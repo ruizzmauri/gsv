@@ -10,8 +10,10 @@ import type {
   Tool,
   Context,
   TextContent,
+  ImageContent,
   ToolCall,
 } from "@mariozechner/pi-ai";
+import type { MediaAttachment } from "./types";
 import { completeSimple, getModel, type Model, type Api } from "@mariozechner/pi-ai";
 import { archivePartialMessages, archiveSession } from "./storage";
 
@@ -162,6 +164,7 @@ export class Session extends DurableObject<Env> {
       thinkLevel?: string;
       model?: { provider: string; id: string };
     },
+    media?: MediaAttachment[],
   ): Promise<ChatSendResult> {
     this.currentRunId = runId;
     this.currentTools = tools;
@@ -176,17 +179,72 @@ export class Session extends DurableObject<Env> {
       await this.doReset();
     }
 
-    const userMessage: UserMessage = {
-      role: "user",
-      content: message,
-      timestamp: Date.now(),
-    };
+    // Build user message content
+    // If we have media (images), use content array format; otherwise use simple string
+    const userMessage: UserMessage = this.buildUserMessage(message, media);
     this.state.messages = [...this.state.messages, userMessage];
     this.state.updatedAt = Date.now();
 
     await this.continueAgentLoop();
 
     return { ok: true, runId };
+  }
+
+  /**
+   * Build a UserMessage with text and optional media attachments
+   * pi-ai supports content as string or array of (TextContent | ImageContent)
+   */
+  private buildUserMessage(text: string, media?: MediaAttachment[]): UserMessage {
+    // Filter to only images that have base64 data (LLMs can't fetch URLs)
+    const images = media?.filter(
+      (m) => m.type === "image" && m.data && m.mimeType
+    ) ?? [];
+
+    // If no images, use simple string content
+    if (images.length === 0) {
+      return {
+        role: "user",
+        content: text,
+        timestamp: Date.now(),
+      };
+    }
+
+    // Build content array with text + images
+    const content: (TextContent | ImageContent)[] = [];
+
+    // Add text first
+    if (text) {
+      content.push({ type: "text", text });
+    }
+
+    // Add images
+    for (const img of images) {
+      if (img.data && img.mimeType) {
+        content.push({
+          type: "image",
+          data: img.data,
+          mimeType: img.mimeType,
+        });
+        console.log(`[Session] Added image: ${img.mimeType}, ${img.data.length} chars base64`);
+      }
+    }
+
+    // Handle audio with transcription - add as text
+    const audioWithTranscript = media?.filter(
+      (m) => m.type === "audio" && m.transcription
+    ) ?? [];
+    for (const audio of audioWithTranscript) {
+      content.push({
+        type: "text",
+        text: `[Voice message transcription: ${audio.transcription}]`,
+      });
+    }
+
+    return {
+      role: "user",
+      content,
+      timestamp: Date.now(),
+    };
   }
 
   private shouldAutoReset(): boolean {
@@ -396,8 +454,23 @@ export class Session extends DurableObject<Env> {
       throw new Error(`API key not configured for provider: ${effectiveModel.provider}`);
     }
 
-    console.log(`[Session] Calling LLM: ${effectiveModel.provider}/${effectiveModel.id}`);
-    const response = await completeSimple(model, context, { apiKey });
+    // Resolve thinking level: directive override > session setting > none
+    const effectiveThinkLevel = 
+      this.currentMessageOverrides.thinkLevel || 
+      sessionSettings.thinkingLevel;
+    
+    // Map our thinking levels to pi-ai reasoning levels
+    // Our: none, low, medium, high
+    // pi-ai: minimal, low, medium, high, xhigh
+    const reasoningLevel = effectiveThinkLevel && effectiveThinkLevel !== "none"
+      ? effectiveThinkLevel as "low" | "medium" | "high"
+      : undefined;
+
+    console.log(`[Session] Calling LLM: ${effectiveModel.provider}/${effectiveModel.id}${reasoningLevel ? ` (reasoning: ${reasoningLevel})` : ''}`);
+    const response = await completeSimple(model, context, { 
+      apiKey,
+      reasoning: reasoningLevel,
+    });
     console.log(`[Session] LLM response received, content blocks: ${response.content?.length ?? 0}`);
 
     // Track token usage from response

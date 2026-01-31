@@ -14,8 +14,10 @@ import {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   DisconnectReason,
+  downloadMediaMessage,
   type WASocket,
   type BaileysEventMap,
+  type WAMessage,
 } from "@whiskeysockets/baileys";
 import QRCode from "qrcode";
 import { useDOAuthState, clearAuthState, hasAuthState } from "./auth-store";
@@ -25,6 +27,7 @@ import type {
   ChannelInboundParams,
   ChannelOutboundPayload,
   PeerInfo,
+  MediaAttachment,
 } from "./types";
 
 interface Env {
@@ -398,18 +401,26 @@ export class WhatsAppAccount extends DurableObject<Env> {
         continue;
       }
 
-      // Skip messages without content
+      // Check for media messages
+      const hasImage = !!msg.message?.imageMessage;
+      const hasVideo = !!msg.message?.videoMessage;
+      const hasAudio = !!msg.message?.audioMessage;
+      const hasDocument = !!msg.message?.documentMessage;
+      const hasMedia = hasImage || hasVideo || hasAudio || hasDocument;
+
+      // Get text content (could be caption for media or regular text)
       const text = msg.message?.conversation || 
                    msg.message?.extendedTextMessage?.text ||
                    msg.message?.imageMessage?.caption ||
-                   msg.message?.videoMessage?.caption;
+                   msg.message?.videoMessage?.caption ||
+                   (hasMedia ? "" : undefined); // Allow empty text if media present
       
-      if (!text) {
-        console.log(`[WhatsAppAccount:${this.state.accountId}] Skipping message without text content`);
+      if (text === undefined) {
+        console.log(`[WhatsAppAccount:${this.state.accountId}] Skipping message without content`);
         continue;
       }
 
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Received message from ${msg.key.remoteJid}: "${text.substring(0, 50)}..."`);
+      console.log(`[WhatsAppAccount:${this.state.accountId}] Received message from ${msg.key.remoteJid}: text="${text.substring(0, 50)}...", hasMedia=${hasMedia}`);
 
       // Build peer info
       const remoteJid = msg.key.remoteJid!;
@@ -420,6 +431,20 @@ export class WhatsAppAccount extends DurableObject<Env> {
         id: remoteJid,
         name: msg.pushName ?? undefined,
       };
+
+      // Download media if present
+      const media: MediaAttachment[] = [];
+      if (hasMedia) {
+        try {
+          const attachment = await this.downloadMedia(msg);
+          if (attachment) {
+            media.push(attachment);
+            console.log(`[WhatsAppAccount:${this.state.accountId}] Downloaded media: ${attachment.type}, ${attachment.mimeType}, ${attachment.data?.length ?? 0} chars base64`);
+          }
+        } catch (e) {
+          console.error(`[WhatsAppAccount:${this.state.accountId}] Failed to download media:`, e);
+        }
+      }
 
       // Build inbound params
       const inbound: ChannelInboundParams = {
@@ -432,9 +457,10 @@ export class WhatsAppAccount extends DurableObject<Env> {
         } : undefined,
         message: {
           id: msg.key.id!,
-          text,
+          text: text || (media.length > 0 ? "[Media]" : ""),
           timestamp: msg.messageTimestamp as number,
           replyToId: msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? undefined,
+          media: media.length > 0 ? media : undefined,
         },
       };
 
@@ -447,6 +473,71 @@ export class WhatsAppAccount extends DurableObject<Env> {
           console.error(`[WhatsAppAccount:${this.state.accountId}] Failed to send to gateway:`, e);
         }
       }
+    }
+  }
+
+  /**
+   * Download media from a WhatsApp message and return as MediaAttachment
+   */
+  private async downloadMedia(msg: WAMessage): Promise<MediaAttachment | null> {
+    if (!this.sock) return null;
+
+    try {
+      // Determine media type and get metadata
+      let mediaType: MediaAttachment["type"];
+      let mimeType: string;
+      let filename: string | undefined;
+
+      if (msg.message?.imageMessage) {
+        mediaType = "image";
+        mimeType = msg.message.imageMessage.mimetype || "image/jpeg";
+        filename = msg.message.imageMessage.caption ?? undefined;
+      } else if (msg.message?.videoMessage) {
+        mediaType = "video";
+        mimeType = msg.message.videoMessage.mimetype || "video/mp4";
+        filename = msg.message.videoMessage.caption ?? undefined;
+      } else if (msg.message?.audioMessage) {
+        mediaType = "audio";
+        mimeType = msg.message.audioMessage.mimetype || "audio/ogg";
+      } else if (msg.message?.documentMessage) {
+        mediaType = "document";
+        mimeType = msg.message.documentMessage.mimetype || "application/octet-stream";
+        filename = msg.message.documentMessage.fileName ?? undefined;
+      } else {
+        return null;
+      }
+
+      // Download the media
+      console.log(`[WhatsAppAccount:${this.state.accountId}] Downloading ${mediaType} (${mimeType})...`);
+      const buffer = await downloadMediaMessage(
+        msg,
+        "buffer",
+        {},
+        {
+          logger: console as any,
+          reuploadRequest: this.sock.updateMediaMessage,
+        }
+      );
+
+      if (!buffer) {
+        console.log(`[WhatsAppAccount:${this.state.accountId}] No buffer returned from media download`);
+        return null;
+      }
+
+      // Convert to base64
+      const base64 = Buffer.from(buffer).toString("base64");
+      console.log(`[WhatsAppAccount:${this.state.accountId}] Media downloaded: ${base64.length} chars base64`);
+
+      return {
+        type: mediaType,
+        mimeType,
+        data: base64,
+        filename,
+        size: buffer.byteLength,
+      };
+    } catch (e) {
+      console.error(`[WhatsAppAccount:${this.state.accountId}] Media download error:`, e);
+      return null;
     }
   }
 

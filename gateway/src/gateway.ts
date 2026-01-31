@@ -24,6 +24,7 @@ import { isWebSocketRequest, validateFrame, isWsConnected } from "./utils";
 import { GsvConfig, DEFAULT_CONFIG, mergeConfig } from "./config";
 import { parseCommand, HELP_TEXT, normalizeThinkLevel, resolveModelAlias, listModelAliases } from "./commands";
 import { parseDirectives, isDirectiveOnly, formatDirectiveAck } from "./directives";
+import { processMediaWithTranscription } from "./transcription";
 
 function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
@@ -1015,12 +1016,20 @@ export class Gateway extends DurableObject<Env> {
         messageOverrides.model = directives.model;
       }
 
+      // Process media attachments (transcribe audio if present)
+      const config = this.getFullConfig();
+      const processedMedia = await processMediaWithTranscription(
+        params.message.media,
+        config.apiKeys.openai,
+      );
+
       const result = await sessionStub.chatSend(
         directives.cleaned, // Send cleaned message without directives
         runId,
         JSON.parse(JSON.stringify(this.getAllTools())),
         sessionKey,
         messageOverrides,
+        processedMedia.length > 0 ? processedMedia : undefined,
       );
 
       this.pendingChannelResponses[sessionKey] = {
