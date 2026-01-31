@@ -12,13 +12,33 @@ import {
   ToolResultParams,
   ResponseFrame,
   ChatEventPayload,
+  SessionRegistryEntry,
+  SessionsListResult,
+  ChannelInboundParams,
+  ChannelOutboundPayload,
+  ChannelRegistryEntry,
+  ChannelId,
+  PeerInfo,
 } from "./types";
 import { isWebSocketRequest, validateFrame, isWsConnected } from "./utils";
 import { GsvConfig, DEFAULT_CONFIG, mergeConfig } from "./config";
 
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  const encoder = new TextEncoder();
+  const bufA = encoder.encode(a);
+  const bufB = encoder.encode(b);
+  let result = 0;
+  for (let i = 0; i < bufA.length; i++) {
+    result |= bufA[i] ^ bufB[i];
+  }
+  return result === 0;
+}
+
 export class Gateway extends DurableObject<Env> {
   clients: Map<string, WebSocket> = new Map();
   nodes: Map<string, WebSocket> = new Map();
+  channels: Map<string, WebSocket> = new Map();
 
   toolRegistry = PersistedObject<Record<string, ToolDefinition[]>>(
     this.ctx.storage.kv,
@@ -47,6 +67,16 @@ export class Gateway extends DurableObject<Env> {
     },
   );
 
+  sessionRegistry = PersistedObject<Record<string, SessionRegistryEntry>>(
+    this.ctx.storage.kv,
+    { prefix: "sessionRegistry:" },
+  );
+
+  channelRegistry = PersistedObject<Record<string, ChannelRegistryEntry>>(
+    this.ctx.storage.kv,
+    { prefix: "channelRegistry:" },
+  );
+
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
 
@@ -56,7 +86,7 @@ export class Gateway extends DurableObject<Env> {
     );
 
     for (const ws of websockets) {
-      const { connected, mode, clientId, nodeId } = ws.deserializeAttachment();
+      const { connected, mode, clientId, nodeId, channelKey } = ws.deserializeAttachment();
       if (!connected) continue;
 
       switch (mode) {
@@ -68,11 +98,17 @@ export class Gateway extends DurableObject<Env> {
           this.nodes.set(nodeId, ws);
           console.log(`[Gateway]   Rehydrated node: ${nodeId}`);
           break;
+        case "channel":
+          if (channelKey) {
+            this.channels.set(channelKey, ws);
+            console.log(`[Gateway]   Rehydrated channel: ${channelKey}`);
+          }
+          break;
       }
     }
 
     console.log(
-      `[Gateway] After rehydration: ${this.clients.size} clients, ${this.nodes.size} nodes`,
+      `[Gateway] After rehydration: ${this.clients.size} clients, ${this.nodes.size} nodes, ${this.channels.size} channels`,
     );
 
     const staleNodeIds = Object.keys(this.toolRegistry).filter(
@@ -150,6 +186,14 @@ export class Gateway extends DurableObject<Env> {
         return this.handleSessionCompact(ws, frame);
       case "session.history":
         return this.handleSessionHistory(ws, frame);
+      case "session.preview":
+        return this.handleSessionPreview(ws, frame);
+      case "sessions.list":
+        return this.handleSessionsList(ws, frame);
+      case "channel.inbound":
+        return this.handleChannelInbound(ws, frame);
+      case "channels.list":
+        return this.handleChannelsList(ws, frame);
       default:
         this.sendError(ws, frame.id, 404, `Unknown method: ${frame.method}`);
     }
@@ -162,8 +206,19 @@ export class Gateway extends DurableObject<Env> {
       return;
     }
 
+    // Check auth token if configured
+    const authToken = this.configStore["auth.token"] as string | undefined;
+    if (authToken) {
+      const providedToken = params?.auth?.token;
+      if (!providedToken || !timingSafeEqual(providedToken, authToken)) {
+        this.sendError(ws, frame.id, 401, "Unauthorized: invalid or missing token");
+        ws.close(4001, "Unauthorized");
+        return;
+      }
+    }
+
     const mode = params?.client?.mode;
-    if (!mode || !["client", "node"].includes(mode)) {
+    if (!mode || !["client", "node", "channel"].includes(mode)) {
       this.sendError(ws, frame.id, 103, "Invalid client mode");
       return;
     }
@@ -182,6 +237,25 @@ export class Gateway extends DurableObject<Env> {
       console.log(
         `[Gateway] Node connected: ${params.client.id}, tools: [${(params.tools ?? []).map((t) => t.name).join(", ")}]`,
       );
+    } else if (mode === "channel") {
+      const channel = params.client.channel;
+      const accountId = params.client.accountId ?? params.client.id;
+      if (!channel) {
+        this.sendError(ws, frame.id, 103, "Channel mode requires channel field");
+        return;
+      }
+      const channelKey = `${channel}:${accountId}`;
+      attachments.channelKey = channelKey;
+      attachments.channel = channel;
+      attachments.accountId = accountId;
+      this.channels.set(channelKey, ws);
+      // Update channel registry
+      this.channelRegistry[channelKey] = {
+        channel,
+        accountId,
+        connectedAt: Date.now(),
+      };
+      console.log(`[Gateway] Channel connected: ${channelKey}`);
     }
 
     ws.serializeAttachment(attachments);
@@ -190,8 +264,8 @@ export class Gateway extends DurableObject<Env> {
       protocol: 1,
       server: { version: "0.0.1", connectionId: attachments.id },
       features: {
-        methods: ["tools.list", "chat.send", "tool.request", "tool.result"],
-        events: ["chat", "tool.invoke", "tool.result"],
+        methods: ["tools.list", "chat.send", "tool.request", "tool.result", "channel.inbound"],
+        events: ["chat", "tool.invoke", "tool.result", "channel.outbound"],
       },
     });
   }
@@ -211,6 +285,16 @@ export class Gateway extends DurableObject<Env> {
     const sessionStub = this.env.SESSION.get(
       this.env.SESSION.idFromName(params.sessionKey),
     );
+
+    const now = Date.now();
+    const existing = this.sessionRegistry[params.sessionKey];
+    this.sessionRegistry[params.sessionKey] = {
+      sessionKey: params.sessionKey,
+      createdAt: existing?.createdAt ?? now,
+      lastActiveAt: now,
+      messageCount: (existing?.messageCount ?? 0) + 1,
+      label: existing?.label,
+    };
 
     try {
       const result = await sessionStub.chatSend(
@@ -353,15 +437,18 @@ export class Gateway extends DurableObject<Env> {
   }
 
   webSocketClose(ws: WebSocket) {
-    const { mode, clientId, nodeId } = ws.deserializeAttachment();
+    const { mode, clientId, nodeId, channelKey } = ws.deserializeAttachment();
     console.log(
-      `[Gateway] WebSocket closed: mode=${mode}, clientId=${clientId}, nodeId=${nodeId}`,
+      `[Gateway] WebSocket closed: mode=${mode}, clientId=${clientId}, nodeId=${nodeId}, channelKey=${channelKey}`,
     );
     if (mode === "client") this.clients.delete(clientId);
     else if (mode === "node") {
       this.nodes.delete(nodeId);
       delete this.toolRegistry[nodeId];
       console.log(`[Gateway] Node ${nodeId} removed from registry`);
+    } else if (mode === "channel" && channelKey) {
+      this.channels.delete(channelKey);
+      console.log(`[Gateway] Channel ${channelKey} disconnected`);
     }
   }
 
@@ -599,6 +686,128 @@ export class Gateway extends DurableObject<Env> {
     }
   }
 
+  handleSessionsList(ws: WebSocket, frame: RequestFrame) {
+    const params = frame.params as { limit?: number; offset?: number } | undefined;
+    const limit = params?.limit ?? 100;
+    const offset = params?.offset ?? 0;
+
+    const allSessions = Object.values(this.sessionRegistry)
+      .sort((a, b) => b.lastActiveAt - a.lastActiveAt);
+
+    const sessions = allSessions.slice(offset, offset + limit);
+
+    const result: SessionsListResult = {
+      sessions,
+      count: allSessions.length,
+    };
+
+    this.sendOk(ws, frame.id, result);
+  }
+
+  async handleSessionPreview(ws: WebSocket, frame: RequestFrame) {
+    const params = frame.params as { sessionKey: string; limit?: number } | undefined;
+
+    if (!params?.sessionKey) {
+      this.sendError(ws, frame.id, 400, "sessionKey required");
+      return;
+    }
+
+    const sessionStub = this.env.SESSION.get(
+      this.env.SESSION.idFromName(params.sessionKey),
+    );
+
+    try {
+      const result = await sessionStub.preview(params.limit);
+      this.sendOk(ws, frame.id, result);
+    } catch (e) {
+      this.sendError(ws, frame.id, 500, String(e));
+    }
+  }
+
+  async handleChannelInbound(ws: WebSocket, frame: RequestFrame) {
+    const params = frame.params as ChannelInboundParams;
+    if (!params?.channel || !params?.accountId || !params?.peer || !params?.message) {
+      this.sendError(ws, frame.id, 400, "channel, accountId, peer, and message required");
+      return;
+    }
+
+    // Generate session key from channel context
+    // Format: agent:{agentId}:{channel}:{peerKind}:{peerId}
+    // TODO: Add agent binding resolution (for now, default to "main")
+    const agentId = "main";
+    const sessionKey = this.buildSessionKeyFromChannel(agentId, params.channel, params.peer);
+
+    const channelKey = `${params.channel}:${params.accountId}`;
+    const existing = this.channelRegistry[channelKey];
+    if (existing) {
+      this.channelRegistry[channelKey] = {
+        ...existing,
+        lastMessageAt: Date.now(),
+      };
+    }
+
+    const now = Date.now();
+    const existingSession = this.sessionRegistry[sessionKey];
+    this.sessionRegistry[sessionKey] = {
+      sessionKey,
+      createdAt: existingSession?.createdAt ?? now,
+      lastActiveAt: now,
+      messageCount: (existingSession?.messageCount ?? 0) + 1,
+      label: existingSession?.label ?? params.peer.name,
+    };
+
+    const sessionStub = this.env.SESSION.get(
+      this.env.SESSION.idFromName(sessionKey),
+    );
+
+    try {
+      const messageText = params.message.text;
+      const runId = crypto.randomUUID();
+
+      const result = await sessionStub.chatSend(
+        messageText,
+        runId,
+        JSON.parse(JSON.stringify(this.getAllTools())),
+        sessionKey,
+      );
+
+      this.pendingChannelResponses[sessionKey] = {
+        channel: params.channel,
+        accountId: params.accountId,
+        peer: params.peer,
+        inboundMessageId: params.message.id,
+      };
+
+      this.sendOk(ws, frame.id, { 
+        status: "started", 
+        runId: result.runId,
+        sessionKey,
+      });
+    } catch (e) {
+      this.sendError(ws, frame.id, 500, String(e));
+    }
+  }
+
+  pendingChannelResponses = PersistedObject<Record<string, {
+    channel: ChannelId;
+    accountId: string;
+    peer: PeerInfo;
+    inboundMessageId: string;
+  }>>(this.ctx.storage.kv, { prefix: "pendingChannelResponses:" });
+
+  private buildSessionKeyFromChannel(agentId: string, channel: ChannelId, peer: PeerInfo): string {
+    const sanitizedPeerId = peer.id.replace(/[^a-zA-Z0-9+\-_@.]/g, "_");
+    return `agent:${agentId}:${channel}:${peer.kind}:${sanitizedPeerId}`;
+  }
+
+  handleChannelsList(ws: WebSocket, frame: RequestFrame) {
+    const channels = Object.values(this.channelRegistry);
+    this.sendOk(ws, frame.id, { 
+      channels,
+      count: channels.length,
+    });
+  }
+
   private getConfigPath(path: string): unknown {
     const parts = path.split(".");
     let current: unknown = this.getFullConfig();
@@ -615,12 +824,27 @@ export class Gateway extends DurableObject<Env> {
   }
 
   private setConfigPath(path: string, value: unknown): void {
-    // Store flat keys like "model.provider" or "apiKeys.anthropic"
-    this.configStore[path] = value;
+    const parts = path.split(".");
+    
+    if (parts.length === 1) {
+      this.configStore[path] = value;
+    } else if (parts.length === 2) {
+      const [group, field] = parts;
+      
+      const existing = this.configStore[group];
+      const groupObj = (typeof existing === "object" && existing !== null) 
+        ? { ...existing as Record<string, unknown> }
+        : {};
+      
+      groupObj[field] = value;
+      this.configStore[group] = groupObj;
+      
+      delete this.configStore[path];
+    }
   }
 
   private getFullConfig(): GsvConfig {
-    return mergeConfig(DEFAULT_CONFIG, { ...this.configStore });
+    return mergeConfig(DEFAULT_CONFIG, { ...this.configStore } as Partial<GsvConfig>);
   }
 
   private getSafeConfig(): GsvConfig {
@@ -651,5 +875,75 @@ export class Gateway extends DurableObject<Env> {
         ws.send(message);
       }
     }
+
+    if (payload.state === "final" && payload.message) {
+      const channelContext = this.pendingChannelResponses[sessionKey];
+      if (channelContext) {
+        this.routeToChannel(sessionKey, channelContext, payload);
+        delete this.pendingChannelResponses[sessionKey];
+      } else {
+        console.log(`[Gateway] No pending channel context for session ${sessionKey}`);
+      }
+    }
+  }
+
+  private routeToChannel(
+    sessionKey: string,
+    context: {
+      channel: ChannelId;
+      accountId: string;
+      peer: PeerInfo;
+      inboundMessageId: string;
+    },
+    payload: ChatEventPayload,
+  ): void {
+    const channelKey = `${context.channel}:${context.accountId}`;
+    const channelWs = this.channels.get(channelKey);
+    
+    if (!channelWs || channelWs.readyState !== WebSocket.OPEN) {
+      console.log(`[Gateway] Channel ${channelKey} not connected for outbound`);
+      return;
+    }
+
+    let text = "";
+    const msg = payload.message as { content?: unknown } | undefined;
+    if (msg?.content) {
+      if (typeof msg.content === "string") {
+        text = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (typeof block === "object" && block && "type" in block) {
+            if ((block as { type: string }).type === "text" && "text" in block) {
+              text += (block as { text: string }).text;
+            }
+          }
+        }
+      }
+    }
+
+    if (!text) {
+      console.log(`[Gateway] No text content in response for ${sessionKey}`);
+      return;
+    }
+
+    const outbound: ChannelOutboundPayload = {
+      channel: context.channel,
+      accountId: context.accountId,
+      peer: context.peer,
+      sessionKey,
+      message: {
+        text,
+        replyToId: context.inboundMessageId,
+      },
+    };
+
+    const evt: EventFrame<ChannelOutboundPayload> = {
+      type: "evt",
+      event: "channel.outbound",
+      payload: outbound,
+    };
+
+    channelWs.send(JSON.stringify(evt));
+    console.log(`[Gateway] Routed response to channel ${channelKey}`);
   }
 }

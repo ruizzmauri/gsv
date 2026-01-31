@@ -1,4 +1,4 @@
-use crate::protocol::{ClientInfo, ConnectParams, Frame, RequestFrame, ResponseFrame, ToolDefinition};
+use crate::protocol::{AuthParams, ClientInfo, ConnectParams, Frame, RequestFrame, ResponseFrame, ToolDefinition};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -26,7 +26,7 @@ impl Connection {
         tools: Option<Vec<ToolDefinition>>,
         on_event: impl Fn(Frame) + Send + 'static + Sync,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::connect_with_id(url, mode, tools, on_event, None).await
+        Self::connect_with_options(url, mode, tools, on_event, None, None).await
     }
 
     pub async fn connect_with_id(
@@ -35,6 +35,17 @@ impl Connection {
         tools: Option<Vec<ToolDefinition>>,
         on_event: impl Fn(Frame) + Send + 'static + Sync,
         client_id: Option<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::connect_with_options(url, mode, tools, on_event, client_id, None).await
+    }
+
+    pub async fn connect_with_options(
+        url: &str,
+        mode: &str,
+        tools: Option<Vec<ToolDefinition>>,
+        on_event: impl Fn(Frame) + Send + 'static + Sync,
+        client_id: Option<String>,
+        token: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (ws_stream, _) = connect_async(url).await?;
         let (mut write, mut read) = ws_stream.split();
@@ -87,7 +98,7 @@ impl Connection {
             event_handler,
             disconnected,
         };
-        conn.handshake(mode, tools, client_id).await?;
+        conn.handshake(mode, tools, client_id, token).await?;
         Ok(conn)
     }
 
@@ -105,6 +116,7 @@ impl Connection {
         mode: &str,
         tools: Option<Vec<ToolDefinition>>,
         client_id: Option<String>,
+        token: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Use provided ID, or generate based on mode:
         // - nodes: use hostname (stable across reconnects)
@@ -131,6 +143,7 @@ impl Connection {
             },
             tools,
             session_key: None,
+            auth: token.map(|t| AuthParams { token: Some(t) }),
         };
 
         let res = self

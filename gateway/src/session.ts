@@ -261,6 +261,7 @@ export class Session extends DurableObject<Env> {
     try {
       response = await this.callLlm();
     } catch (e) {
+      console.error(`[Session] LLM call failed:`, e);
       await this.broadcastToClients({
         runId: this.currentRunId,
         sessionKey: this.state.sessionKey,
@@ -366,7 +367,9 @@ export class Session extends DurableObject<Env> {
       throw new Error(`API key not configured for provider: ${effectiveModel.provider}`);
     }
 
+    console.log(`[Session] Calling LLM: ${effectiveModel.provider}/${effectiveModel.id}`);
     const response = await completeSimple(model, context, { apiKey });
+    console.log(`[Session] LLM response received, content blocks: ${response.content?.length ?? 0}`);
 
     // Track token usage from response
     if (response.usage) {
@@ -505,10 +508,10 @@ export class Session extends DurableObject<Env> {
         output: this.state.outputTokens,
         total: this.state.totalTokens,
       },
-      settings: this.state.settings,
-      resetPolicy: this.state.resetPolicy,
+      settings: { ...this.state.settings },
+      resetPolicy: this.state.resetPolicy ? { ...this.state.resetPolicy } : undefined,
       lastResetAt: this.state.lastResetAt,
-      previousSessionIds: this.state.previousSessionIds,
+      previousSessionIds: [...this.state.previousSessionIds],
       label: this.state.label,
     };
   }
@@ -599,7 +602,26 @@ export class Session extends DurableObject<Env> {
     return {
       sessionKey: this.state.sessionKey,
       currentSessionId: this.state.sessionId,
-      previousSessionIds: this.state.previousSessionIds,
+      previousSessionIds: [...this.state.previousSessionIds],
+    };
+  }
+
+  async preview(limit?: number): Promise<{
+    sessionKey: string;
+    sessionId: string;
+    messageCount: number;
+    messages: Message[];
+  }> {
+    const messages = [...this.state.messages];
+    const limitedMessages = limit ? messages.slice(-limit) : messages;
+    
+    const plainMessages = JSON.parse(JSON.stringify(limitedMessages));
+    
+    return {
+      sessionKey: this.state.sessionKey,
+      sessionId: this.state.sessionId,
+      messageCount: this.state.messages.length,
+      messages: plainMessages,
     };
   }
 

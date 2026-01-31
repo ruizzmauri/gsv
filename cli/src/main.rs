@@ -17,6 +17,10 @@ struct Cli {
     #[arg(short, long, default_value = "ws://localhost:8787/ws")]
     url: String,
 
+    /// Auth token (or set GSV_TOKEN env var)
+    #[arg(short, long, env = "GSV_TOKEN")]
+    token: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -74,6 +78,12 @@ enum ConfigAction {
 
 #[derive(Subcommand)]
 enum SessionAction {
+    /// List all known sessions
+    List {
+        /// Maximum number of sessions to show
+        #[arg(short, long, default_value = "50")]
+        limit: i64,
+    },
     /// Reset a session (clear message history, archive to R2)
     Reset {
         /// Session key (default: "main")
@@ -116,6 +126,15 @@ enum SessionAction {
         #[arg(default_value = "main")]
         session_key: String,
     },
+    /// Preview session messages
+    Preview {
+        /// Session key (default: "main")
+        #[arg(default_value = "main")]
+        session_key: String,
+        /// Number of messages to show (default: all)
+        #[arg(short, long)]
+        limit: Option<i64>,
+    },
 }
 
 #[tokio::main]
@@ -123,16 +142,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Client { message, session } => run_client(&cli.url, message, &session).await,
-        Commands::Node { id } => run_node(&cli.url, id).await,
-        Commands::Config { action } => run_config(&cli.url, action).await,
-        Commands::Session { action } => run_session(&cli.url, action).await,
-        Commands::Tools => run_tools(&cli.url).await,
+        Commands::Client { message, session } => run_client(&cli.url, cli.token, message, &session).await,
+        Commands::Node { id } => run_node(&cli.url, cli.token, id).await,
+        Commands::Config { action } => run_config(&cli.url, cli.token, action).await,
+        Commands::Session { action } => run_session(&cli.url, cli.token, action).await,
+        Commands::Tools => run_tools(&cli.url, cli.token).await,
     }
 }
 
 async fn run_client(
     url: &str,
+    token: Option<String>,
     message: Option<String>,
     session_key: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -143,7 +163,7 @@ async fn run_client(
     let response_received_clone = response_received.clone();
     let session_key_owned = session_key.to_string();
 
-    let conn = Connection::connect(url, "client", None, move |frame| {
+    let conn = Connection::connect_with_options(url, "client", None, move |frame| {
         // Handle incoming events
         if let Frame::Evt(evt) = frame {
             if evt.event == "chat" {
@@ -183,7 +203,7 @@ async fn run_client(
                 }
             }
         }
-    })
+    }, None, token)
     .await?;
 
     if let Some(msg) = message {
@@ -305,8 +325,8 @@ fn format_content(content: &serde_json::Value) -> String {
     content.to_string()
 }
 
-async fn run_config(url: &str, action: ConfigAction) -> Result<(), Box<dyn std::error::Error>> {
-    let conn = Connection::connect(url, "client", None, |_| {}).await?;
+async fn run_config(url: &str, token: Option<String>, action: ConfigAction) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::connect_with_options(url, "client", None, |_| {}, None, token).await?;
 
     match action {
         ConfigAction::Get { path } => {
@@ -355,8 +375,8 @@ async fn run_config(url: &str, action: ConfigAction) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-async fn run_tools(url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let conn = Connection::connect(url, "client", None, |_| {}).await?;
+async fn run_tools(url: &str, token: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::connect_with_options(url, "client", None, |_| {}, None, token).await?;
 
     let res = conn.request("tools.list", None).await?;
 
@@ -384,10 +404,53 @@ async fn run_tools(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_session(url: &str, action: SessionAction) -> Result<(), Box<dyn std::error::Error>> {
-    let conn = Connection::connect(url, "client", None, |_| {}).await?;
+async fn run_session(url: &str, token: Option<String>, action: SessionAction) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::connect_with_options(url, "client", None, |_| {}, None, token).await?;
 
     match action {
+        SessionAction::List { limit } => {
+            let res = conn
+                .request(
+                    "sessions.list",
+                    Some(json!({ "limit": limit })),
+                )
+                .await?;
+
+            if res.ok {
+                if let Some(payload) = res.payload {
+                    let sessions = payload.get("sessions").and_then(|s| s.as_array());
+                    let count = payload.get("count").and_then(|c| c.as_i64()).unwrap_or(0);
+                    
+                    if let Some(sessions) = sessions {
+                        if sessions.is_empty() {
+                            println!("No sessions found");
+                        } else {
+                            println!("Sessions ({}):", count);
+                            for session in sessions {
+                                let key = session.get("sessionKey").and_then(|k| k.as_str()).unwrap_or("?");
+                                let msg_count = session.get("messageCount").and_then(|c| c.as_i64()).unwrap_or(0);
+                                let label = session.get("label").and_then(|l| l.as_str());
+                                let last_active = session.get("lastActiveAt").and_then(|t| t.as_i64());
+                                
+                                let last_active_str = last_active
+                                    .and_then(|ts| chrono::DateTime::from_timestamp_millis(ts))
+                                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                                    .unwrap_or_else(|| "?".to_string());
+                                
+                                if let Some(label) = label {
+                                    println!("  {} ({}) - {} msgs, last active: {}", key, label, msg_count, last_active_str);
+                                } else {
+                                    println!("  {} - {} msgs, last active: {}", key, msg_count, last_active_str);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(err) = res.error {
+                eprintln!("Error: {}", err.message);
+            }
+        }
+        
         SessionAction::Reset { session_key } => {
             let res = conn
                 .request(
@@ -648,12 +711,96 @@ async fn run_session(url: &str, action: SessionAction) -> Result<(), Box<dyn std
                 eprintln!("Error: {}", err.message);
             }
         }
+        
+        SessionAction::Preview { session_key, limit } => {
+            let mut params = json!({ "sessionKey": session_key });
+            if let Some(l) = limit {
+                params["limit"] = json!(l);
+            }
+            
+            let res = conn
+                .request("session.preview", Some(params))
+                .await?;
+
+            if res.ok {
+                if let Some(payload) = res.payload {
+                    let msg_count = payload.get("messageCount").and_then(|c| c.as_i64()).unwrap_or(0);
+                    let messages = payload.get("messages").and_then(|m| m.as_array());
+                    
+                    println!("Session: {} ({} messages total)\n", session_key, msg_count);
+                    
+                    if let Some(msgs) = messages {
+                        for msg in msgs {
+                            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+                            
+                            match role {
+                                "user" => {
+                                    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                                    println!("USER: {}\n", content);
+                                }
+                                "assistant" => {
+                                    print!("ASSISTANT: ");
+                                    if let Some(content) = msg.get("content") {
+                                        if let Some(text) = content.as_str() {
+                                            println!("{}\n", text);
+                                        } else if let Some(blocks) = content.as_array() {
+                                            for block in blocks {
+                                                if let Some(block_type) = block.get("type").and_then(|t| t.as_str()) {
+                                                    match block_type {
+                                                        "text" => {
+                                                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                                                print!("{}", text);
+                                                            }
+                                                        }
+                                                        "toolCall" => {
+                                                            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                                                            println!("\n[Tool call: {}]", name);
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                            println!("\n");
+                                        }
+                                    }
+                                }
+                                "toolResult" => {
+                                    let tool_name = msg.get("toolName").and_then(|n| n.as_str()).unwrap_or("?");
+                                    let is_error = msg.get("isError").and_then(|e| e.as_bool()).unwrap_or(false);
+                                    let prefix = if is_error { "ERROR" } else { "RESULT" };
+                                    
+                                    print!("TOOL {} ({}): ", prefix, tool_name);
+                                    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+                                        for block in content {
+                                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                                // Truncate long results
+                                                if text.len() > 200 {
+                                                    println!("{}...", &text[..200]);
+                                                } else {
+                                                    println!("{}", text);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    println!();
+                                }
+                                _ => {
+                                    println!("{}: {:?}\n", role.to_uppercase(), msg);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(err) = res.error {
+                eprintln!("Error: {}", err.message);
+            }
+        }
     }
 
     Ok(())
 }
 
-async fn run_node(url: &str, node_id: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_node(url: &str, token: Option<String>, node_id: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve node ID: use provided, or fall back to hostname
     let node_id = node_id.unwrap_or_else(|| {
         let hostname = hostname::get()
@@ -675,7 +822,7 @@ async fn run_node(url: &str, node_id: Option<String>) -> Result<(), Box<dyn std:
 
         let tools_for_handler: Arc<Vec<Box<dyn Tool>>> = Arc::new(all_tools());
 
-        let conn = match Connection::connect_with_id(url, "node", Some(tool_defs), |_frame| {}, Some(node_id.clone())).await {
+        let conn = match Connection::connect_with_options(url, "node", Some(tool_defs), |_frame| {}, Some(node_id.clone()), token.clone()).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("Failed to connect: {}. Retrying in 3s...", e);

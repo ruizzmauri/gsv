@@ -26,6 +26,10 @@ export type EventFrame<Payload = unknown> = {
 
 export type Frame = RequestFrame | ResponseFrame | EventFrame;
 
+export type AuthParams = {
+  token?: string;
+};
+
 export type ConnectParams = {
   minProtocol: number;
   maxProtocol: number;
@@ -33,9 +37,88 @@ export type ConnectParams = {
     id: string;
     version: string;
     platform: string;
-    mode: "client" | "node";
+    mode: "client" | "node" | "channel";
+    channel?: ChannelId;
+    accountId?: string;
   };
   tools?: ToolDefinition[];
+  auth?: AuthParams;
+};
+
+export type ChannelId =
+  | "whatsapp"
+  | "telegram"
+  | "discord"
+  | "slack"
+  | "signal"
+  | "imessage"
+  | "googlechat"
+  | (string & {});
+
+export type ChatType = "dm" | "group";
+
+export type PeerInfo = {
+  kind: ChatType;
+  id: string;
+  name?: string;
+  handle?: string;
+};
+
+export type SenderInfo = {
+  id: string;
+  name?: string;
+  handle?: string;
+};
+
+export type ChannelInboundParams = {
+  channel: ChannelId;
+  accountId: string;
+  peer: PeerInfo;
+  sender?: SenderInfo;
+  message: {
+    id: string;
+    text: string;
+    timestamp?: number;
+    replyToId?: string;
+    replyToText?: string;
+    mediaUrl?: string;
+    mediaType?: string;
+    location?: { lat: number; lon: number; name?: string };
+  };
+  wasMentioned?: boolean;
+  mentionedIds?: string[];
+};
+
+export type ChannelOutboundPayload = {
+  channel: ChannelId;
+  accountId: string;
+  peer: PeerInfo;
+  sessionKey: string;
+  message: {
+    text: string;
+    replyToId?: string;
+    mediaUrl?: string;
+  };
+};
+
+export type ChannelRegistryEntry = {
+  channel: ChannelId;
+  accountId: string;
+  connectedAt: number;
+  lastMessageAt?: number;
+};
+
+export type SessionRegistryEntry = {
+  sessionKey: string;
+  createdAt: number;
+  lastActiveAt: number;
+  messageCount?: number;
+  label?: string;
+};
+
+export type SessionsListResult = {
+  sessions: SessionRegistryEntry[];
+  count: number;
 };
 
 export type ToolDefinition = {

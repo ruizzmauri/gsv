@@ -47,6 +47,12 @@ pub struct ErrorShape {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectParams {
     pub min_protocol: u32,
@@ -56,6 +62,8 @@ pub struct ConnectParams {
     pub tools: Option<Vec<ToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthParams>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
