@@ -25,6 +25,7 @@ import { GsvConfig, DEFAULT_CONFIG, mergeConfig } from "./config";
 import { parseCommand, HELP_TEXT, normalizeThinkLevel, resolveModelAlias, listModelAliases } from "./commands";
 import { parseDirectives, isDirectiveOnly, formatDirectiveAck } from "./directives";
 import { processMediaWithTranscription } from "./transcription";
+import { processInboundMedia } from "./storage";
 
 function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
@@ -333,7 +334,6 @@ export class Gateway extends DurableObject<Env> {
       sessionKey: params.sessionKey,
       createdAt: existing?.createdAt ?? now,
       lastActiveAt: now,
-      messageCount: (existing?.messageCount ?? 0) + 1,
       label: existing?.label,
     };
 
@@ -992,7 +992,6 @@ export class Gateway extends DurableObject<Env> {
       sessionKey,
       createdAt: existingSession?.createdAt ?? now,
       lastActiveAt: now,
-      messageCount: (existingSession?.messageCount ?? 0) + 1,
       label: existingSession?.label ?? params.peer.name,
     };
 
@@ -1016,16 +1015,37 @@ export class Gateway extends DurableObject<Env> {
         messageOverrides.model = directives.model;
       }
 
-      // Process media attachments (transcribe audio if present)
-      // Priority: Workers AI (free) > OpenAI
+      // Process media attachments:
+      // 1. Transcribe audio (Workers AI free > OpenAI fallback)
+      // 2. Store all media in R2 (returns r2Key references)
       const config = this.getFullConfig();
-      const processedMedia = await processMediaWithTranscription(
-        params.message.media,
+      const inboundMedia = params.message.media;
+      
+      let processedMedia = await processMediaWithTranscription(
+        inboundMedia,
         {
           workersAi: this.env.AI,
           openaiApiKey: config.apiKeys.openai,
         },
       );
+      
+      // Store media in R2 (replaces base64 data with r2Key references)
+      if (processedMedia.length > 0) {
+        processedMedia = await processInboundMedia(
+          processedMedia,
+          this.env.STORAGE,
+          sessionKey,
+        );
+      }
+
+      // Store channel context BEFORE calling chatSend to avoid race condition
+      // (chatSend may trigger broadcastToSession before returning)
+      this.pendingChannelResponses[sessionKey] = {
+        channel: params.channel,
+        accountId: params.accountId,
+        peer: params.peer,
+        inboundMessageId: params.message.id,
+      };
 
       const result = await sessionStub.chatSend(
         directives.cleaned, // Send cleaned message without directives
@@ -1035,13 +1055,6 @@ export class Gateway extends DurableObject<Env> {
         messageOverrides,
         processedMedia.length > 0 ? processedMedia : undefined,
       );
-
-      this.pendingChannelResponses[sessionKey] = {
-        channel: params.channel,
-        accountId: params.accountId,
-        peer: params.peer,
-        inboundMessageId: params.message.id,
-      };
 
       this.sendOk(ws, frame.id, { 
         status: "started", 

@@ -94,13 +94,10 @@ async function transcribeWithWorkersAI(
     throw new Error("Audio attachment missing base64 data");
   }
 
-  // Convert base64 to Uint8Array
-  const binaryData = Uint8Array.from(atob(attachment.data), c => c.charCodeAt(0));
-
-  // Call Workers AI Whisper model
-  const result = await ai.run("@cf/openai/whisper", {
-    audio: [...binaryData], // Workers AI expects number array
-  }) as { text?: string };
+  // Workers AI Whisper expects base64 string directly
+  const result = await (ai as any).run("@cf/openai/whisper-large-v3-turbo", {
+    audio: attachment.data,
+  }) as { text?: string; vtt?: string };
 
   if (!result.text) {
     throw new Error("Workers AI transcription response missing text");
@@ -109,7 +106,7 @@ async function transcribeWithWorkersAI(
   return {
     text: result.text.trim(),
     provider: "workers-ai",
-    model: "@cf/openai/whisper",
+    model: "@cf/openai/whisper-large-v3-turbo",
     duration: attachment.duration,
   };
 }

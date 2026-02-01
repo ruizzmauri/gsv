@@ -72,16 +72,26 @@ export type SenderInfo = {
 
 /**
  * Media attachment for channel messages
- * Can be provided as base64 data or URL
+ * 
+ * Inbound flow:
+ * 1. Channel sends with `data` (base64)
+ * 2. Gateway stores in R2, replaces `data` with `r2Key`
+ * 3. Session stores message with `r2Key` reference
+ * 4. On LLM call, Session fetches from R2 → base64
+ * 
+ * The `data` field is transient and not stored in SQLite.
+ * The `r2Key` is the permanent ref.
  */
 export type MediaAttachment = {
   /** Media type: image, audio, video, document */
   type: "image" | "audio" | "video" | "document";
   /** MIME type (e.g., image/jpeg, audio/ogg) */
   mimeType: string;
-  /** Base64-encoded data (preferred for LLM) */
+  /** Base64-encoded data */
   data?: string;
-  /** URL to media (fallback, requires fetch) */
+  /** R2 storage key */
+  r2Key?: string;
+  /** URL to media (for serving to channels) */
   url?: string;
   /** Original filename */
   filename?: string;
@@ -139,7 +149,6 @@ export type SessionRegistryEntry = {
   sessionKey: string;
   createdAt: number;
   lastActiveAt: number;
-  messageCount?: number;
   label?: string;
 };
 

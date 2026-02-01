@@ -34,13 +34,10 @@ export class GatewayClient {
 
   async connect(): Promise<void> {
     return new Promise((resolve, reject) => {
-      console.log(`[GatewayClient] Connecting to ${this.options.url}`);
-      
       const ws = new WebSocket(this.options.url);
       this.ws = ws;
 
       ws.addEventListener("open", async () => {
-        console.log("[GatewayClient] WebSocket opened, sending handshake");
         try {
           await this.handshake();
           this.connected = true;
@@ -55,13 +52,11 @@ export class GatewayClient {
       });
 
       ws.addEventListener("close", () => {
-        console.log("[GatewayClient] WebSocket closed");
         this.connected = false;
         this.options.onDisconnect?.();
       });
 
-      ws.addEventListener("error", (event) => {
-        console.error("[GatewayClient] WebSocket error:", event);
+      ws.addEventListener("error", () => {
         reject(new Error("WebSocket connection failed"));
       });
     });
@@ -85,8 +80,6 @@ export class GatewayClient {
     if (!res.ok) {
       throw new Error(`Handshake failed: ${res.error?.message}`);
     }
-
-    console.log("[GatewayClient] Handshake successful");
   }
 
   private handleMessage(data: string): void {
@@ -94,28 +87,21 @@ export class GatewayClient {
       const frame = JSON.parse(data) as Frame;
 
       if (frame.type === "res") {
-        // Response to a request we made
         const pending = this.pendingRequests.get(frame.id);
         if (pending) {
           this.pendingRequests.delete(frame.id);
           pending.resolve(frame);
         }
       } else if (frame.type === "evt") {
-        // Event from gateway
         this.handleEvent(frame);
       }
-    } catch (e) {
-      console.error("[GatewayClient] Failed to parse message:", e);
-    }
+    } catch {}
   }
 
   private handleEvent(frame: EventFrame): void {
     if (frame.event === "channel.outbound") {
       const payload = frame.payload as ChannelOutboundPayload;
-      console.log(`[GatewayClient] Received outbound for ${payload.peer.id}`);
-      this.options.onOutbound(payload).catch((e) => {
-        console.error("[GatewayClient] Failed to handle outbound:", e);
-      });
+      this.options.onOutbound(payload).catch(() => {});
     }
   }
 

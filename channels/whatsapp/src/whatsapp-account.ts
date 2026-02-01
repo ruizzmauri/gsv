@@ -14,11 +14,16 @@ import {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   DisconnectReason,
-  downloadMediaMessage,
+  extractMessageContent,
+  getContentType,
   type WASocket,
   type BaileysEventMap,
   type WAMessage,
 } from "@whiskeysockets/baileys";
+import {
+  getMediaKeys,
+  getUrlFromDirectPath,
+} from "@whiskeysockets/baileys/lib/Utils/messages-media";
 import QRCode from "qrcode";
 import { useDOAuthState, clearAuthState, hasAuthState } from "./auth-store";
 import { GatewayClient } from "./gateway-client";
@@ -278,62 +283,39 @@ export class WhatsAppAccount extends DurableObject<Env> {
   }
 
   private async startSocket(): Promise<void> {
-    console.log(`[WhatsAppAccount:${this.state.accountId}] Starting socket`);
-
-    // Get auth state from DO storage
     const { state: authState, saveCreds } = await useDOAuthState(this.ctx.storage);
 
-    // Get latest Baileys version
-    console.log(`[WhatsAppAccount:${this.state.accountId}] Fetching Baileys version...`);
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log(`[WhatsAppAccount:${this.state.accountId}] Baileys version: ${version.join(".")}, isLatest=${isLatest}`);
+    const { version } = await fetchLatestBaileysVersion();
 
-    // Create socket
+    const noopLogger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, trace: () => {}, child: () => noopLogger } as any;
+    
     this.sock = makeWASocket({
       auth: {
         creds: authState.creds,
-        keys: makeCacheableSignalKeyStore(authState.keys, console as any),
+        keys: makeCacheableSignalKeyStore(authState.keys, noopLogger),
       },
       version,
       printQRInTerminal: false,
       browser: ["GSV WhatsApp", "Channel", "1.0.0"],
       syncFullHistory: false,
       markOnlineOnConnect: false,
+      logger: noopLogger,
     });
 
-    // Set up event handlers
     this.sock.ev.on("creds.update", saveCreds);
     this.sock.ev.on("connection.update", (update) => this.handleConnectionUpdate(update));
-    this.sock.ev.on("messages.upsert", (m) => this.handleMessagesUpsert(m));
-    
-    // Handle WebSocket errors
-    if (this.sock.ws) {
-      const ws = this.sock.ws as any;
-      if (typeof ws.on === "function") {
-        ws.on("error", (err: Error) => {
-          console.error(`[WhatsAppAccount:${this.state.accountId}] WebSocket error:`, err);
-        });
-        ws.on("close", (code: number, reason: string) => {
-          console.log(`[WhatsAppAccount:${this.state.accountId}] WebSocket closed: code=${code}, reason=${reason}`);
-        });
-        ws.on("open", () => {
-          console.log(`[WhatsAppAccount:${this.state.accountId}] WebSocket opened`);
-        });
-      }
-    }
-    
-    console.log(`[WhatsAppAccount:${this.state.accountId}] Socket created, ws=${!!this.sock.ws}, waiting for events...`);
+    this.sock.ev.on("messages.upsert", (m) => {
+      this.handleMessagesUpsert(m).catch((e) => {
+        console.error(`[WA] handleMessagesUpsert error:`, e);
+      });
+    });
   }
 
   private handleConnectionUpdate(update: Partial<BaileysEventMap["connection.update"]>): void {
-    console.log(`[WhatsAppAccount:${this.state.accountId}] connection.update:`, JSON.stringify(update, null, 2));
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      console.log(`[WhatsAppAccount:${this.state.accountId}] QR code received (length: ${qr.length})`);
       this.qrCode = qr;
-      // Resolve any waiting QR promises
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Resolving ${this.qrResolvers.length} QR waiters`);
       for (const resolve of this.qrResolvers) {
         resolve(qr);
       }
@@ -341,65 +323,46 @@ export class WhatsAppAccount extends DurableObject<Env> {
     }
 
     if (connection === "open") {
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Connected to WhatsApp`);
       this.state.connected = true;
       this.state.lastConnectedAt = Date.now();
       this.state.selfJid = this.sock?.user?.id;
       
-      // Extract E164 from JID (format: 14155551234@s.whatsapp.net)
+      // Extract E164 from JID (format: 14155551234@s.whatsapp.net or 14155551234:13@s.whatsapp.net)
       if (this.state.selfJid) {
-        const match = this.state.selfJid.match(/^(\d+)@/);
+        const match = this.state.selfJid.match(/^(\d+)(?::\d+)?@/);
         if (match) {
           this.state.selfE164 = `+${match[1]}`;
         }
       }
       
-      // Connect to GSV Gateway now that WhatsApp is connected
       this.connectToGateway().catch((e) => {
-        console.error(`[WhatsAppAccount:${this.state.accountId}] Failed to connect to gateway:`, e);
+        console.error(`[WA] Gateway connect failed:`, e);
       });
       
-      // Set up keep-alive alarm to prevent DO hibernation
-      // This ensures the WhatsApp WebSocket stays connected
       this.scheduleKeepAlive();
     }
 
     if (connection === "close") {
       const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
       const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Disconnected: ${statusCode}, loggedOut=${isLoggedOut}`);
       
       this.state.connected = false;
       this.state.lastDisconnectedAt = Date.now();
 
       if (isLoggedOut) {
-        // Clear auth and don't reconnect
         clearAuthState(this.ctx.storage);
       } else {
-        // Attempt reconnect after delay
-        // In DO, we'd set an alarm for this
         this.ctx.storage.setAlarm(Date.now() + 5000);
       }
     }
   }
 
   private async handleMessagesUpsert(m: BaileysEventMap["messages.upsert"]): Promise<void> {
-    console.log(`[WhatsAppAccount:${this.state.accountId}] messages.upsert: type=${m.type}, count=${m.messages.length}`);
-    
-    if (m.type !== "notify") {
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Skipping non-notify message type`);
-      return;
-    }
+    if (m.type !== "notify") return;
 
     for (const msg of m.messages) {
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Processing message: fromMe=${msg.key.fromMe}, remoteJid=${msg.key.remoteJid}`);
-      
       // Skip our own messages
-      if (msg.key.fromMe) {
-        console.log(`[WhatsAppAccount:${this.state.accountId}] Skipping own message`);
-        continue;
-      }
+      if (msg.key.fromMe) continue;
 
       // Check for media messages
       const hasImage = !!msg.message?.imageMessage;
@@ -415,14 +378,8 @@ export class WhatsAppAccount extends DurableObject<Env> {
                    msg.message?.videoMessage?.caption ||
                    (hasMedia ? "" : undefined); // Allow empty text if media present
       
-      if (text === undefined) {
-        console.log(`[WhatsAppAccount:${this.state.accountId}] Skipping message without content`);
-        continue;
-      }
+      if (text === undefined) continue;
 
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Received message from ${msg.key.remoteJid}: text="${text.substring(0, 50)}...", hasMedia=${hasMedia}`);
-
-      // Build peer info
       const remoteJid = msg.key.remoteJid!;
       const isGroup = remoteJid.endsWith("@g.us");
       
@@ -439,12 +396,14 @@ export class WhatsAppAccount extends DurableObject<Env> {
           const attachment = await this.downloadMedia(msg);
           if (attachment) {
             media.push(attachment);
-            console.log(`[WhatsAppAccount:${this.state.accountId}] Downloaded media: ${attachment.type}, ${attachment.mimeType}, ${attachment.data?.length ?? 0} chars base64`);
+            console.log(`[WA] Media: ${attachment.type} ${attachment.mimeType} ${Math.round((attachment.data?.length ?? 0) / 1024)}KB`);
           }
         } catch (e) {
-          console.error(`[WhatsAppAccount:${this.state.accountId}] Failed to download media:`, e);
+          console.error(`[WA] Media download failed:`, e);
         }
       }
+
+      console.log(`[WA] ${remoteJid}: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"${media.length > 0 ? ` +${media.length} media` : ''}`);
 
       // Build inbound params
       const inbound: ChannelInboundParams = {
@@ -470,7 +429,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
           await this.gatewayClient.sendInbound(inbound);
           this.state.lastMessageAt = Date.now();
         } catch (e) {
-          console.error(`[WhatsAppAccount:${this.state.accountId}] Failed to send to gateway:`, e);
+          console.error(`[WA] Gateway send failed:`, e);
         }
       }
     }
@@ -478,67 +437,112 @@ export class WhatsAppAccount extends DurableObject<Env> {
 
   /**
    * Download media from a WhatsApp message and return as MediaAttachment
+   * 
+   * Custom implementation for Cloudflare Workers since Baileys' downloadMediaMessage
+   * uses Node.js streams (pipe) which aren't supported in Workers.
    */
   private async downloadMedia(msg: WAMessage): Promise<MediaAttachment | null> {
     if (!this.sock) return null;
 
-    try {
-      // Determine media type and get metadata
-      let mediaType: MediaAttachment["type"];
-      let mimeType: string;
-      let filename: string | undefined;
+    const mContent = extractMessageContent(msg.message);
+    if (!mContent) return null;
 
-      if (msg.message?.imageMessage) {
-        mediaType = "image";
-        mimeType = msg.message.imageMessage.mimetype || "image/jpeg";
-        filename = msg.message.imageMessage.caption ?? undefined;
-      } else if (msg.message?.videoMessage) {
-        mediaType = "video";
-        mimeType = msg.message.videoMessage.mimetype || "video/mp4";
-        filename = msg.message.videoMessage.caption ?? undefined;
-      } else if (msg.message?.audioMessage) {
-        mediaType = "audio";
-        mimeType = msg.message.audioMessage.mimetype || "audio/ogg";
-      } else if (msg.message?.documentMessage) {
-        mediaType = "document";
-        mimeType = msg.message.documentMessage.mimetype || "application/octet-stream";
-        filename = msg.message.documentMessage.fileName ?? undefined;
-      } else {
-        return null;
-      }
+    const contentType = getContentType(mContent);
+    if (!contentType) return null;
 
-      // Download the media
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Downloading ${mediaType} (${mimeType})...`);
-      const buffer = await downloadMediaMessage(
-        msg,
-        "buffer",
-        {},
-        {
-          logger: console as any,
-          reuploadRequest: this.sock.updateMediaMessage,
-        }
-      );
+    // Determine media type and get metadata
+    let mediaType: MediaAttachment["type"];
+    let mimeType: string;
+    let filename: string | undefined;
+    let baileysMediaType: string;
 
-      if (!buffer) {
-        console.log(`[WhatsAppAccount:${this.state.accountId}] No buffer returned from media download`);
-        return null;
-      }
-
-      // Convert to base64
-      const base64 = Buffer.from(buffer).toString("base64");
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Media downloaded: ${base64.length} chars base64`);
-
-      return {
-        type: mediaType,
-        mimeType,
-        data: base64,
-        filename,
-        size: buffer.byteLength,
-      };
-    } catch (e) {
-      console.error(`[WhatsAppAccount:${this.state.accountId}] Media download error:`, e);
+    if (msg.message?.imageMessage) {
+      mediaType = "image";
+      mimeType = msg.message.imageMessage.mimetype || "image/jpeg";
+      filename = msg.message.imageMessage.caption ?? undefined;
+      baileysMediaType = "image";
+    } else if (msg.message?.videoMessage) {
+      mediaType = "video";
+      mimeType = msg.message.videoMessage.mimetype || "video/mp4";
+      filename = msg.message.videoMessage.caption ?? undefined;
+      baileysMediaType = "video";
+    } else if (msg.message?.audioMessage) {
+      mediaType = "audio";
+      mimeType = msg.message.audioMessage.mimetype || "audio/ogg";
+      baileysMediaType = "audio";
+    } else if (msg.message?.documentMessage) {
+      mediaType = "document";
+      mimeType = msg.message.documentMessage.mimetype || "application/octet-stream";
+      filename = msg.message.documentMessage.fileName ?? undefined;
+      baileysMediaType = "document";
+    } else {
       return null;
     }
+
+    const media = mContent[contentType] as {
+      url?: string;
+      directPath?: string;
+      mediaKey?: Uint8Array | Buffer;
+      fileLength?: number;
+    };
+
+    if (!media || typeof media !== "object") return null;
+    if (!media.url && !media.directPath) return null;
+    if (!media.mediaKey) return null;
+
+    // Get download URL
+    const isValidMediaUrl = media.url?.startsWith("https://mmg.whatsapp.net/");
+    const downloadUrl = isValidMediaUrl ? media.url : getUrlFromDirectPath(media.directPath!);
+    if (!downloadUrl) return null;
+
+    // Get decryption keys
+    const keys = await getMediaKeys(media.mediaKey, baileysMediaType as any);
+
+    // Download encrypted content using fetch (Workers-compatible)
+    const response = await fetch(downloadUrl, {
+      headers: {
+        Origin: "https://web.whatsapp.com",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Media download failed: HTTP ${response.status}`);
+    }
+
+    const encryptedData = new Uint8Array(await response.arrayBuffer());
+
+    // WhatsApp media format: [encrypted data][10-byte MAC]
+    // The last 10 bytes are the HMAC-SHA256 truncated to 10 bytes
+    const ciphertext = encryptedData.slice(0, -10);
+    // const mac = encryptedData.slice(-10); // Could verify MAC if needed
+
+    // Decrypt using AES-256-CBC
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      keys.cipherKey,
+      { name: "AES-CBC" },
+      false,
+      ["decrypt"]
+    );
+
+    const decrypted = await crypto.subtle.decrypt(
+      { name: "AES-CBC", iv: keys.iv },
+      cryptoKey,
+      ciphertext
+    );
+
+    const decryptedArray = new Uint8Array(decrypted);
+
+    // Convert to base64
+    const base64 = btoa(String.fromCharCode(...decryptedArray));
+
+    return {
+      type: mediaType,
+      mimeType,
+      data: base64,
+      filename,
+      size: decryptedArray.byteLength,
+    };
   }
 
   private async connectToGateway(): Promise<void> {
@@ -550,127 +554,83 @@ export class WhatsAppAccount extends DurableObject<Env> {
       accountId: this.state.selfE164 || this.state.accountId,
       onOutbound: (payload) => this.handleOutbound(payload),
       onDisconnect: () => {
-        console.log(`[WhatsAppAccount:${this.state.accountId}] Gateway disconnected`);
-        // Set alarm to reconnect
         this.ctx.storage.setAlarm(Date.now() + 3000);
       },
     });
 
     await this.gatewayClient.connect();
-    console.log(`[WhatsAppAccount:${this.state.accountId}] Connected to gateway`);
   }
 
   private async handleOutbound(payload: ChannelOutboundPayload): Promise<void> {
-    console.log(`[WhatsAppAccount:${this.state.accountId}] handleOutbound called, sock=${!!this.sock}, connected=${this.state.connected}`);
-    console.log(`[WhatsAppAccount:${this.state.accountId}] Outbound payload:`, JSON.stringify(payload));
-    
-    if (!this.sock || !this.state.connected) {
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Cannot send: not connected (sock=${!!this.sock}, connected=${this.state.connected})`);
-      return;
-    }
+    if (!this.sock || !this.state.connected) return;
 
     const jid = payload.peer.id;
     const text = payload.message.text;
-    
-    console.log(`[WhatsAppAccount:${this.state.accountId}] Sending to ${jid}: "${text.substring(0, 100)}..."`);
 
     try {
-      // Simple send without quoting for now to debug
-      const result = await this.sock.sendMessage(jid, { text });
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Send result:`, result?.key?.id);
+      await this.sock.sendMessage(jid, { text });
+      console.log(`[WA] Sent to ${jid}: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
     } catch (e) {
-      console.error(`[WhatsAppAccount:${this.state.accountId}] Failed to send:`, e);
-      // Log more details about the error
-      if (e instanceof Error) {
-        console.error(`[WhatsAppAccount:${this.state.accountId}] Error stack:`, e.stack);
-      }
+      console.error(`[WA] Send failed:`, e);
     }
   }
 
   private waitForQrOrConnection(timeoutMs: number): Promise<{ connected?: boolean; qr?: string }> {
     return new Promise((resolve) => {
-      console.log(`[WhatsAppAccount:${this.state.accountId}] waitForQrOrConnection called, timeout=${timeoutMs}ms`);
-      
-      // If already connected
       if (this.state.connected) {
-        console.log(`[WhatsAppAccount:${this.state.accountId}] Already connected`);
         resolve({ connected: true });
         return;
       }
 
-      // If we already have a QR code
       if (this.qrCode) {
-        console.log(`[WhatsAppAccount:${this.state.accountId}] Already have QR code`);
         resolve({ qr: this.qrCode });
         return;
       }
 
-      // Wait for QR
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Waiting for QR code...`);
-      const timeout = setTimeout(() => {
-        console.log(`[WhatsAppAccount:${this.state.accountId}] Timeout waiting for QR`);
-        resolve({});
-      }, timeoutMs);
+      const timeout = setTimeout(() => resolve({}), timeoutMs);
 
       this.qrResolvers.push((qr) => {
-        console.log(`[WhatsAppAccount:${this.state.accountId}] QR resolver called`);
         clearTimeout(timeout);
         resolve({ qr });
       });
     });
   }
 
-  // Keep-alive interval in ms (25 seconds - well under DO's hibernation timeout)
-  private static readonly KEEP_ALIVE_INTERVAL_MS = 25_000;
+  // Keep-alive interval in ms 10 seconds
+  private static readonly KEEP_ALIVE_INTERVAL_MS = 10_000;
 
-  /**
-   * Schedule a keep-alive alarm to prevent DO hibernation.
-   * This ensures the WhatsApp WebSocket connection stays active.
-   */
+  /** Schedule a keep-alive alarm to prevent DO hibernation */
   private scheduleKeepAlive(): void {
-    const nextAlarm = Date.now() + WhatsAppAccount.KEEP_ALIVE_INTERVAL_MS;
-    this.ctx.storage.setAlarm(nextAlarm);
-    console.log(`[WhatsAppAccount:${this.state.accountId}] Keep-alive alarm scheduled for ${new Date(nextAlarm).toISOString()}`);
+    this.ctx.storage.setAlarm(Date.now() + WhatsAppAccount.KEEP_ALIVE_INTERVAL_MS);
   }
 
-  /**
-   * Alarm handler - used for reconnection attempts and keep-alive
-   */
+  /** Alarm handler - reconnection and keep-alive */
   async alarm(): Promise<void> {
-    console.log(`[WhatsAppAccount:${this.state.accountId}] Alarm triggered, connected=${this.state.connected}, sock=${!!this.sock}`);
-
-    // If we're connected, this is a keep-alive alarm
-    if (this.sock && this.state.connected) {
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Keep-alive: connection active`);
-      
-      // Reconnect to gateway if needed (it may have disconnected)
-      if (!this.gatewayClient?.isConnected()) {
-        console.log(`[WhatsAppAccount:${this.state.accountId}] Keep-alive: gateway disconnected, reconnecting...`);
-        try {
-          await this.connectToGateway();
-        } catch (e) {
-          console.error(`[WhatsAppAccount:${this.state.accountId}] Keep-alive: failed to reconnect gateway:`, e);
-        }
-      }
-      
-      // Schedule next keep-alive
-      this.scheduleKeepAlive();
+    const hasAuth = await hasAuthState(this.ctx.storage);
+    if (!hasAuth) {
+      // No auth, nothing to do
       return;
     }
 
-    // Not connected - attempt reconnection
-    if (!this.sock || !this.state.connected) {
-      const hasAuth = await hasAuthState(this.ctx.storage);
-      if (hasAuth) {
-        console.log(`[WhatsAppAccount:${this.state.accountId}] Alarm: reconnecting WhatsApp...`);
-        await this.startSocket();
+    // Reconnect WhatsApp if needed (sock is lost on hibernation)
+    if (!this.sock) {
+      console.log(`[WA] Alarm: WhatsApp socket lost, reconnecting...`);
+      await this.startSocket();
+      // Don't proceed - handleConnectionUpdate will reconnect Gateway and schedule next alarm
+      return;
+    }
+
+    // WhatsApp socket exists - check Gateway connection
+    if (!this.gatewayClient?.isConnected()) {
+      console.log(`[WA] Alarm: Gateway not connected, reconnecting...`);
+      try {
+        await this.connectToGateway();
+      } catch (e) {
+        console.error(`[WA] Alarm: Gateway reconnect failed:`, e);
       }
     }
 
-    // Reconnect to gateway if WhatsApp is connected
-    if (this.state.connected && !this.gatewayClient?.isConnected()) {
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Alarm: reconnecting gateway...`);
-      await this.connectToGateway();
-    }
+    // Schedule next keep-alive
+    this.scheduleKeepAlive();
   }
 }
