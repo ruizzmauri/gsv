@@ -25,6 +25,12 @@ import {
   fetchMediaFromR2,
   deleteSessionMedia,
 } from "./storage";
+import {
+  loadAgentWorkspace,
+  buildSystemPromptFromWorkspace,
+  isMainSession,
+  type AgentWorkspace,
+} from "./workspace";
 
 type PendingToolCall = {
   id: string;
@@ -671,10 +677,12 @@ export class Session extends DurableObject<Env> {
       this.currentMessageOverrides.model ||
       sessionSettings.model ||
       config.model;
-    const effectiveSystemPrompt =
-      sessionSettings.systemPrompt ||
-      config.systemPrompt ||
-      "You are a helpful assistant with access to tools.";
+    
+    // Build system prompt from workspace files + config
+    const effectiveSystemPrompt = await this.buildEffectiveSystemPrompt(
+      config,
+      sessionSettings,
+    );
 
     if (this.currentMessageOverrides.model) {
       console.log(
@@ -784,6 +792,48 @@ export class Session extends DurableObject<Env> {
     }
 
     return response;
+  }
+
+  /**
+   * Build the effective system prompt by combining workspace files with config
+   * 
+   * Loads agent identity files from R2 and merges with session/config settings
+   */
+  private async buildEffectiveSystemPrompt(
+    config: GsvConfig,
+    sessionSettings: SessionSettings,
+  ): Promise<string> {
+    // Extract agentId from session key (format: agent:{agentId}:{channel}:{peerKind}:{peerId})
+    const agentId = this.meta.sessionKey?.split(":")[1] || "main";
+    
+    // Check if this is main session (for MEMORY.md security)
+    const mainSession = isMainSession(this.meta.sessionKey || "");
+    
+    console.log(`[Session] Loading workspace for agent: ${agentId} (mainSession: ${mainSession})`);
+    
+    // Load workspace from R2
+    const workspace = await loadAgentWorkspace(this.env.STORAGE, agentId, mainSession);
+    
+    // Log what was loaded
+    const loaded = [
+      workspace.agents?.exists && "AGENTS.md",
+      workspace.soul?.exists && "SOUL.md",
+      workspace.user?.exists && "USER.md",
+      workspace.memory?.exists && "MEMORY.md",
+      workspace.tools?.exists && "TOOLS.md",
+      workspace.dailyMemory?.exists && "daily",
+      workspace.yesterdayMemory?.exists && "yesterday",
+    ].filter(Boolean);
+    
+    if (loaded.length > 0) {
+      console.log(`[Session] Workspace files loaded: ${loaded.join(", ")}`);
+    }
+    
+    // Get base prompt from settings or config
+    const basePrompt = sessionSettings.systemPrompt || config.systemPrompt;
+    
+    // Build combined prompt
+    return buildSystemPromptFromWorkspace(basePrompt, workspace);
   }
 
   private async broadcastToClients(payload: {

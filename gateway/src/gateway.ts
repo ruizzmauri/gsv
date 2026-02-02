@@ -21,7 +21,16 @@ import {
   PeerInfo,
 } from "./types";
 import { isWebSocketRequest, validateFrame, isWsConnected } from "./utils";
-import { GsvConfig, DEFAULT_CONFIG, mergeConfig } from "./config";
+import { GsvConfig, DEFAULT_CONFIG, mergeConfig, resolveAgentIdFromBinding, getAgentConfig, parseDuration, HeartbeatConfig, isAllowedSender } from "./config";
+import { 
+  HeartbeatState, 
+  getHeartbeatConfig, 
+  getNextHeartbeatTime, 
+  isWithinActiveHours,
+  shouldDeliverResponse,
+  DEFAULT_HEARTBEAT_PROMPT,
+  HEARTBEAT_OK_TOKEN,
+} from "./heartbeat";
 import { parseCommand, HELP_TEXT, normalizeThinkLevel, resolveModelAlias, listModelAliases } from "./commands";
 import { parseDirectives, isDirectiveOnly, formatDirectiveAck } from "./directives";
 import { processMediaWithTranscription } from "./transcription";
@@ -79,6 +88,25 @@ export class Gateway extends DurableObject<Env> {
   channelRegistry = PersistedObject<Record<string, ChannelRegistryEntry>>(
     this.ctx.storage.kv,
     { prefix: "channelRegistry:" },
+  );
+
+  // Heartbeat state per agent
+  heartbeatState = PersistedObject<Record<string, HeartbeatState>>(
+    this.ctx.storage.kv,
+    { prefix: "heartbeatState:" },
+  );
+
+  // Last active channel context per agent (for heartbeat delivery)
+  lastActiveContext = PersistedObject<Record<string, {
+    agentId: string;
+    channel: ChannelId;
+    accountId: string;
+    peer: PeerInfo;
+    sessionKey: string;
+    timestamp: number;
+  }>>(
+    this.ctx.storage.kv,
+    { prefix: "lastActiveContext:" },
   );
 
   constructor(state: DurableObjectState, env: Env) {
@@ -198,6 +226,12 @@ export class Gateway extends DurableObject<Env> {
         return this.handleChannelInbound(ws, frame);
       case "channels.list":
         return this.handleChannelsList(ws, frame);
+      case "heartbeat.trigger":
+        return this.handleHeartbeatTrigger(ws, frame);
+      case "heartbeat.status":
+        return this.handleHeartbeatStatus(ws, frame);
+      case "heartbeat.start":
+        return this.handleHeartbeatStart(ws, frame);
       default:
         this.sendError(ws, frame.id, 404, `Unknown method: ${frame.method}`);
     }
@@ -914,9 +948,32 @@ export class Gateway extends DurableObject<Env> {
       return;
     }
 
+    const config = await this.getConfig();
+
+    // Check allowlist before processing
+    // For DMs, check the peer ID; for groups, check the sender (if provided)
+    const senderId = params.sender?.id ?? params.peer.id;
+    const allowCheck = isAllowedSender(config, params.channel, senderId, params.peer.id);
+    
+    if (!allowCheck.allowed) {
+      console.log(`[Gateway] Blocked message from ${senderId}: ${allowCheck.reason}`);
+      // Silently acknowledge but don't process
+      this.sendOk(ws, frame.id, { 
+        status: "blocked",
+        reason: allowCheck.reason,
+      });
+      return;
+    }
+
     // Generate session key from channel context
     // Format: agent:{agentId}:{channel}:{peerKind}:{peerId}
-    const agentId = "main";
+    // Resolve agentId from bindings configuration
+    const agentId = resolveAgentIdFromBinding(
+      config,
+      params.channel,
+      params.accountId,
+      params.peer,
+    );
     const sessionKey = this.buildSessionKeyFromChannel(agentId, params.channel, params.peer);
 
     const channelKey = `${params.channel}:${params.accountId}`;
@@ -1026,6 +1083,7 @@ export class Gateway extends DurableObject<Env> {
         {
           workersAi: this.env.AI,
           openaiApiKey: config.apiKeys.openai,
+          preferredProvider: config.transcription?.provider,
         },
       );
       
@@ -1045,6 +1103,17 @@ export class Gateway extends DurableObject<Env> {
         accountId: params.accountId,
         peer: params.peer,
         inboundMessageId: params.message.id,
+      };
+
+      // Update last active context for heartbeat delivery
+      // This tracks where the user last messaged from
+      this.lastActiveContext[agentId] = {
+        agentId,
+        channel: params.channel,
+        accountId: params.accountId,
+        peer: params.peer,
+        sessionKey,
+        timestamp: Date.now(),
       };
 
       const result = await sessionStub.chatSend(
@@ -1257,6 +1326,30 @@ export class Gateway extends DurableObject<Env> {
     });
   }
 
+  // ---- Heartbeat RPC handlers ----
+
+  async handleHeartbeatTrigger(ws: WebSocket, frame: RequestFrame) {
+    const params = frame.params as { agentId?: string } | undefined;
+    const agentId = params?.agentId ?? "main";
+    
+    const result = await this.triggerHeartbeat(agentId);
+    this.sendOk(ws, frame.id, result);
+  }
+
+  async handleHeartbeatStatus(ws: WebSocket, frame: RequestFrame) {
+    const status = await this.getHeartbeatStatus();
+    this.sendOk(ws, frame.id, { agents: status });
+  }
+
+  async handleHeartbeatStart(ws: WebSocket, frame: RequestFrame) {
+    await this.scheduleHeartbeat();
+    const status = await this.getHeartbeatStatus();
+    this.sendOk(ws, frame.id, { 
+      message: "Heartbeat scheduler started",
+      agents: status,
+    });
+  }
+
   private getConfigPath(path: string): unknown {
     const parts = path.split(".");
     let current: unknown = this.getFullConfig();
@@ -1277,19 +1370,37 @@ export class Gateway extends DurableObject<Env> {
     
     if (parts.length === 1) {
       this.configStore[path] = value;
-    } else if (parts.length === 2) {
-      const [group, field] = parts;
-      
-      const existing = this.configStore[group];
-      const groupObj = (typeof existing === "object" && existing !== null) 
-        ? { ...existing as Record<string, unknown> }
-        : {};
-      
-      groupObj[field] = value;
-      this.configStore[group] = groupObj;
-      
-      delete this.configStore[path];
+      return;
     }
+    
+    // Handle nested paths like "channels.whatsapp.allowFrom"
+    // Get a plain object copy of the config store (PersistedObject proxy can't be cloned)
+    const plainConfig = JSON.parse(JSON.stringify(this.configStore)) as Record<string, unknown>;
+    
+    // Build up the nested structure
+    let current = plainConfig;
+    
+    for (let i = 0; i < parts.length - 1; i++) {
+      const part = parts[i];
+      const existing = current[part];
+      
+      if (typeof existing !== "object" || existing === null) {
+        current[part] = {};
+      }
+      
+      current = current[part] as Record<string, unknown>;
+    }
+    
+    // Set the final value
+    const lastPart = parts[parts.length - 1];
+    current[lastPart] = value;
+    
+    // Write back the top-level key
+    const topLevelKey = parts[0];
+    this.configStore[topLevelKey] = plainConfig[topLevelKey];
+    
+    // Clean up any flat key that might exist
+    delete this.configStore[path];
   }
 
   private getFullConfig(): GsvConfig {
@@ -1380,6 +1491,22 @@ export class Gateway extends DurableObject<Env> {
       return;
     }
 
+    // Check if this is a heartbeat response (inboundMessageId starts with "heartbeat:")
+    const isHeartbeat = context.inboundMessageId.startsWith("heartbeat:");
+    
+    if (isHeartbeat) {
+      // Check if response should be suppressed (HEARTBEAT_OK with short content)
+      const { deliver, cleanedText } = shouldDeliverResponse(text, {});
+      
+      if (!deliver) {
+        console.log(`[Gateway] Heartbeat response suppressed (HEARTBEAT_OK or short ack)`);
+        return;
+      }
+      
+      // Use cleaned text (HEARTBEAT_OK stripped)
+      text = cleanedText || text;
+    }
+
     const outbound: ChannelOutboundPayload = {
       channel: context.channel,
       accountId: context.accountId,
@@ -1387,7 +1514,7 @@ export class Gateway extends DurableObject<Env> {
       sessionKey,
       message: {
         text,
-        replyToId: context.inboundMessageId,
+        replyToId: isHeartbeat ? undefined : context.inboundMessageId, // Don't reply to heartbeat
       },
     };
 
@@ -1398,6 +1525,228 @@ export class Gateway extends DurableObject<Env> {
     };
 
     channelWs.send(JSON.stringify(evt));
-    console.log(`[Gateway] Routed response to channel ${channelKey}`);
+    console.log(`[Gateway] Routed response to channel ${channelKey}${isHeartbeat ? ' (heartbeat)' : ''}`);
+  }
+
+  // ---- Heartbeat System ----
+
+  /**
+   * Schedule the next heartbeat alarm
+   */
+  private async scheduleHeartbeat(): Promise<void> {
+    const config = await this.getConfig();
+    const agents = config.agents?.list ?? [{ id: "main", default: true }];
+    
+    let nextAlarmTime: number | null = null;
+    
+    for (const agent of agents) {
+      const heartbeatConfig = getHeartbeatConfig(config, agent.id);
+      const nextTime = getNextHeartbeatTime(heartbeatConfig);
+      
+      if (nextTime !== null) {
+        // Update state
+        const state = this.heartbeatState[agent.id] ?? {
+          agentId: agent.id,
+          nextHeartbeatAt: null,
+          lastHeartbeatAt: null,
+          lastHeartbeatText: null,
+          lastHeartbeatSentAt: null,
+        };
+        state.nextHeartbeatAt = nextTime;
+        this.heartbeatState[agent.id] = state;
+        
+        // Track earliest alarm
+        if (nextAlarmTime === null || nextTime < nextAlarmTime) {
+          nextAlarmTime = nextTime;
+        }
+      }
+    }
+    
+    if (nextAlarmTime !== null) {
+      this.ctx.storage.setAlarm(nextAlarmTime);
+      console.log(`[Gateway] Heartbeat alarm scheduled for ${new Date(nextAlarmTime).toISOString()}`);
+    }
+  }
+
+  /**
+   * Handle alarm (heartbeat trigger)
+   */
+  async alarm(): Promise<void> {
+    console.log(`[Gateway] Heartbeat alarm fired`);
+    
+    const config = await this.getConfig();
+    const now = Date.now();
+    
+    // Find agents whose heartbeat is due
+    for (const agentId of Object.keys(this.heartbeatState)) {
+      const state = this.heartbeatState[agentId];
+      if (!state.nextHeartbeatAt || state.nextHeartbeatAt > now) continue;
+      
+      const heartbeatConfig = getHeartbeatConfig(config, agentId);
+      
+      // Check active hours
+      if (!isWithinActiveHours(heartbeatConfig.activeHours)) {
+        console.log(`[Gateway] Heartbeat for ${agentId} skipped (outside active hours)`);
+        state.nextHeartbeatAt = getNextHeartbeatTime(heartbeatConfig);
+        this.heartbeatState[agentId] = state;
+        continue;
+      }
+      
+      // Run heartbeat
+      await this.runHeartbeat(agentId, heartbeatConfig, "interval");
+      
+      // Schedule next
+      state.lastHeartbeatAt = now;
+      state.nextHeartbeatAt = getNextHeartbeatTime(heartbeatConfig);
+      this.heartbeatState[agentId] = state;
+    }
+    
+    // Schedule next alarm
+    await this.scheduleHeartbeat();
+  }
+
+  /**
+   * Run a heartbeat for an agent
+   */
+  private async runHeartbeat(
+    agentId: string,
+    config: HeartbeatConfig,
+    reason: "interval" | "manual" | "cron",
+  ): Promise<void> {
+    console.log(`[Gateway] Running heartbeat for agent ${agentId} (reason: ${reason})`);
+    
+    // Resolve delivery target from config
+    const target = config.target ?? "last";
+    
+    // Get last active context for this agent
+    const lastActive = this.lastActiveContext[agentId];
+    
+    // Determine session and delivery context
+    let sessionKey: string;
+    let deliveryContext: { channel: ChannelId; accountId: string; peer: PeerInfo } | null = null;
+    
+    if (target === "none") {
+      // Silent heartbeat - run in isolated session, no delivery
+      sessionKey = `agent:${agentId}:heartbeat:system:internal`;
+      console.log(`[Gateway] Heartbeat target=none, using isolated session`);
+    } else if (target === "last" && lastActive) {
+      // Use last active session and deliver to that channel
+      sessionKey = lastActive.sessionKey;
+      deliveryContext = {
+        channel: lastActive.channel,
+        accountId: lastActive.accountId,
+        peer: lastActive.peer,
+      };
+      console.log(`[Gateway] Heartbeat target=last, delivering to ${lastActive.channel}:${lastActive.peer.id}`);
+    } else if (target !== "last" && target !== "none") {
+      // Specific channel target (e.g., "whatsapp")
+      // For now, use last active if channel matches
+      if (lastActive && lastActive.channel === target) {
+        sessionKey = lastActive.sessionKey;
+        deliveryContext = {
+          channel: lastActive.channel,
+          accountId: lastActive.accountId,
+          peer: lastActive.peer,
+        };
+        console.log(`[Gateway] Heartbeat target=${target}, matched last active`);
+      } else {
+        // No matching context, run silently
+        sessionKey = `agent:${agentId}:heartbeat:system:internal`;
+        console.log(`[Gateway] Heartbeat target=${target}, no matching context, running silently`);
+      }
+    } else {
+      // No last active context, run in isolated session
+      sessionKey = `agent:${agentId}:heartbeat:system:internal`;
+      console.log(`[Gateway] Heartbeat: no last active context, running silently`);
+    }
+    
+    // Get the session DO
+    const session = this.env.SESSION.get(
+      this.env.SESSION.idFromName(sessionKey),
+    );
+    
+    // Set up delivery context if we have one
+    if (deliveryContext) {
+      this.pendingChannelResponses[sessionKey] = {
+        ...deliveryContext,
+        inboundMessageId: `heartbeat:${reason}:${Date.now()}`,
+      };
+    }
+    
+    // Send heartbeat prompt
+    const runId = crypto.randomUUID();
+    const prompt = config.prompt ?? DEFAULT_HEARTBEAT_PROMPT;
+    
+    try {
+      await session.chatSend(prompt, runId, [], sessionKey);
+      console.log(`[Gateway] Heartbeat sent to session ${sessionKey}`);
+    } catch (e) {
+      console.error(`[Gateway] Heartbeat failed for ${agentId}:`, e);
+      // Clean up pending context on failure
+      if (deliveryContext) {
+        delete this.pendingChannelResponses[sessionKey];
+      }
+    }
+  }
+
+  /**
+   * Manually trigger a heartbeat for an agent
+   */
+  async triggerHeartbeat(agentId: string): Promise<{ ok: boolean; message: string }> {
+    const config = await this.getConfig();
+    const heartbeatConfig = getHeartbeatConfig(config, agentId);
+    
+    await this.runHeartbeat(agentId, heartbeatConfig, "manual");
+    
+    return { ok: true, message: `Heartbeat triggered for agent ${agentId}` };
+  }
+
+  /**
+   * Get heartbeat status for all agents
+   */
+  async getHeartbeatStatus(): Promise<Record<string, HeartbeatState & { 
+    lastActive?: {
+      channel: ChannelId;
+      accountId: string;
+      peer: PeerInfo;
+      timestamp: number;
+    } 
+  }>> {
+    const result: Record<string, HeartbeatState & { lastActive?: { channel: ChannelId; accountId: string; peer: PeerInfo; timestamp: number } }> = {};
+    
+    // Merge heartbeat state with last active context
+    for (const [agentId, state] of Object.entries(this.heartbeatState)) {
+      const lastActive = this.lastActiveContext[agentId];
+      result[agentId] = {
+        ...state,
+        lastActive: lastActive ? {
+          channel: lastActive.channel,
+          accountId: lastActive.accountId,
+          peer: lastActive.peer,
+          timestamp: lastActive.timestamp,
+        } : undefined,
+      };
+    }
+    
+    // Also include agents with lastActive but no heartbeat state yet
+    for (const [agentId, context] of Object.entries(this.lastActiveContext)) {
+      if (!result[agentId]) {
+        result[agentId] = {
+          agentId,
+          nextHeartbeatAt: null,
+          lastHeartbeatAt: null,
+          lastHeartbeatText: null,
+          lastHeartbeatSentAt: null,
+          lastActive: {
+            channel: context.channel,
+            accountId: context.accountId,
+            peer: context.peer,
+            timestamp: context.timestamp,
+          },
+        };
+      }
+    }
+    
+    return result;
   }
 }

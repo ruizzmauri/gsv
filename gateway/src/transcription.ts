@@ -8,6 +8,7 @@
  */
 
 import type { MediaAttachment } from "./types";
+import type { TranscriptionProvider } from "./config";
 
 const OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions";
 const OPENAI_DEFAULT_MODEL = "whisper-1";
@@ -15,7 +16,8 @@ const OPENAI_DEFAULT_MODEL = "whisper-1";
 // Max audio size for transcription (25MB is OpenAI's limit)
 export const MAX_AUDIO_SIZE_BYTES = 25 * 1024 * 1024;
 
-export type TranscriptionProvider = "openai" | "workers-ai";
+// Re-export for convenience
+export type { TranscriptionProvider };
 
 export type TranscriptionConfig = {
   provider: TranscriptionProvider;
