@@ -165,87 +165,53 @@ gsv pair approve whatsapp +31649988417
 
 ---
 
-#### 4. Heartbeat Skip Optimizations
-**Priority:** Medium - Saves API costs
+#### 4. Heartbeat Skip Optimizations ✅ DONE
+**Status:** Implemented
 
-**Clawdbot optimizations we should add:**
-1. **Empty HEARTBEAT.md** - If file only has comments/headers, skip LLM call
-2. **Outside active hours** - Skip if outside configured hours (e.g., 08:00-22:00)
-3. **Queue busy** - Skip if other requests are in flight (needs queue system)
+Skip checks added to `runHeartbeat()` in `gateway/src/gateway.ts`:
+1. **Outside active hours** - Skip if outside configured `activeHours` (unless manual trigger)
+2. **Empty HEARTBEAT.md** - Skip if file missing or only has comments/headers
+3. **Session busy** - Skip if session `isProcessing` or has queued messages
 
-**Implementation:**
-1. In `runHeartbeat()`, read HEARTBEAT.md from R2 first
-2. Check if content is "effectively empty" (only `#` headers, empty lines)
-3. Check `activeHours` config before running
-4. Return early with `{ skipped: true, reason: "..." }`
+Helper functions in `gateway/src/workspace.ts`:
+- `loadHeartbeatFile()` - Load HEARTBEAT.md from R2
+- `isHeartbeatFileEmpty()` - Check if content is effectively empty
 
-**Files to modify:**
-- `gateway/src/gateway.ts` - Add skip checks in `runHeartbeat()`
-- `gateway/src/config.ts` - Add `activeHours` to HeartbeatConfig
+`HeartbeatResult` type extended with `error?: string` field.
 
 ---
 
-#### 5. Message Queue System
-**Priority:** Medium - Prevents race conditions, enables heartbeat skip
+#### 5. Message Queue System ✅ DONE
+**Status:** Implemented
 
-**Problem:** If user sends multiple messages rapidly, or heartbeat fires while user message is processing, we get race conditions.
+Prevents race conditions when multiple messages arrive rapidly or heartbeat fires during processing.
 
-**Clawdbot approach:**
-- Command queue with lanes (Main, Background)
-- Heartbeat skips if queue has items ("requests-in-flight")
-- Messages processed sequentially per session
+**Implementation in `gateway/src/session.ts`:**
+- `messageQueue: QueuedMessage[]` - PersistedObject for queued messages
+- `isProcessing: boolean` - Flag to track if currently processing
+- `chatSend()` queues messages if busy, returns `{ queued: true, queuePosition }`
+- `processNextQueued()` processes queue after each message completes
+- `stats()` RPC returns `isProcessing` and `queueSize`
 
-**Implementation (simple approach):**
-1. Add to Session DO:
-   ```typescript
-   pendingMessages: Array<{ text: string; runId: string; media?: MediaAttachment[] }> = [];
-   isProcessing: boolean = false;
-   ```
-2. In `chatSend()`:
-   - If `isProcessing`, push to queue and return `{ queued: true }`
-   - Otherwise, set `isProcessing = true`, run agent loop
-   - After completion, check queue and process next
-3. In Gateway, expose queue size for heartbeat skip check
-
-**Files to modify:**
-- `gateway/src/session.ts` - Add queue logic to `chatSend()`
-- `gateway/src/gateway.ts` - Check queue before heartbeat
+**Gateway integration:**
+- Heartbeat skip check uses `session.stats()` to check if busy
 
 ---
 
-#### 5b. Identity Links (Cross-Channel Session Routing)
-**Priority:** Medium - Useful for multi-platform users
+#### 5b. Identity Links (Cross-Channel Session Routing) ✅ DONE
+**Status:** Implemented
 
-**Problem:** If the same person messages from WhatsApp AND Telegram, they get separate sessions with separate context. Identity links would route both to a single session.
+Routes multiple channel identities to a single session for the same person.
 
-**Clawdbot approach:**
-```yaml
-session:
-  identityLinks:
-    steve:
-      - "+31628552611"           # WhatsApp number
-      - "telegram:123456789"     # Telegram user ID
-      - "whatsapp:+34675706329"  # Another WhatsApp number
+**Config:**
+```bash
+gsv config set session.identityLinks.steve '["+31628552611", "telegram:123456789"]'
 ```
 
-With this config, messages from any of these identities route to `agent:main:steve` instead of separate per-channel sessions.
-
 **Implementation:**
-1. Add to GsvConfig:
-   ```typescript
-   session?: {
-     identityLinks?: Record<string, string[]>;  // canonical -> [channel:id, ...]
-   };
-   ```
-2. In `buildSessionKeyFromChannel()`:
-   - Check if sender matches any identity link
-   - If match found, use canonical name in session key: `agent:{agentId}:{canonical}`
-   - If no match, use existing per-channel-peer format
-3. Helper function `resolveLinkedIdentity(config, channel, peerId) -> string | null`
-
-**Files to modify:**
-- `gateway/src/config.ts` - Add identityLinks to config
-- `gateway/src/gateway.ts` - Update session key resolution
+- `gateway/src/config.ts` - Added `resolveLinkedIdentity(config, channel, peerId)` helper
+- `gateway/src/gateway.ts` - `buildSessionKeyFromChannel()` checks identity links
+- Session key becomes `agent:{agentId}:{canonicalName}` when matched
 
 ---
 
@@ -334,11 +300,23 @@ session: {
 }
 ```
 
-#### 13. Typing Indicators
-Send typing indicators while processing.
+#### 13. Typing Indicators ✅ DONE (Basic)
+**Status:** Partially Implemented
 
-- Gateway sends `channel.typing` event
-- WhatsApp channel calls `sock.sendPresenceUpdate("composing", jid)`
+Shows "typing..." in WhatsApp while LLM is processing.
+
+**Implemented:**
+- `gateway/src/types.ts` - Added `ChannelTypingPayload` type
+- `gateway/src/gateway.ts` - Added `sendTypingToChannel()`, called before `chatSend()`
+- `channels/whatsapp/src/gateway-client.ts` - Handle `channel.typing` event
+- `channels/whatsapp/src/whatsapp-account.ts` - `handleTyping()` calls `sock.sendPresenceUpdate("composing", jid)`
+
+**Still TODO (from OpenClaw patterns):**
+- [ ] Send `typing=false` when response completes (currently only sends start)
+- [ ] Typing TTL - auto-stop after max duration (2 min)
+- [ ] Typing mode resolution: "never" | "instant" | "message" | "thinking"
+- [ ] Typing suppression for heartbeat responses
+- [ ] Refresh typing indicator during long tool executions
 
 #### 14. `/usage` Command
 Show detailed token usage and estimated cost.
@@ -362,8 +340,207 @@ Toggle verbose mode for debugging.
 #### 17. `/whoami` Command
 Show sender ID and channel info.
 
-#### 18. Identity Links
-See section 5b above for detailed implementation plan.
+#### 18. Identity Links ✅ DONE
+See section 5b above - implemented.
+
+---
+
+## New Features from OpenClaw Analysis
+
+These patterns were identified from the OpenClaw (formerly Clawdbot) codebase analysis.
+
+### Heartbeat Improvements
+
+#### 19. Heartbeat Coalescing
+**Priority:** Medium - Prevents thundering herd
+
+OpenClaw uses a 250ms coalesce window to prevent rapid-fire heartbeat triggers.
+
+```typescript
+// Coalesce multiple wake requests into one
+export function requestHeartbeatNow(opts?: { reason?: string; coalesceMs?: number }) {
+  pendingReason = opts?.reason ?? pendingReason ?? "requested";
+  schedule(opts?.coalesceMs ?? 250); // Default 250ms
+}
+```
+
+**Implementation:**
+- Add debounce to `scheduleHeartbeat()` in Gateway
+- Coalesce rapid trigger requests
+
+#### 20. Heartbeat Response Deduplication
+**Priority:** Medium - Saves API costs and prevents spam
+
+Skip delivery if same response text was sent within 24h.
+
+```typescript
+// Track in session or heartbeat state
+lastHeartbeatText?: string;
+lastHeartbeatSentAt?: number;
+
+// Skip if duplicate
+if (responseText === lastHeartbeatText && 
+    Date.now() - lastHeartbeatSentAt < 24 * 60 * 60 * 1000) {
+  return { skipped: true, reason: "duplicate" };
+}
+```
+
+### Typing Indicator Improvements
+
+#### 21. Typing Stop Event
+**Priority:** High - Complete the typing lifecycle
+
+Currently we only send `typing=true`. Need to send `typing=false` when:
+- Response is complete
+- Error occurs
+- Max TTL reached
+
+**Implementation:**
+- Call `sendTypingToChannel(..., false)` after response delivered
+- Add to error handlers
+
+#### 22. Typing TTL (Time-To-Live)
+**Priority:** Medium - Prevents stuck typing indicators
+
+Auto-stop typing after max duration (2 minutes).
+
+```typescript
+// TypingController pattern from OpenClaw
+const typing = {
+  typingIntervalSeconds: 6,    // Refresh interval (WhatsApp needs this)
+  typingTtlMs: 2 * 60_000,     // Max typing duration
+};
+```
+
+### Media Pipeline
+
+#### 23. PDF Text Extraction + Image Fallback
+**Priority:** High - Documents already in R2, just not sent to LLM
+
+OpenClaw pattern:
+1. Try text extraction first (pdf.js)
+2. If text is sparse (< 200 chars), render pages as images
+3. Send both text + images to vision models
+
+```typescript
+const PDF_LIMITS = {
+  maxPages: 4,
+  maxPixels: 4_000_000,
+  minTextChars: 200,  // Below this, render as images
+};
+
+async function extractPdfContent(buffer: Buffer) {
+  // 1. Extract text from each page
+  // 2. If text.length < minTextChars, render pages as PNG
+  // 3. Return { text, images }
+}
+```
+
+**Implementation:**
+- Add `pdf.js` or similar to gateway (check Workers compatibility)
+- Update `buildUserMessage()` to handle documents
+- Format as Anthropic document blocks or image blocks
+
+#### 24. Video Frame Extraction
+**Priority:** Lower - Complex, may wait for native LLM support
+
+Extract keyframes from video and send as images.
+
+### Queuing Improvements
+
+#### 25. Lane-Based Command Queue
+**Priority:** Medium - Better than simple isProcessing flag
+
+OpenClaw uses lanes with configurable concurrency:
+
+```typescript
+enum CommandLane {
+  Main = "main",        // Primary auto-reply (concurrency: 1)
+  Cron = "cron",        // Scheduled jobs (concurrency: 3)
+  Subagent = "subagent", // Nested agent calls (concurrency: 2)
+}
+```
+
+Benefits:
+- Cron jobs don't block interactive messages
+- Subagent calls have their own capacity
+- Per-session lanes prevent cross-session interference
+
+### Scheduled Tasks
+
+#### 26. Cron Jobs System
+**Priority:** Medium - Scheduled autonomous tasks
+
+Full cron system with isolated sessions:
+
+```typescript
+type CronJob = {
+  id: string;
+  name: string;
+  agentId?: string;
+  enabled: boolean;
+  schedule: 
+    | { kind: "at"; atMs: number }           // One-time
+    | { kind: "every"; everyMs: number }     // Interval
+    | { kind: "cron"; expr: string };        // Cron expression
+  sessionTarget: "main" | "isolated";
+  payload: {
+    kind: "agentTurn";
+    message: string;
+  };
+};
+```
+
+**CLI commands:**
+```bash
+gsv cron list
+gsv cron add "Daily summary" --every 24h --message "Summarize today's activity"
+gsv cron run <id>
+gsv cron disable <id>
+```
+
+### Installation & Distribution
+
+#### 27. Installation Wizard
+**Priority:** HIGH - Required for sharing with others
+
+Create a smooth onboarding experience:
+
+```bash
+# Option A: Install CLI, wizard deploys everything
+curl -sSL https://gsv.dev/install.sh | sh
+gsv init
+
+# Option B: One-click deploy to Cloudflare
+# Deploy button that forks and deploys
+```
+
+**Wizard steps:**
+1. Check prerequisites (Cloudflare account, wrangler auth)
+2. Create R2 bucket
+3. Deploy gateway worker
+4. Deploy WhatsApp channel (optional)
+5. Set secrets (LLM API key, auth token)
+6. Generate initial config
+7. Show connection instructions
+
+#### 28. CLI Binary Distribution
+**Priority:** HIGH
+
+Options:
+- GitHub Releases (current) - manual download
+- `cargo install gsv` - Rust users
+- Homebrew tap - macOS users
+- curl installer script - universal
+- npm wrapper package - Node users
+
+#### 29. Update Mechanism
+**Priority:** Medium
+
+How to update:
+- CLI: `gsv update` or re-run installer
+- Gateway: `gsv deploy` or GitHub Actions
+- Config: synced via CLI
 
 ---
 
@@ -395,8 +572,8 @@ See section 5b above for detailed implementation plan.
 | Thinking levels | ✅ | ⚠️ | Command done, not wired |
 | Session scope | ✅ | ❌ | TODO |
 | DM scope | ✅ | Hardcoded | TODO config |
-| Typing indicators | ✅ | ❌ | TODO |
-| Message queue | ✅ | ❌ | TODO |
+| Typing indicators | ✅ | ✅ | Done |
+| Message queue | ✅ | ✅ | Done |
 | Auth token | ✅ | ✅ | Done |
 
 ### Session Management
@@ -421,23 +598,36 @@ See section 5b above for detailed implementation plan.
 3. [x] **Fix heartbeat delivery** - Route responses to last active channel
 4. [x] **Pairing flow** - Let unknown senders request access, approve via CLI
 
-### High Priority
-5. [ ] **Identity links** - Route multiple channel identities to single session
-6. [ ] **Heartbeat skip optimizations** - Empty file, active hours
-7. [ ] **Message queue** - Prevent race conditions
+### High Priority - DONE ✅
+5. [x] **Identity links** - Route multiple channel identities to single session
+6. [x] **Heartbeat skip optimizations** - Empty file, active hours, session busy
+7. [x] **Message queue** - Prevent race conditions
+8. [x] **Typing indicators** - Show "typing..." in WhatsApp
 
-### Next Up
-8. [ ] PDF/document support in `buildUserMessage()`
-9. [ ] Run cancellation for `/stop`
-10. [ ] Typing indicators
-11. [ ] Inject HEARTBEAT.md into system prompt
+### Next Up - Installation & Polish
+9. [ ] **Installation wizard** (`gsv init`) - Deploy gateway + configure secrets
+10. [ ] **CLI binary distribution** - curl installer, GitHub releases
+11. [ ] **Typing stop event** - Send `typing=false` when done
+12. [ ] **PDF/document support** - Text extraction + image fallback
 
-### Later
-12. [ ] Video support (frame extraction?)
-13. [ ] Session scope config
-14. [ ] `/usage` command
-15. [ ] Message debouncing
-16. [ ] Sticker support (treat as images)
+### Medium Priority - Feature Parity
+13. [ ] Run cancellation for `/stop`
+14. [ ] Inject HEARTBEAT.md into system prompt
+15. [ ] `/usage` command - Token/cost summary
+16. [ ] Wire thinking level to LLM
+17. [ ] Heartbeat coalescing (250ms)
+18. [ ] Heartbeat response deduplication (24h)
+19. [ ] Typing TTL (auto-stop after 2min)
+
+### Later - Advanced Features
+20. [ ] Cron jobs system
+21. [ ] Lane-based command queue
+22. [ ] Video support (frame extraction?)
+23. [ ] Session scope config
+24. [ ] Message debouncing
+25. [ ] Sticker support (treat as images)
+26. [ ] `/verbose` command
+27. [ ] `/whoami` command
 
 ---
 
@@ -554,6 +744,159 @@ Agents should be able to check in periodically:
 **Phase 3: Proactive**
 - Heartbeat system
 - Cron jobs
+
+---
+
+---
+
+## Installation & Distribution Strategy
+
+### The Challenge
+
+GSV is a distributed system with multiple components:
+1. **Gateway Worker** - Cloudflare Worker + Durable Objects
+2. **WhatsApp Channel** - Separate Cloudflare Worker (optional)
+3. **R2 Bucket** - Storage for workspace, media, archives
+4. **CLI Binary** - Rust binary for local tools + chat
+5. **Secrets** - LLM API keys, auth tokens
+
+### Proposed Solution: CLI-Driven Wizard
+
+```bash
+# 1. Install CLI (one command)
+curl -sSL https://gsv.dev/install.sh | sh
+
+# 2. Run wizard (does everything else)
+gsv init
+```
+
+### Wizard Flow (`gsv init`)
+
+```
+╔═══════════════════════════════════════════════════════════════╗
+║                    GSV Setup Wizard                           ║
+╚═══════════════════════════════════════════════════════════════╝
+
+Step 1/6: Cloudflare Authentication
+─────────────────────────────────────
+? Do you have a Cloudflare account? (Y/n)
+? Authenticate with Cloudflare:
+  > Browser login (wrangler login)
+  > API token (paste token)
+
+Step 2/6: Create Resources  
+─────────────────────────────────────
+Creating R2 bucket: gsv-storage... ✓
+Creating KV namespace: gsv-config... ✓
+
+Step 3/6: Deploy Gateway
+─────────────────────────────────────
+Deploying gateway worker... ✓
+Gateway URL: https://gsv-gateway.your-account.workers.dev
+
+Step 4/6: Configure LLM
+─────────────────────────────────────
+? Select LLM provider:
+  > Anthropic (Claude)
+  > OpenAI
+  > OpenRouter
+? Enter API key: ****************************
+Setting secret LLM_API_KEY... ✓
+
+Step 5/6: Security
+─────────────────────────────────────
+? Generate auth token? (Y/n)
+Auth token: gsv_xxxxxxxxxxxx
+Setting secret AUTH_TOKEN... ✓
+
+Step 6/6: WhatsApp (Optional)
+─────────────────────────────────────
+? Set up WhatsApp channel? (y/N)
+  (You can do this later with: gsv channel add whatsapp)
+
+╔══════════════════════════════════��════════════════════════════╗
+║                    Setup Complete! 🎉                         ║
+╠═══════════════════════════════════════════════════════════════╣
+║  Gateway:  https://gsv-gateway.your-account.workers.dev       ║
+║  Config:   ~/.config/gsv/config.json                          ║
+║                                                               ║
+║  Next steps:                                                  ║
+║    gsv chat "Hello!"           # Start chatting               ║
+║    gsv channel add whatsapp    # Add WhatsApp                 ║
+║    gsv mount                   # Mount workspace locally      ║
+╚═══════════════════════════════════════════════════════════════╝
+```
+
+### Component Distribution
+
+| Component | Distribution Method | Update Method |
+|-----------|--------------------|--------------| 
+| CLI | curl installer / GitHub releases / cargo install | `gsv update` |
+| Gateway | Deployed by wizard via wrangler | `gsv deploy gateway` |
+| WhatsApp | Deployed by wizard via wrangler | `gsv deploy whatsapp` |
+| Config | Local file + synced to KV | `gsv config set/get` |
+| Workspace | R2 bucket | `gsv mount` (FUSE) |
+
+### CLI Installation Script (`install.sh`)
+
+```bash
+#!/bin/sh
+set -e
+
+# Detect OS/arch
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+
+# Map to release names
+case "$ARCH" in
+  x86_64) ARCH="x64" ;;
+  aarch64|arm64) ARCH="arm64" ;;
+esac
+
+# Download and install
+RELEASE_URL="https://github.com/deathbyknowledge/gsv/releases/latest/download/gsv-$OS-$ARCH"
+curl -sSL "$RELEASE_URL" -o /tmp/gsv
+chmod +x /tmp/gsv
+sudo mv /tmp/gsv /usr/local/bin/gsv
+
+echo "GSV installed! Run 'gsv init' to get started."
+```
+
+### Alternative: Repo Clone + Deploy
+
+For developers who want to customize:
+
+```bash
+git clone https://github.com/deathbyknowledge/gsv
+cd gsv
+./deploy.sh  # Deploys gateway + whatsapp
+```
+
+### Update Mechanism
+
+```bash
+# Update CLI
+gsv update  # Downloads latest binary
+
+# Update Gateway (redeploy)
+gsv deploy gateway
+
+# Update WhatsApp channel
+gsv deploy whatsapp
+
+# Check versions
+gsv version
+# CLI: 0.2.0
+# Gateway: 0.2.0 (deployed 2026-02-01)
+# WhatsApp: 0.2.0 (deployed 2026-02-01)
+```
+
+### Open Questions
+
+1. **Domain**: Should we get `gsv.dev` or similar for the install script?
+2. **Hosted option**: Offer a fully-hosted version for non-technical users?
+3. **Wrangler dependency**: Wizard needs wrangler - bundle it or require install?
+4. **Multi-account**: Support deploying to different CF accounts?
 
 ---
 
