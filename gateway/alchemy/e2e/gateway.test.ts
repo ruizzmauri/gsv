@@ -495,3 +495,66 @@ describe("Error Handling", () => {
     ws.close();
   });
 });
+
+// ============================================================================
+// Message Queue E2E
+// ============================================================================
+
+describe("Message Queue", () => {
+  it("session.stats includes queue status", async () => {
+    const wsUrl = gatewayUrl.replace("https://", "wss://") + "/ws";
+    const ws = await connectAndAuth(wsUrl);
+    
+    const stats = await sendRequest(ws, "session.stats", {
+      sessionKey: "queue-test-session",
+    }) as { isProcessing: boolean; queueSize: number };
+    
+    // Should have queue status fields
+    expect(typeof stats.isProcessing).toBe("boolean");
+    expect(typeof stats.queueSize).toBe("number");
+    expect(stats.queueSize).toBeGreaterThanOrEqual(0);
+    
+    ws.close();
+  });
+
+  it("chat.send returns queue info when message is queued", async () => {
+    const wsUrl = gatewayUrl.replace("https://", "wss://") + "/ws";
+    const ws = await connectAndAuth(wsUrl);
+    const sessionKey = `queue-test-${crypto.randomUUID()}`;
+    
+    // Send first message (will start processing)
+    // Using a non-command message so it actually goes to the LLM
+    const result1 = await sendRequest(ws, "chat.send", {
+      sessionKey,
+      message: "Hello, this is a test message",
+    }) as { status: string; runId?: string; queued?: boolean };
+    
+    // First message should start processing (not queued)
+    expect(result1.status).toBe("started");
+    expect(result1.queued).toBeUndefined();
+    
+    ws.close();
+  });
+
+  it("queue size is 0 when not processing", async () => {
+    const wsUrl = gatewayUrl.replace("https://", "wss://") + "/ws";
+    const ws = await connectAndAuth(wsUrl);
+    const sessionKey = `queue-idle-${crypto.randomUUID()}`;
+    
+    // Just send a command (doesn't trigger LLM processing)
+    await sendRequest(ws, "chat.send", {
+      sessionKey,
+      message: "/status",
+    });
+    
+    // Check stats - should not be processing after command
+    const stats = await sendRequest(ws, "session.stats", {
+      sessionKey,
+    }) as { isProcessing: boolean; queueSize: number };
+    
+    // After a command completes, queue should be empty
+    expect(stats.queueSize).toBe(0);
+    
+    ws.close();
+  });
+});

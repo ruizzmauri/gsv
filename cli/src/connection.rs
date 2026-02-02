@@ -1,4 +1,6 @@
-use crate::protocol::{AuthParams, ClientInfo, ConnectParams, Frame, RequestFrame, ResponseFrame, ToolDefinition};
+use crate::protocol::{
+    AuthParams, ClientInfo, ConnectParams, Frame, RequestFrame, ResponseFrame, ToolDefinition,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -131,7 +133,7 @@ impl Connection {
                 format!("client-{}", uuid::Uuid::new_v4())
             }
         });
-        
+
         let params = ConnectParams {
             min_protocol: 1,
             max_protocol: 1,

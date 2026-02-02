@@ -46,19 +46,19 @@ enum Commands {
     Client {
         /// Message to send (if omitted, enters interactive mode)
         message: Option<String>,
-        
+
         /// Session key (default from config or "main")
         #[arg(short, long)]
         session: Option<String>,
     },
-    
+
     /// Run as a tool-providing node
     Node {
         /// Node ID (default: hostname)
         #[arg(long)]
         id: Option<String>,
     },
-    
+
     /// Get or set gateway configuration (remote)
     Config {
         #[command(subcommand)]
@@ -70,28 +70,28 @@ enum Commands {
         #[command(subcommand)]
         action: LocalConfigAction,
     },
-    
+
     /// Manage sessions
     Session {
         #[command(subcommand)]
         action: SessionAction,
     },
-    
+
     /// List available tools
     Tools,
-    
+
     /// Mount R2 bucket to local workspace using rclone
     Mount {
         #[command(subcommand)]
         action: MountAction,
     },
-    
+
     /// Manage heartbeat (proactive check-ins)
     Heartbeat {
         #[command(subcommand)]
         action: HeartbeatAction,
     },
-    
+
     /// Manage pairing requests (approve/reject new senders)
     Pair {
         #[command(subcommand)]
@@ -103,10 +103,10 @@ enum Commands {
 enum HeartbeatAction {
     /// Show heartbeat status for all agents
     Status,
-    
+
     /// Start the heartbeat scheduler
     Start,
-    
+
     /// Manually trigger a heartbeat
     Trigger {
         /// Agent ID (default: main)
@@ -119,21 +119,21 @@ enum HeartbeatAction {
 enum PairAction {
     /// List pending pairing requests
     List,
-    
+
     /// Approve a pairing request
     Approve {
         /// Channel name (e.g., "whatsapp")
         channel: String,
-        
+
         /// Sender ID (e.g., "+1234567890")
         sender_id: String,
     },
-    
+
     /// Reject a pairing request
     Reject {
         /// Channel name (e.g., "whatsapp")
         channel: String,
-        
+
         /// Sender ID (e.g., "+1234567890")
         sender_id: String,
     },
@@ -146,34 +146,34 @@ enum MountAction {
         /// Cloudflare Account ID (or set r2.account_id in config)
         #[arg(long, env = "CF_ACCOUNT_ID", default_value = "")]
         account_id: String,
-        
+
         /// R2 Access Key ID (or set r2.access_key_id in config)
         #[arg(long, env = "R2_ACCESS_KEY_ID", default_value = "")]
         access_key_id: String,
-        
+
         /// R2 Secret Access Key (or set r2.secret_access_key in config)
         #[arg(long, env = "R2_SECRET_ACCESS_KEY", default_value = "")]
         secret_access_key: String,
-        
+
         /// R2 bucket name (default: gsv-storage)
         #[arg(long, default_value = "gsv-storage")]
         bucket: String,
-        
+
         /// R2 bucket path prefix (default: agents/main)
         #[arg(long, default_value = "agents/main")]
         prefix: String,
     },
-    
+
     /// Start the mount (requires setup first)
     Start {
         /// Run in foreground (default: background)
         #[arg(long)]
         foreground: bool,
     },
-    
+
     /// Stop the mount
     Stop,
-    
+
     /// Show mount status
     Status,
 }
@@ -278,7 +278,7 @@ enum SessionAction {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    
+
     // Load config from file
     let cfg = CliConfig::load();
 
@@ -349,7 +349,7 @@ fn run_local_config(action: LocalConfigAction) -> Result<(), Box<dyn std::error:
                 "gateway.token" => cfg.gateway.token.map(|s| {
                     // Mask token for security
                     if s.len() > 8 {
-                        format!("{}...{}", &s[..4], &s[s.len()-4..])
+                        format!("{}...{}", &s[..4], &s[s.len() - 4..])
                     } else {
                         "****".to_string()
                     }
@@ -357,7 +357,11 @@ fn run_local_config(action: LocalConfigAction) -> Result<(), Box<dyn std::error:
                 "workspace.path" => cfg.workspace.path.map(|p| p.display().to_string()),
                 "r2.account_id" => cfg.r2.account_id,
                 "r2.access_key_id" => cfg.r2.access_key_id.map(|s| {
-                    if s.len() > 8 { format!("{}...", &s[..8]) } else { "****".to_string() }
+                    if s.len() > 8 {
+                        format!("{}...", &s[..8])
+                    } else {
+                        "****".to_string()
+                    }
                 }),
                 "r2.bucket" => cfg.r2.bucket,
                 "r2.prefix" => cfg.r2.prefix,
@@ -399,22 +403,28 @@ fn run_local_config(action: LocalConfigAction) -> Result<(), Box<dyn std::error:
             }
 
             cfg.save()?;
-            println!("Set {} = {}", key, if key.contains("token") || key.contains("secret") { "****" } else { &value });
+            println!(
+                "Set {} = {}",
+                key,
+                if key.contains("token") || key.contains("secret") {
+                    "****"
+                } else {
+                    &value
+                }
+            );
         }
 
-        LocalConfigAction::Path => {
-            match CliConfig::config_path() {
-                Some(path) => {
-                    println!("{}", path.display());
-                    if path.exists() {
-                        println!("(exists)");
-                    } else {
-                        println!("(not created yet - run 'gsv init')");
-                    }
+        LocalConfigAction::Path => match CliConfig::config_path() {
+            Some(path) => {
+                println!("{}", path.display());
+                if path.exists() {
+                    println!("(exists)");
+                } else {
+                    println!("(not created yet - run 'gsv init')");
                 }
-                None => println!("Could not determine config path"),
             }
-        }
+            None => println!("Could not determine config path"),
+        },
     }
 
     Ok(())
@@ -433,59 +443,70 @@ async fn run_client(
     let response_received_clone = response_received.clone();
     let session_key_owned = session_key.to_string();
 
-    let conn = Connection::connect_with_options(url, "client", None, move |frame| {
-        // Handle incoming events
-        if let Frame::Evt(evt) = frame {
-            if evt.event == "chat" {
-                if let Some(payload) = evt.payload {
-                    // Filter by sessionKey - ignore events for other sessions
-                    if let Some(event_session) = payload.get("sessionKey").and_then(|s| s.as_str()) {
-                        if event_session != session_key_owned {
-                            return;
-                        }
-                    }
-                    
-                    if let Some(state) = payload.get("state").and_then(|s| s.as_str()) {
-                        match state {
-                            "delta" | "partial" => {
-                                if let Some(text) = payload.get("text").and_then(|t| t.as_str()) {
-                                    print!("{}", text);
-                                    let _ = io::stdout().flush();
-                                }
+    let conn = Connection::connect_with_options(
+        url,
+        "client",
+        None,
+        move |frame| {
+            // Handle incoming events
+            if let Frame::Evt(evt) = frame {
+                if evt.event == "chat" {
+                    if let Some(payload) = evt.payload {
+                        // Filter by sessionKey - ignore events for other sessions
+                        if let Some(event_session) =
+                            payload.get("sessionKey").and_then(|s| s.as_str())
+                        {
+                            if event_session != session_key_owned {
+                                return;
                             }
-                            "final" => {
-                                if let Some(msg) = payload.get("message") {
-                                    if let Some(content) = msg.get("content") {
-                                        println!("\nAssistant: {}", format_content(content));
+                        }
+
+                        if let Some(state) = payload.get("state").and_then(|s| s.as_str()) {
+                            match state {
+                                "delta" | "partial" => {
+                                    if let Some(text) = payload.get("text").and_then(|t| t.as_str())
+                                    {
+                                        print!("{}", text);
+                                        let _ = io::stdout().flush();
                                     }
                                 }
-                                response_received_clone.store(true, Ordering::SeqCst);
-                            }
-                            "error" => {
-                                if let Some(err) = payload.get("error").and_then(|e| e.as_str()) {
-                                    eprintln!("\nError: {}", err);
+                                "final" => {
+                                    if let Some(msg) = payload.get("message") {
+                                        if let Some(content) = msg.get("content") {
+                                            println!("\nAssistant: {}", format_content(content));
+                                        }
+                                    }
+                                    response_received_clone.store(true, Ordering::SeqCst);
                                 }
-                                response_received_clone.store(true, Ordering::SeqCst);
+                                "error" => {
+                                    if let Some(err) = payload.get("error").and_then(|e| e.as_str())
+                                    {
+                                        eprintln!("\nError: {}", err);
+                                    }
+                                    response_received_clone.store(true, Ordering::SeqCst);
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
                 }
             }
-        }
-    }, None, token)
+        },
+        None,
+        token,
+    )
     .await?;
 
     if let Some(msg) = message {
         // One-shot mode: send message and wait for response
         let was_command = send_chat(&conn, session_key, &msg).await?;
-        
+
         // Only wait for chat event if this wasn't a command/directive
         if !was_command {
             // Wait for response (up to 120 seconds for LLM + tool execution)
             let timeout = tokio::time::Duration::from_secs(120);
             let start = tokio::time::Instant::now();
-            
+
             while !response_received.load(Ordering::SeqCst) {
                 if start.elapsed() > timeout {
                     eprintln!("Timeout waiting for response");
@@ -497,19 +518,19 @@ async fn run_client(
     } else {
         // Interactive mode
         println!("Connected! Type your message and press Enter. Type 'quit' to exit.\n");
-        
+
         let stdin = io::stdin();
         print!("> ");
         let _ = io::stdout().flush();
-        
+
         for line in stdin.lock().lines() {
             let line = line?;
             let line = line.trim();
-            
+
             if line == "quit" || line == "exit" {
                 break;
             }
-            
+
             if line.is_empty() {
                 print!("> ");
                 let _ = io::stdout().flush();
@@ -518,15 +539,15 @@ async fn run_client(
 
             // Reset response flag
             response_received.store(false, Ordering::SeqCst);
-            
+
             let was_command = send_chat(&conn, session_key, line).await?;
-            
+
             // Only wait for chat event if this wasn't a command/directive
             if !was_command {
                 // Wait for response (up to 120 seconds)
                 let timeout = tokio::time::Duration::from_secs(120);
                 let start = tokio::time::Instant::now();
-                
+
                 while !response_received.load(Ordering::SeqCst) {
                     if start.elapsed() > timeout {
                         eprintln!("Timeout waiting for response");
@@ -535,7 +556,7 @@ async fn run_client(
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
-            
+
             print!("\n> ");
             let _ = io::stdout().flush();
         }
@@ -544,13 +565,17 @@ async fn run_client(
     Ok(())
 }
 
-async fn run_heartbeat(url: &str, token: Option<String>, action: HeartbeatAction) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_heartbeat(
+    url: &str,
+    token: Option<String>,
+    action: HeartbeatAction,
+) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::connect_with_options(url, "client", None, |_| {}, None, token).await?;
 
     match action {
         HeartbeatAction::Status => {
             let res = conn.request("heartbeat.status", None).await?;
-            
+
             if res.ok {
                 if let Some(payload) = res.payload {
                     if let Some(agents) = payload.get("agents").and_then(|a| a.as_object()) {
@@ -562,39 +587,55 @@ async fn run_heartbeat(url: &str, token: Option<String>, action: HeartbeatAction
                             println!("Heartbeat status:");
                             for (agent_id, state) in agents {
                                 println!("\n  Agent: {}", agent_id);
-                                
-                                if let Some(next) = state.get("nextHeartbeatAt").and_then(|n| n.as_i64()) {
+
+                                if let Some(next) =
+                                    state.get("nextHeartbeatAt").and_then(|n| n.as_i64())
+                                {
                                     let dt = chrono::DateTime::from_timestamp_millis(next);
                                     if let Some(dt) = dt {
                                         println!("    Next: {}", dt.format("%Y-%m-%d %H:%M:%S"));
                                     }
                                 }
-                                
-                                if let Some(last) = state.get("lastHeartbeatAt").and_then(|n| n.as_i64()) {
+
+                                if let Some(last) =
+                                    state.get("lastHeartbeatAt").and_then(|n| n.as_i64())
+                                {
                                     let dt = chrono::DateTime::from_timestamp_millis(last);
                                     if let Some(dt) = dt {
                                         println!("    Last: {}", dt.format("%Y-%m-%d %H:%M:%S"));
                                     }
                                 }
-                                
+
                                 // Show last active channel context
                                 if let Some(last_active) = state.get("lastActive") {
-                                    if let Some(channel) = last_active.get("channel").and_then(|c| c.as_str()) {
-                                        let peer_name = last_active.get("peer")
+                                    if let Some(channel) =
+                                        last_active.get("channel").and_then(|c| c.as_str())
+                                    {
+                                        let peer_name = last_active
+                                            .get("peer")
                                             .and_then(|p| p.get("name"))
                                             .and_then(|n| n.as_str())
                                             .unwrap_or("unknown");
-                                        let peer_id = last_active.get("peer")
+                                        let peer_id = last_active
+                                            .get("peer")
                                             .and_then(|p| p.get("id"))
                                             .and_then(|i| i.as_str())
                                             .unwrap_or("unknown");
-                                        
-                                        println!("    Delivery: {} -> {} ({})", channel, peer_name, peer_id);
-                                        
-                                        if let Some(ts) = last_active.get("timestamp").and_then(|t| t.as_i64()) {
+
+                                        println!(
+                                            "    Delivery: {} -> {} ({})",
+                                            channel, peer_name, peer_id
+                                        );
+
+                                        if let Some(ts) =
+                                            last_active.get("timestamp").and_then(|t| t.as_i64())
+                                        {
                                             let dt = chrono::DateTime::from_timestamp_millis(ts);
                                             if let Some(dt) = dt {
-                                                println!("    Last msg: {}", dt.format("%Y-%m-%d %H:%M:%S"));
+                                                println!(
+                                                    "    Last msg: {}",
+                                                    dt.format("%Y-%m-%d %H:%M:%S")
+                                                );
                                             }
                                         }
                                     }
@@ -607,19 +648,21 @@ async fn run_heartbeat(url: &str, token: Option<String>, action: HeartbeatAction
                 eprintln!("Error: {}", err.message);
             }
         }
-        
+
         HeartbeatAction::Start => {
             let res = conn.request("heartbeat.start", None).await?;
-            
+
             if res.ok {
                 if let Some(payload) = res.payload {
                     if let Some(msg) = payload.get("message").and_then(|m| m.as_str()) {
                         println!("{}", msg);
                     }
-                    
+
                     if let Some(agents) = payload.get("agents").and_then(|a| a.as_object()) {
                         for (agent_id, state) in agents {
-                            if let Some(next) = state.get("nextHeartbeatAt").and_then(|n| n.as_i64()) {
+                            if let Some(next) =
+                                state.get("nextHeartbeatAt").and_then(|n| n.as_i64())
+                            {
                                 let dt = chrono::DateTime::from_timestamp_millis(next);
                                 if let Some(dt) = dt {
                                     println!("  {}: next at {}", agent_id, dt.format("%H:%M:%S"));
@@ -632,12 +675,12 @@ async fn run_heartbeat(url: &str, token: Option<String>, action: HeartbeatAction
                 eprintln!("Error: {}", err.message);
             }
         }
-        
+
         HeartbeatAction::Trigger { agent_id } => {
             let res = conn
                 .request("heartbeat.trigger", Some(json!({ "agentId": agent_id })))
                 .await?;
-            
+
             if res.ok {
                 if let Some(payload) = res.payload {
                     if let Some(msg) = payload.get("message").and_then(|m| m.as_str()) {
@@ -653,13 +696,17 @@ async fn run_heartbeat(url: &str, token: Option<String>, action: HeartbeatAction
     Ok(())
 }
 
-async fn run_pair(url: &str, token: Option<String>, action: PairAction) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_pair(
+    url: &str,
+    token: Option<String>,
+    action: PairAction,
+) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::connect_with_options(url, "client", None, |_| {}, None, token).await?;
 
     match action {
         PairAction::List => {
             let res = conn.request("pair.list", None).await?;
-            
+
             if res.ok {
                 if let Some(payload) = res.payload {
                     if let Some(pairs) = payload.get("pairs").and_then(|p| p.as_object()) {
@@ -668,16 +715,36 @@ async fn run_pair(url: &str, token: Option<String>, action: PairAction) -> Resul
                         } else {
                             println!("Pending pairing requests ({}):\n", pairs.len());
                             for (key, pair) in pairs {
-                                let sender_id = pair.get("senderId").and_then(|s| s.as_str()).unwrap_or("unknown");
-                                let sender_name = pair.get("senderName").and_then(|s| s.as_str()).unwrap_or("unknown");
-                                let channel = pair.get("channel").and_then(|s| s.as_str()).unwrap_or("unknown");
-                                let first_msg = pair.get("firstMessage").and_then(|s| s.as_str()).unwrap_or("");
-                                
-                                if let Some(requested_at) = pair.get("requestedAt").and_then(|t| t.as_i64()) {
+                                let sender_id = pair
+                                    .get("senderId")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("unknown");
+                                let sender_name = pair
+                                    .get("senderName")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("unknown");
+                                let channel = pair
+                                    .get("channel")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("unknown");
+                                let first_msg = pair
+                                    .get("firstMessage")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("");
+
+                                if let Some(requested_at) =
+                                    pair.get("requestedAt").and_then(|t| t.as_i64())
+                                {
                                     let dt = chrono::DateTime::from_timestamp_millis(requested_at);
                                     if let Some(dt) = dt {
-                                        println!("  {} ({}) via {}", sender_name, sender_id, channel);
-                                        println!("    Requested: {}", dt.format("%Y-%m-%d %H:%M:%S"));
+                                        println!(
+                                            "  {} ({}) via {}",
+                                            sender_name, sender_id, channel
+                                        );
+                                        println!(
+                                            "    Requested: {}",
+                                            dt.format("%Y-%m-%d %H:%M:%S")
+                                        );
                                         if !first_msg.is_empty() {
                                             println!("    Message: \"{}\"", first_msg);
                                         }
@@ -696,19 +763,28 @@ async fn run_pair(url: &str, token: Option<String>, action: PairAction) -> Resul
                 eprintln!("Error: {}", err.message);
             }
         }
-        
+
         PairAction::Approve { channel, sender_id } => {
             let res = conn
-                .request("pair.approve", Some(json!({ "channel": channel, "senderId": sender_id })))
+                .request(
+                    "pair.approve",
+                    Some(json!({ "channel": channel, "senderId": sender_id })),
+                )
                 .await?;
-            
+
             if res.ok {
                 if let Some(payload) = res.payload {
-                    let approved_id = payload.get("senderId").and_then(|s| s.as_str()).unwrap_or(&sender_id);
+                    let approved_id = payload
+                        .get("senderId")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or(&sender_id);
                     let sender_name = payload.get("senderName").and_then(|s| s.as_str());
-                    
+
                     if let Some(name) = sender_name {
-                        println!("Approved {} ({}) - they can now message the bot", name, approved_id);
+                        println!(
+                            "Approved {} ({}) - they can now message the bot",
+                            name, approved_id
+                        );
                     } else {
                         println!("Approved {} - they can now message the bot", approved_id);
                     }
@@ -717,12 +793,15 @@ async fn run_pair(url: &str, token: Option<String>, action: PairAction) -> Resul
                 eprintln!("Error: {}", err.message);
             }
         }
-        
+
         PairAction::Reject { channel, sender_id } => {
             let res = conn
-                .request("pair.reject", Some(json!({ "channel": channel, "senderId": sender_id })))
+                .request(
+                    "pair.reject",
+                    Some(json!({ "channel": channel, "senderId": sender_id })),
+                )
                 .await?;
-            
+
             if res.ok {
                 println!("Rejected {} - their request has been removed", sender_id);
             } else if let Some(err) = res.error {
@@ -741,7 +820,7 @@ async fn send_chat(
     message: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let run_id = uuid::Uuid::new_v4().to_string();
-    
+
     let res = conn
         .request(
             "chat.send",
@@ -793,7 +872,7 @@ fn format_content(content: &serde_json::Value) -> String {
     if let Some(text) = content.as_str() {
         return text.to_string();
     }
-    
+
     if let Some(arr) = content.as_array() {
         let mut result = String::new();
         for block in arr {
@@ -815,20 +894,21 @@ fn format_content(content: &serde_json::Value) -> String {
         }
         return result;
     }
-    
+
     content.to_string()
 }
 
-async fn run_config(url: &str, token: Option<String>, action: ConfigAction) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_config(
+    url: &str,
+    token: Option<String>,
+    action: ConfigAction,
+) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::connect_with_options(url, "client", None, |_| {}, None, token).await?;
 
     match action {
         ConfigAction::Get { path } => {
             let res = conn
-                .request(
-                    "config.get",
-                    Some(json!({ "path": path })),
-                )
+                .request("config.get", Some(json!({ "path": path })))
                 .await?;
 
             if res.ok {
@@ -883,7 +963,10 @@ async fn run_tools(url: &str, token: Option<String>) -> Result<(), Box<dyn std::
                     println!("Available tools ({}):", tools.len());
                     for tool in tools {
                         let name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-                        let desc = tool.get("description").and_then(|d| d.as_str()).unwrap_or("");
+                        let desc = tool
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("");
                         println!("  - {}: {}", name, desc);
                     }
                 }
@@ -898,43 +981,57 @@ async fn run_tools(url: &str, token: Option<String>) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-async fn run_session(url: &str, token: Option<String>, action: SessionAction) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_session(
+    url: &str,
+    token: Option<String>,
+    action: SessionAction,
+) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::connect_with_options(url, "client", None, |_| {}, None, token).await?;
 
     match action {
         SessionAction::List { limit } => {
             let res = conn
-                .request(
-                    "sessions.list",
-                    Some(json!({ "limit": limit })),
-                )
+                .request("sessions.list", Some(json!({ "limit": limit })))
                 .await?;
 
             if res.ok {
                 if let Some(payload) = res.payload {
                     let sessions = payload.get("sessions").and_then(|s| s.as_array());
                     let count = payload.get("count").and_then(|c| c.as_i64()).unwrap_or(0);
-                    
+
                     if let Some(sessions) = sessions {
                         if sessions.is_empty() {
                             println!("No sessions found");
                         } else {
                             println!("Sessions ({}):", count);
                             for session in sessions {
-                                let key = session.get("sessionKey").and_then(|k| k.as_str()).unwrap_or("?");
-                                let msg_count = session.get("messageCount").and_then(|c| c.as_i64()).unwrap_or(0);
+                                let key = session
+                                    .get("sessionKey")
+                                    .and_then(|k| k.as_str())
+                                    .unwrap_or("?");
+                                let msg_count = session
+                                    .get("messageCount")
+                                    .and_then(|c| c.as_i64())
+                                    .unwrap_or(0);
                                 let label = session.get("label").and_then(|l| l.as_str());
-                                let last_active = session.get("lastActiveAt").and_then(|t| t.as_i64());
-                                
+                                let last_active =
+                                    session.get("lastActiveAt").and_then(|t| t.as_i64());
+
                                 let last_active_str = last_active
                                     .and_then(|ts| chrono::DateTime::from_timestamp_millis(ts))
                                     .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                                     .unwrap_or_else(|| "?".to_string());
-                                
+
                                 if let Some(label) = label {
-                                    println!("  {} ({}) - {} msgs, last active: {}", key, label, msg_count, last_active_str);
+                                    println!(
+                                        "  {} ({}) - {} msgs, last active: {}",
+                                        key, label, msg_count, last_active_str
+                                    );
                                 } else {
-                                    println!("  {} - {} msgs, last active: {}", key, msg_count, last_active_str);
+                                    println!(
+                                        "  {} - {} msgs, last active: {}",
+                                        key, msg_count, last_active_str
+                                    );
                                 }
                             }
                         }
@@ -944,24 +1041,30 @@ async fn run_session(url: &str, token: Option<String>, action: SessionAction) ->
                 eprintln!("Error: {}", err.message);
             }
         }
-        
+
         SessionAction::Reset { session_key } => {
             let res = conn
-                .request(
-                    "session.reset",
-                    Some(json!({ "sessionKey": session_key })),
-                )
+                .request("session.reset", Some(json!({ "sessionKey": session_key })))
                 .await?;
 
             if res.ok {
                 if let Some(payload) = res.payload {
-                    let old_id = payload.get("oldSessionId").and_then(|s| s.as_str()).unwrap_or("?");
-                    let new_id = payload.get("newSessionId").and_then(|s| s.as_str()).unwrap_or("?");
-                    let archived = payload.get("archivedMessages").and_then(|c| c.as_i64()).unwrap_or(0);
+                    let old_id = payload
+                        .get("oldSessionId")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("?");
+                    let new_id = payload
+                        .get("newSessionId")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("?");
+                    let archived = payload
+                        .get("archivedMessages")
+                        .and_then(|c| c.as_i64())
+                        .unwrap_or(0);
                     let empty_obj = json!({});
                     let tokens = payload.get("tokensCleared").unwrap_or(&empty_obj);
                     let total_tokens = tokens.get("total").and_then(|t| t.as_i64()).unwrap_or(0);
-                    
+
                     println!("Reset session '{}'", session_key);
                     println!("  Old session ID: {}", &old_id[..8.min(old_id.len())]);
                     println!("  New session ID: {}", &new_id[..8.min(new_id.len())]);
@@ -974,36 +1077,48 @@ async fn run_session(url: &str, token: Option<String>, action: SessionAction) ->
                 eprintln!("Error: {}", err.message);
             }
         }
-        
+
         SessionAction::Get { session_key } => {
             let res = conn
-                .request(
-                    "session.get",
-                    Some(json!({ "sessionKey": session_key })),
-                )
+                .request("session.get", Some(json!({ "sessionKey": session_key })))
                 .await?;
 
             if res.ok {
                 if let Some(payload) = res.payload {
                     println!("Session: {}", session_key);
-                    println!("  Session ID: {}", payload.get("sessionId").and_then(|s| s.as_str()).unwrap_or("?"));
-                    println!("  Messages: {}", payload.get("messageCount").and_then(|c| c.as_i64()).unwrap_or(0));
-                    
+                    println!(
+                        "  Session ID: {}",
+                        payload
+                            .get("sessionId")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("?")
+                    );
+                    println!(
+                        "  Messages: {}",
+                        payload
+                            .get("messageCount")
+                            .and_then(|c| c.as_i64())
+                            .unwrap_or(0)
+                    );
+
                     if let Some(tokens) = payload.get("tokens") {
                         let input = tokens.get("input").and_then(|t| t.as_i64()).unwrap_or(0);
                         let output = tokens.get("output").and_then(|t| t.as_i64()).unwrap_or(0);
                         let total = tokens.get("total").and_then(|t| t.as_i64()).unwrap_or(0);
                         println!("  Tokens: {} in / {} out ({} total)", input, output, total);
                     }
-                    
+
                     if let Some(settings) = payload.get("settings") {
                         if !settings.as_object().map(|o| o.is_empty()).unwrap_or(true) {
                             println!("  Settings: {}", serde_json::to_string(settings)?);
                         }
                     }
-                    
+
                     if let Some(policy) = payload.get("resetPolicy") {
-                        let mode = policy.get("mode").and_then(|m| m.as_str()).unwrap_or("manual");
+                        let mode = policy
+                            .get("mode")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("manual");
                         print!("  Reset policy: {}", mode);
                         if mode == "daily" {
                             if let Some(hour) = policy.get("atHour").and_then(|h| h.as_i64()) {
@@ -1016,18 +1131,18 @@ async fn run_session(url: &str, token: Option<String>, action: SessionAction) ->
                         }
                         println!();
                     }
-                    
+
                     if let Some(label) = payload.get("label").and_then(|l| l.as_str()) {
                         println!("  Label: {}", label);
                     }
-                    
+
                     let prev_ids = payload.get("previousSessionIds").and_then(|p| p.as_array());
                     if let Some(ids) = prev_ids {
                         if !ids.is_empty() {
                             println!("  Previous sessions: {}", ids.len());
                         }
                     }
-                    
+
                     if let Some(created) = payload.get("createdAt").and_then(|c| c.as_i64()) {
                         let dt = chrono::DateTime::from_timestamp_millis(created);
                         if let Some(dt) = dt {
@@ -1039,20 +1154,23 @@ async fn run_session(url: &str, token: Option<String>, action: SessionAction) ->
                 eprintln!("Error: {}", err.message);
             }
         }
-        
+
         SessionAction::Stats { session_key } => {
             let res = conn
-                .request(
-                    "session.stats",
-                    Some(json!({ "sessionKey": session_key })),
-                )
+                .request("session.stats", Some(json!({ "sessionKey": session_key })))
                 .await?;
 
             if res.ok {
                 if let Some(payload) = res.payload {
                     println!("Session stats: {}", session_key);
-                    println!("  Messages: {}", payload.get("messageCount").and_then(|c| c.as_i64()).unwrap_or(0));
-                    
+                    println!(
+                        "  Messages: {}",
+                        payload
+                            .get("messageCount")
+                            .and_then(|c| c.as_i64())
+                            .unwrap_or(0)
+                    );
+
                     if let Some(tokens) = payload.get("tokens") {
                         let input = tokens.get("input").and_then(|t| t.as_i64()).unwrap_or(0);
                         let output = tokens.get("output").and_then(|t| t.as_i64()).unwrap_or(0);
@@ -1061,7 +1179,7 @@ async fn run_session(url: &str, token: Option<String>, action: SessionAction) ->
                         println!("  Output tokens: {}", output);
                         println!("  Total tokens: {}", total);
                     }
-                    
+
                     if let Some(uptime) = payload.get("uptime").and_then(|u| u.as_i64()) {
                         let hours = uptime / 3600000;
                         let minutes = (uptime % 3600000) / 60000;
@@ -1072,25 +1190,34 @@ async fn run_session(url: &str, token: Option<String>, action: SessionAction) ->
                 eprintln!("Error: {}", err.message);
             }
         }
-        
-        SessionAction::Set { session_key, path, value } => {
+
+        SessionAction::Set {
+            session_key,
+            path,
+            value,
+        } => {
             // Build the patch params based on the path
             let parsed_value: serde_json::Value = serde_json::from_str(&value)
                 .unwrap_or_else(|_| serde_json::Value::String(value.clone()));
-            
+
             let params = match path.as_str() {
                 "label" => json!({
                     "sessionKey": session_key,
                     "label": parsed_value
                 }),
-                p if p.starts_with("settings.") || p.starts_with("model.") || p == "thinkingLevel" || p == "systemPrompt" || p == "maxTokens" => {
+                p if p.starts_with("settings.")
+                    || p.starts_with("model.")
+                    || p == "thinkingLevel"
+                    || p == "systemPrompt"
+                    || p == "maxTokens" =>
+                {
                     // Handle settings paths
                     let settings_path = if p.starts_with("settings.") {
                         &p[9..] // Remove "settings." prefix
                     } else {
                         p
                     };
-                    
+
                     // Build nested settings object
                     let mut settings = json!({});
                     let parts: Vec<&str> = settings_path.split('.').collect();
@@ -1099,37 +1226,35 @@ async fn run_session(url: &str, token: Option<String>, action: SessionAction) ->
                     } else if parts.len() == 2 {
                         settings[parts[0]] = json!({ parts[1]: parsed_value });
                     }
-                    
+
                     json!({
                         "sessionKey": session_key,
                         "settings": settings
                     })
-                },
+                }
                 p if p.starts_with("resetPolicy.") || p == "resetPolicy" => {
                     let policy_path = if p.starts_with("resetPolicy.") {
                         &p[12..] // Remove "resetPolicy." prefix
                     } else {
                         "mode"
                     };
-                    
+
                     let mut policy = json!({});
                     policy[policy_path] = parsed_value;
-                    
+
                     json!({
                         "sessionKey": session_key,
                         "resetPolicy": policy
                     })
-                },
+                }
                 _ => {
                     eprintln!("Unknown setting path: {}", path);
                     eprintln!("Valid paths: label, model.provider, model.id, thinkingLevel, systemPrompt, maxTokens, resetPolicy.mode, resetPolicy.atHour, resetPolicy.idleMinutes");
                     return Ok(());
                 }
             };
-            
-            let res = conn
-                .request("session.patch", Some(params))
-                .await?;
+
+            let res = conn.request("session.patch", Some(params)).await?;
 
             if res.ok {
                 println!("Updated {} = {} for session '{}'", path, value, session_key);
@@ -1137,12 +1262,12 @@ async fn run_session(url: &str, token: Option<String>, action: SessionAction) ->
                 eprintln!("Error: {}", err.message);
             }
         }
-        
+
         SessionAction::Compact { session_key, keep } => {
             let res = conn
                 .request(
                     "session.compact",
-                    Some(json!({ 
+                    Some(json!({
                         "sessionKey": session_key,
                         "keepMessages": keep
                     })),
@@ -1151,9 +1276,15 @@ async fn run_session(url: &str, token: Option<String>, action: SessionAction) ->
 
             if res.ok {
                 if let Some(payload) = res.payload {
-                    let trimmed = payload.get("trimmedMessages").and_then(|c| c.as_i64()).unwrap_or(0);
-                    let kept = payload.get("keptMessages").and_then(|c| c.as_i64()).unwrap_or(0);
-                    
+                    let trimmed = payload
+                        .get("trimmedMessages")
+                        .and_then(|c| c.as_i64())
+                        .unwrap_or(0);
+                    let kept = payload
+                        .get("keptMessages")
+                        .and_then(|c| c.as_i64())
+                        .unwrap_or(0);
+
                     if trimmed > 0 {
                         println!("Compacted session '{}'", session_key);
                         println!("  Trimmed {} messages, kept {}", trimmed, kept);
@@ -1161,14 +1292,17 @@ async fn run_session(url: &str, token: Option<String>, action: SessionAction) ->
                             println!("  Archived to: {}", path);
                         }
                     } else {
-                        println!("Session '{}' has {} messages (no compaction needed)", session_key, kept);
+                        println!(
+                            "Session '{}' has {} messages (no compaction needed)",
+                            session_key, kept
+                        );
                     }
                 }
             } else if let Some(err) = res.error {
                 eprintln!("Error: {}", err.message);
             }
         }
-        
+
         SessionAction::History { session_key } => {
             let res = conn
                 .request(
@@ -1179,12 +1313,15 @@ async fn run_session(url: &str, token: Option<String>, action: SessionAction) ->
 
             if res.ok {
                 if let Some(payload) = res.payload {
-                    let current = payload.get("currentSessionId").and_then(|s| s.as_str()).unwrap_or("?");
+                    let current = payload
+                        .get("currentSessionId")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("?");
                     let previous = payload.get("previousSessionIds").and_then(|p| p.as_array());
-                    
+
                     println!("Session history: {}", session_key);
                     println!("  Current session: {}", &current[..8.min(current.len())]);
-                    
+
                     if let Some(ids) = previous {
                         if ids.is_empty() {
                             println!("  No previous sessions");
@@ -1205,31 +1342,33 @@ async fn run_session(url: &str, token: Option<String>, action: SessionAction) ->
                 eprintln!("Error: {}", err.message);
             }
         }
-        
+
         SessionAction::Preview { session_key, limit } => {
             let mut params = json!({ "sessionKey": session_key });
             if let Some(l) = limit {
                 params["limit"] = json!(l);
             }
-            
-            let res = conn
-                .request("session.preview", Some(params))
-                .await?;
+
+            let res = conn.request("session.preview", Some(params)).await?;
 
             if res.ok {
                 if let Some(payload) = res.payload {
-                    let msg_count = payload.get("messageCount").and_then(|c| c.as_i64()).unwrap_or(0);
+                    let msg_count = payload
+                        .get("messageCount")
+                        .and_then(|c| c.as_i64())
+                        .unwrap_or(0);
                     let messages = payload.get("messages").and_then(|m| m.as_array());
-                    
+
                     println!("Session: {} ({} messages total)\n", session_key, msg_count);
-                    
+
                     if let Some(msgs) = messages {
                         for msg in msgs {
                             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
-                            
+
                             match role {
                                 "user" => {
-                                    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                                    let content =
+                                        msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
                                     println!("USER: {}\n", content);
                                 }
                                 "assistant" => {
@@ -1239,15 +1378,23 @@ async fn run_session(url: &str, token: Option<String>, action: SessionAction) ->
                                             println!("{}\n", text);
                                         } else if let Some(blocks) = content.as_array() {
                                             for block in blocks {
-                                                if let Some(block_type) = block.get("type").and_then(|t| t.as_str()) {
+                                                if let Some(block_type) =
+                                                    block.get("type").and_then(|t| t.as_str())
+                                                {
                                                     match block_type {
                                                         "text" => {
-                                                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                                            if let Some(text) = block
+                                                                .get("text")
+                                                                .and_then(|t| t.as_str())
+                                                            {
                                                                 print!("{}", text);
                                                             }
                                                         }
                                                         "toolCall" => {
-                                                            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                                                            let name = block
+                                                                .get("name")
+                                                                .and_then(|n| n.as_str())
+                                                                .unwrap_or("?");
                                                             println!("\n[Tool call: {}]", name);
                                                         }
                                                         _ => {}
@@ -1259,14 +1406,22 @@ async fn run_session(url: &str, token: Option<String>, action: SessionAction) ->
                                     }
                                 }
                                 "toolResult" => {
-                                    let tool_name = msg.get("toolName").and_then(|n| n.as_str()).unwrap_or("?");
-                                    let is_error = msg.get("isError").and_then(|e| e.as_bool()).unwrap_or(false);
+                                    let tool_name =
+                                        msg.get("toolName").and_then(|n| n.as_str()).unwrap_or("?");
+                                    let is_error = msg
+                                        .get("isError")
+                                        .and_then(|e| e.as_bool())
+                                        .unwrap_or(false);
                                     let prefix = if is_error { "ERROR" } else { "RESULT" };
-                                    
+
                                     print!("TOOL {} ({}): ", prefix, tool_name);
-                                    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+                                    if let Some(content) =
+                                        msg.get("content").and_then(|c| c.as_array())
+                                    {
                                         for block in content {
-                                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                            if let Some(text) =
+                                                block.get("text").and_then(|t| t.as_str())
+                                            {
                                                 // Truncate long results
                                                 if text.len() > 200 {
                                                     println!("{}...", &text[..200]);
@@ -1294,7 +1449,12 @@ async fn run_session(url: &str, token: Option<String>, action: SessionAction) ->
     Ok(())
 }
 
-async fn run_node(url: &str, token: Option<String>, node_id: Option<String>, workspace: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_node(
+    url: &str,
+    token: Option<String>,
+    node_id: Option<String>,
+    workspace: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve node ID: use provided, or fall back to hostname
     let node_id = node_id.unwrap_or_else(|| {
         let hostname = hostname::get()
@@ -1302,7 +1462,7 @@ async fn run_node(url: &str, token: Option<String>, node_id: Option<String>, wor
             .unwrap_or_else(|_| "unknown".to_string());
         format!("node-{}", hostname)
     });
-    
+
     loop {
         println!("Connecting as node '{}' to {}...", node_id, url);
         println!("Workspace: {}", workspace.display());
@@ -1315,9 +1475,19 @@ async fn run_node(url: &str, token: Option<String>, node_id: Option<String>, wor
             tool_defs.iter().map(|t| &t.name).collect::<Vec<_>>()
         );
 
-        let tools_for_handler: Arc<Vec<Box<dyn Tool>>> = Arc::new(all_tools_with_workspace(workspace.clone()));
+        let tools_for_handler: Arc<Vec<Box<dyn Tool>>> =
+            Arc::new(all_tools_with_workspace(workspace.clone()));
 
-        let conn = match Connection::connect_with_options(url, "node", Some(tool_defs), |_frame| {}, Some(node_id.clone()), token.clone()).await {
+        let conn = match Connection::connect_with_options(
+            url,
+            "node",
+            Some(tool_defs),
+            |_frame| {},
+            Some(node_id.clone()),
+            token.clone(),
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("Failed to connect: {}. Retrying in 3s...", e);
@@ -1338,14 +1508,17 @@ async fn run_node(url: &str, token: Option<String>, node_id: Option<String>, wor
                 if let Frame::Evt(evt) = frame {
                     if evt.event == "tool.invoke" {
                         if let Some(payload) = evt.payload {
-                            if let Ok(invoke) = serde_json::from_value::<ToolInvokePayload>(payload) {
+                            if let Ok(invoke) = serde_json::from_value::<ToolInvokePayload>(payload)
+                            {
                                 println!("Tool invoke: {} ({})", invoke.tool, invoke.call_id);
 
                                 let result = tools
                                     .iter()
                                     .find(|t| t.definition().name == invoke.tool)
                                     .map(|t| t.execute(invoke.args.clone()))
-                                    .unwrap_or_else(|| Err(format!("Tool not found: {}", invoke.tool)));
+                                    .unwrap_or_else(|| {
+                                        Err(format!("Tool not found: {}", invoke.tool))
+                                    });
 
                                 let params = match result {
                                     Ok(res) => ToolResultParams {
@@ -1363,7 +1536,10 @@ async fn run_node(url: &str, token: Option<String>, node_id: Option<String>, wor
                                 println!("Tool result: {:?}", params);
 
                                 if let Err(e) = conn
-                                    .request("tool.result", Some(serde_json::to_value(&params).unwrap()))
+                                    .request(
+                                        "tool.result",
+                                        Some(serde_json::to_value(&params).unwrap()),
+                                    )
                                     .await
                                 {
                                     eprintln!("Failed to send tool result: {}", e);
@@ -1397,7 +1573,11 @@ async fn run_node(url: &str, token: Option<String>, node_id: Option<String>, wor
     }
 }
 
-async fn run_mount(action: MountAction, workspace: PathBuf, cfg: &CliConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_mount(
+    action: MountAction,
+    workspace: PathBuf,
+    cfg: &CliConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let config_dir = dirs::config_dir()
         .ok_or("Could not find config directory")?
         .join("gsv");
@@ -1405,36 +1585,50 @@ async fn run_mount(action: MountAction, workspace: PathBuf, cfg: &CliConfig) -> 
     let pid_file = config_dir.join("mount.pid");
 
     match action {
-        MountAction::Setup { 
-            account_id, 
-            access_key_id, 
-            secret_access_key, 
+        MountAction::Setup {
+            account_id,
+            access_key_id,
+            secret_access_key,
             bucket,
             prefix,
         } => {
             // Use CLI args, falling back to config file
             let account_id = if account_id.is_empty() {
-                cfg.r2.account_id.clone().ok_or("account_id required (use --account-id or set in config)")?
+                cfg.r2
+                    .account_id
+                    .clone()
+                    .ok_or("account_id required (use --account-id or set in config)")?
             } else {
                 account_id
             };
             let access_key_id = if access_key_id.is_empty() {
-                cfg.r2.access_key_id.clone().ok_or("access_key_id required (use --access-key-id or set in config)")?
+                cfg.r2
+                    .access_key_id
+                    .clone()
+                    .ok_or("access_key_id required (use --access-key-id or set in config)")?
             } else {
                 access_key_id
             };
             let secret_access_key = if secret_access_key.is_empty() {
-                cfg.r2.secret_access_key.clone().ok_or("secret_access_key required (use --secret-access-key or set in config)")?
+                cfg.r2.secret_access_key.clone().ok_or(
+                    "secret_access_key required (use --secret-access-key or set in config)",
+                )?
             } else {
                 secret_access_key
             };
             let bucket = if bucket == "gsv-storage" {
-                cfg.r2.bucket.clone().unwrap_or_else(|| "gsv-storage".to_string())
+                cfg.r2
+                    .bucket
+                    .clone()
+                    .unwrap_or_else(|| "gsv-storage".to_string())
             } else {
                 bucket
             };
             let prefix = if prefix == "agents/main" {
-                cfg.r2.prefix.clone().unwrap_or_else(|| "agents/main".to_string())
+                cfg.r2
+                    .prefix
+                    .clone()
+                    .unwrap_or_else(|| "agents/main".to_string())
             } else {
                 prefix
             };
@@ -1442,7 +1636,7 @@ async fn run_mount(action: MountAction, workspace: PathBuf, cfg: &CliConfig) -> 
             let rclone_check = std::process::Command::new("rclone")
                 .arg("--version")
                 .output();
-            
+
             if rclone_check.is_err() {
                 eprintln!("rclone is not installed. Install it first:");
                 eprintln!("  macOS:  brew install rclone");
@@ -1458,7 +1652,7 @@ async fn run_mount(action: MountAction, workspace: PathBuf, cfg: &CliConfig) -> 
             // 2. gsv-workspace: Agent-specific workspace (scoped to prefix)
             let endpoint = format!("{}.r2.cloudflarestorage.com", account_id);
             let config_content = format!(
-r#"[gsv-r2]
+                r#"[gsv-r2]
 type = s3
 provider = Cloudflare
 access_key_id = {}
@@ -1474,34 +1668,29 @@ remote = gsv-r2:{}
 type = alias
 remote = gsv-r2:{}/{}
 "#,
-                access_key_id,
-                secret_access_key,
-                endpoint,
-                bucket,
-                bucket,
-                prefix
+                access_key_id, secret_access_key, endpoint, bucket, bucket, prefix
             );
 
             std::fs::write(&rclone_config, &config_content)?;
-            
+
             println!("R2 configuration saved to {}", rclone_config.display());
             println!("\nConfiguration:");
             println!("  Account ID: {}", account_id);
             println!("  Bucket: {}", bucket);
             println!("  Agent prefix: {}", prefix);
-            
+
             // Create mount point directory (needs sudo on macOS for /Volumes)
             #[cfg(target_os = "macos")]
             let bucket_mount = PathBuf::from("/Volumes/gsv-storage");
-            
+
             #[cfg(not(target_os = "macos"))]
             let bucket_mount = dirs::data_dir()
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join("gsv-storage");
-            
+
             if !bucket_mount.exists() {
                 println!("\nCreating mount point {}...", bucket_mount.display());
-                
+
                 #[cfg(target_os = "macos")]
                 {
                     // On macOS, /Volumes requires sudo
@@ -1510,14 +1699,14 @@ remote = gsv-r2:{}/{}
                         .arg("-p")
                         .arg(&bucket_mount)
                         .status();
-                    
+
                     if status.is_err() || !status.unwrap().success() {
                         eprintln!("Failed to create mount point. Run manually:");
                         eprintln!("  sudo mkdir -p {}", bucket_mount.display());
                         eprintln!("  sudo chown $USER {}", bucket_mount.display());
                         return Err("Failed to create mount point".into());
                     }
-                    
+
                     // Change ownership to current user
                     let username = std::env::var("USER").unwrap_or_else(|_| "".to_string());
                     if !username.is_empty() {
@@ -1527,10 +1716,10 @@ remote = gsv-r2:{}/{}
                             .arg(&bucket_mount)
                             .status();
                     }
-                    
+
                     println!("Created {}", bucket_mount.display());
                 }
-                
+
                 #[cfg(not(target_os = "macos"))]
                 {
                     std::fs::create_dir_all(&bucket_mount)?;
@@ -1539,10 +1728,15 @@ remote = gsv-r2:{}/{}
             } else {
                 println!("\nMount point {} already exists", bucket_mount.display());
             }
-            
+
             println!("\nMount points:");
             println!("  Full bucket:     {}", bucket_mount.display());
-            println!("  Agent workspace: {} -> {}/{}", workspace.display(), bucket_mount.display(), prefix);
+            println!(
+                "  Agent workspace: {} -> {}/{}",
+                workspace.display(),
+                bucket_mount.display(),
+                prefix
+            );
             println!("\nTo start the mount, run:");
             println!("  gsv mount start");
         }
@@ -1574,7 +1768,7 @@ remote = gsv-r2:{}/{}
             {
                 // Check for macFUSE by looking for the filesystem bundle
                 let macfuse_fs = std::path::Path::new("/Library/Filesystems/macfuse.fs");
-                
+
                 if !macfuse_fs.exists() {
                     eprintln!("Error: macFUSE is required for mounting on macOS.");
                     eprintln!("");
@@ -1582,7 +1776,7 @@ remote = gsv-r2:{}/{}
                     eprintln!("  brew install --cask macfuse");
                     return Err("macFUSE not installed".into());
                 }
-                
+
                 // Check if rclone is from Homebrew (which doesn't support mount)
                 let rclone_path = std::process::Command::new("which")
                     .arg("rclone")
@@ -1590,13 +1784,15 @@ remote = gsv-r2:{}/{}
                     .ok()
                     .and_then(|o| String::from_utf8(o.stdout).ok())
                     .unwrap_or_default();
-                
+
                 if rclone_path.contains("/homebrew/") {
                     eprintln!("Error: Homebrew rclone doesn't support FUSE mounting on macOS.");
                     eprintln!("");
                     eprintln!("Install rclone from official binaries instead:");
                     eprintln!("  brew uninstall rclone");
-                    eprintln!("  curl -O https://downloads.rclone.org/rclone-current-osx-arm64.zip");
+                    eprintln!(
+                        "  curl -O https://downloads.rclone.org/rclone-current-osx-arm64.zip"
+                    );
                     eprintln!("  unzip rclone-current-osx-arm64.zip");
                     eprintln!("  cd rclone-*-osx-arm64");
                     eprintln!("  sudo cp rclone /usr/local/bin/");
@@ -1604,16 +1800,16 @@ remote = gsv-r2:{}/{}
                     return Err("Homebrew rclone doesn't support mount".into());
                 }
             }
-            
+
             // Mount paths
             #[cfg(target_os = "macos")]
             let bucket_mount = PathBuf::from("/Volumes/gsv-storage");
-            
+
             #[cfg(not(target_os = "macos"))]
             let bucket_mount = dirs::data_dir()
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join("gsv-storage");
-            
+
             #[cfg(target_os = "linux")]
             {
                 let has_fuse = std::process::Command::new("which")
@@ -1626,7 +1822,7 @@ remote = gsv-r2:{}/{}
                         .output()
                         .map(|o| o.status.success())
                         .unwrap_or(false);
-                
+
                 if !has_fuse {
                     eprintln!("Error: FUSE is required for mounting on Linux.");
                     eprintln!("");
@@ -1649,15 +1845,20 @@ remote = gsv-r2:{}/{}
 
             let mut cmd = std::process::Command::new("rclone");
             cmd.arg("mount")
-                .arg("gsv-bucket:/")  // Mount full bucket, not just workspace
+                .arg("gsv-bucket:/") // Mount full bucket, not just workspace
                 .arg(&bucket_mount)
-                .arg("--config").arg(&rclone_config)
-                .arg("--vfs-cache-mode").arg("full")
-                .arg("--vfs-cache-max-age").arg("1h")
-                .arg("--vfs-read-chunk-size").arg("0")  // Disable chunked reads (R2 returns 403 on ranged requests)
-                .arg("--dir-cache-time").arg("30s")
+                .arg("--config")
+                .arg(&rclone_config)
+                .arg("--vfs-cache-mode")
+                .arg("full")
+                .arg("--vfs-cache-max-age")
+                .arg("1h")
+                .arg("--vfs-read-chunk-size")
+                .arg("0") // Disable chunked reads (R2 returns 403 on ranged requests)
+                .arg("--dir-cache-time")
+                .arg("30s")
                 .arg("--allow-non-empty");
-            
+
             // Store agent prefix for symlink creation
             let workspace_target = bucket_mount.join(&agent_prefix);
 
@@ -1666,12 +1867,16 @@ remote = gsv-r2:{}/{}
                 // Remove old symlink/dir if exists
                 let _ = std::fs::remove_file(&workspace);
                 let _ = std::fs::remove_dir(&workspace);
-                
+
                 #[cfg(unix)]
                 if std::os::unix::fs::symlink(&workspace_target, &workspace).is_ok() {
-                    println!("Symlinked {} -> {}", workspace.display(), workspace_target.display());
+                    println!(
+                        "Symlinked {} -> {}",
+                        workspace.display(),
+                        workspace_target.display()
+                    );
                 }
-                
+
                 println!("Running in foreground. Press Ctrl+C to stop.");
                 let status = cmd.status()?;
                 if !status.success() {
@@ -1679,7 +1884,7 @@ remote = gsv-r2:{}/{}
                 }
             } else {
                 cmd.arg("--daemon");
-                
+
                 let output = cmd.output()?;
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1689,12 +1894,12 @@ remote = gsv-r2:{}/{}
 
                 // Find the PID (rclone --daemon doesn't return it directly)
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                
+
                 let pgrep = std::process::Command::new("pgrep")
                     .arg("-f")
                     .arg(format!("rclone mount.*gsv-bucket"))
                     .output();
-                
+
                 if let Ok(output) = pgrep {
                     let pid = String::from_utf8_lossy(&output.stdout)
                         .lines()
@@ -1707,21 +1912,29 @@ remote = gsv-r2:{}/{}
                         println!("Mount started (PID: {})", pid);
                     }
                 }
-                
+
                 println!("Full bucket: {}", bucket_mount.display());
-                
+
                 // Create symlink from workspace to agent directory in mount
                 // Remove old symlink/dir if exists
                 let _ = std::fs::remove_file(&workspace);
                 let _ = std::fs::remove_dir(&workspace);
-                
+
                 #[cfg(unix)]
                 if std::os::unix::fs::symlink(&workspace_target, &workspace).is_ok() {
-                    println!("Agent workspace: {} -> {}", workspace.display(), workspace_target.display());
+                    println!(
+                        "Agent workspace: {} -> {}",
+                        workspace.display(),
+                        workspace_target.display()
+                    );
                 } else {
-                    eprintln!("Warning: Could not create symlink {} -> {}", workspace.display(), workspace_target.display());
+                    eprintln!(
+                        "Warning: Could not create symlink {} -> {}",
+                        workspace.display(),
+                        workspace_target.display()
+                    );
                 }
-                
+
                 println!("\nTo stop the mount, run:");
                 println!("  gsv mount stop");
             }
@@ -1731,21 +1944,21 @@ remote = gsv-r2:{}/{}
             // Mount paths
             #[cfg(target_os = "macos")]
             let bucket_mount = PathBuf::from("/Volumes/gsv-storage");
-            
+
             #[cfg(not(target_os = "macos"))]
             let bucket_mount = dirs::data_dir()
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join("gsv-storage");
-            
+
             if !pid_file.exists() {
                 println!("No mount PID file found. Mount may not be running.");
-                
+
                 // Try to find and kill anyway
                 let _ = std::process::Command::new("pkill")
                     .arg("-f")
                     .arg("rclone mount.*gsv-bucket")
                     .status();
-                
+
                 // Try to unmount
                 #[cfg(target_os = "macos")]
                 {
@@ -1760,39 +1973,37 @@ remote = gsv-r2:{}/{}
                         .arg(&bucket_mount)
                         .status();
                 }
-                
+
                 // Remove workspace symlink if it exists
                 if workspace.is_symlink() {
                     let _ = std::fs::remove_file(&workspace);
                     println!("Removed symlink {}", workspace.display());
                 }
-                
+
                 return Ok(());
             }
 
             let pid = std::fs::read_to_string(&pid_file)?.trim().to_string();
-            
+
             // Kill the process
-            let status = std::process::Command::new("kill")
-                .arg(&pid)
-                .status();
-            
+            let status = std::process::Command::new("kill").arg(&pid).status();
+
             if status.is_ok() {
                 println!("Mount stopped (PID: {})", pid);
             } else {
                 eprintln!("Failed to stop mount (PID: {})", pid);
             }
-            
+
             // Clean up PID file
             let _ = std::fs::remove_file(&pid_file);
-            
+
             // Clean up mount point
             #[cfg(target_os = "macos")]
             {
                 let _ = std::process::Command::new("umount")
                     .arg(&bucket_mount)
                     .status();
-                
+
                 // macFUSE removes the mount point after umount, recreate it
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 if !bucket_mount.exists() {
@@ -1806,7 +2017,7 @@ remote = gsv-r2:{}/{}
                     .arg(&bucket_mount)
                     .status();
             }
-            
+
             // Remove workspace symlink if it exists
             if workspace.is_symlink() {
                 let _ = std::fs::remove_file(&workspace);
@@ -1818,39 +2029,39 @@ remote = gsv-r2:{}/{}
             // Mount paths
             #[cfg(target_os = "macos")]
             let bucket_mount = PathBuf::from("/Volumes/gsv-storage");
-            
+
             #[cfg(not(target_os = "macos"))]
             let bucket_mount = dirs::data_dir()
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join("gsv-storage");
-            
+
             let mut is_running = false;
-            
+
             if pid_file.exists() {
                 let pid = std::fs::read_to_string(&pid_file)?.trim().to_string();
-                
+
                 // Check if process is still running
                 let status = std::process::Command::new("ps")
                     .arg("-p")
                     .arg(&pid)
                     .output();
-                
+
                 if let Ok(output) = status {
                     if output.status.success() {
                         println!("Mount is running (PID: {})", pid);
                         is_running = true;
                     }
                 }
-                
+
                 if !is_running {
                     // Process not running, clean up stale PID file
                     let _ = std::fs::remove_file(&pid_file);
                 }
             }
-            
+
             if is_running {
                 println!("\nFull bucket:     {}", bucket_mount.display());
-                
+
                 // List top-level directories
                 if let Ok(entries) = std::fs::read_dir(&bucket_mount) {
                     let dirs: Vec<_> = entries
@@ -1862,14 +2073,14 @@ remote = gsv-r2:{}/{}
                         println!("                 Contains: {}", dirs.join(", "));
                     }
                 }
-                
+
                 println!("Agent workspace: {}", workspace.display());
                 if workspace.is_symlink() {
                     if let Ok(target) = std::fs::read_link(&workspace) {
                         println!("                 -> {}", target.display());
                     }
                 }
-                
+
                 // List workspace files
                 let ws_path = if workspace.is_symlink() {
                     std::fs::read_link(&workspace).unwrap_or(workspace.clone())
