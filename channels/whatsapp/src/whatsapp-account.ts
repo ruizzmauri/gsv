@@ -346,12 +346,18 @@ export class WhatsAppAccount extends DurableObject<Env> {
       const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
       const isLoggedOut = statusCode === DisconnectReason.loggedOut;
       
+      console.log(`[WA] Connection closed. statusCode=${statusCode}, isLoggedOut=${isLoggedOut}`);
+      
       this.state.connected = false;
       this.state.lastDisconnectedAt = Date.now();
 
       if (isLoggedOut) {
+        console.log(`[WA] Logged out - clearing auth state`);
         clearAuthState(this.ctx.storage);
+        // Don't schedule alarm - user needs to re-auth
       } else {
+        // Quick reconnect attempt
+        console.log(`[WA] Scheduling reconnect alarm in 5s`);
         this.ctx.storage.setAlarm(Date.now() + 5000);
       }
     }
@@ -608,19 +614,32 @@ export class WhatsAppAccount extends DurableObject<Env> {
   async alarm(): Promise<void> {
     const hasAuth = await hasAuthState(this.ctx.storage);
     if (!hasAuth) {
-      // No auth, nothing to do
+      // No auth, nothing to do - don't schedule another alarm
       return;
     }
+
+    // ALWAYS schedule next alarm first, before any async work that might fail
+    // This ensures we never lose the keep-alive loop
+    this.scheduleKeepAlive();
 
     // Reconnect WhatsApp if needed (sock is lost on hibernation)
     if (!this.sock) {
       console.log(`[WA] Alarm: WhatsApp socket lost, reconnecting...`);
-      await this.startSocket();
-      // Don't proceed - handleConnectionUpdate will reconnect Gateway and schedule next alarm
+      try {
+        await this.startSocket();
+      } catch (e) {
+        console.error(`[WA] Alarm: WhatsApp reconnect failed:`, e);
+      }
       return;
     }
 
-    // WhatsApp socket exists - check Gateway connection
+    // WhatsApp socket exists but not connected - might be mid-reconnect
+    if (!this.state.connected) {
+      console.log(`[WA] Alarm: WhatsApp socket exists but not connected, waiting...`);
+      return;
+    }
+
+    // WhatsApp connected - check Gateway connection
     if (!this.gatewayClient?.isConnected()) {
       console.log(`[WA] Alarm: Gateway not connected, reconnecting...`);
       try {
@@ -629,8 +648,5 @@ export class WhatsAppAccount extends DurableObject<Env> {
         console.error(`[WA] Alarm: Gateway reconnect failed:`, e);
       }
     }
-
-    // Schedule next keep-alive
-    this.scheduleKeepAlive();
   }
 }
