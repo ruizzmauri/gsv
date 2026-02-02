@@ -228,11 +228,20 @@ export class Session extends DurableObject<Env> {
     { prefix: "pendingToolCalls:" },
   );
 
-  // Message queue for sequential processing
-  messageQueue = PersistedObject<QueuedMessage[]>(
+  // Message queue for sequential processing (wrapped in object for PersistedObject)
+  private _messageQueue = PersistedObject<{ items: QueuedMessage[] }>(
     this.ctx.storage.kv,
-    { prefix: "messageQueue:", defaults: [] },
+    { prefix: "messageQueue:", defaults: { items: [] } },
   );
+  
+  // Helper to access queue items
+  private get messageQueue(): QueuedMessage[] {
+    return this._messageQueue.items;
+  }
+  
+  private set messageQueue(items: QueuedMessage[]) {
+    this._messageQueue.items = items;
+  }
 
   // Processing state (not persisted - if we crash mid-processing, queue will retry)
   private isProcessing = false;
