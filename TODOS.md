@@ -42,6 +42,9 @@ GSV (Gateway-Session-Vector) is a distributed AI agent platform built on Cloudfl
 - [x] Message routing (inbound/outbound)
 - [x] Keep-alive alarm to prevent hibernation
 - [x] Bearer token auth for management API
+- [x] Image support (download, R2 storage, send to LLM)
+- [x] Voice message transcription (Workers AI Whisper)
+- [x] Custom media decryption (Workers-compatible, no Node.js streams)
 
 ### Gateway
 - [x] Channel mode connection
@@ -50,33 +53,259 @@ GSV (Gateway-Session-Vector) is a distributed AI agent platform built on Cloudfl
 - [x] Channel registry
 - [x] Auth token support (`auth.token` config)
 
+### Agent Workspace (Phase 1 Done!)
+- [x] Workspace loading from R2 (`gateway/src/workspace.ts`)
+- [x] `loadAgentWorkspace()` - Loads AGENTS.md, SOUL.md, USER.md, MEMORY.md, TOOLS.md
+- [x] `buildSystemPromptFromWorkspace()` - Combines files into system prompt
+- [x] Daily memory loading (today + yesterday)
+- [x] Main session security (`isMainSession()`) - MEMORY.md only in DMs/CLI
+- [x] Template workspace files uploaded for `main` agent
+
 ---
 
 ## Remaining TODOs
 
-### High Priority
+### Critical: Heartbeat & Channel Security (clawdbot parity)
 
-#### 1. WhatsApp Media/Voice Support
-Support receiving and processing media messages from WhatsApp.
+These items are required for a production-ready heartbeat system that matches clawdbot's behavior.
 
-**Message types to handle:**
-- Images with captions
-- Audio messages (voice notes) → transcribe with Whisper
-- Videos with captions
-- Documents
+#### 1. WhatsApp Allowlist Filtering (SECURITY) ✅ DONE
+**Status:** Implemented
+
+- Added `channels.whatsapp.dmPolicy` ("open" | "allowlist")
+- Added `channels.whatsapp.allowFrom` array
+- Messages from non-allowed senders are silently blocked
+- E164 normalization handles both `+31628552611` and `31628552611@s.whatsapp.net`
+
+**Usage:**
+```bash
+gsv config set channels.whatsapp.dmPolicy allowlist
+gsv config set channels.whatsapp.allowFrom '["+31628552611"]'
+```
+
+---
+
+#### 1b. Pairing Flow (Enhancement)
+**Priority:** Medium - Nice-to-have for easier onboarding
+
+**Problem:** Currently you must manually add phone numbers to allowFrom. A pairing flow would let unknown senders request access, which the owner can approve via CLI.
 
 **Implementation:**
-1. Download media via Baileys `downloadMediaMessage()`
-2. Upload to R2, get signed URL (1hr expiry)
-3. For audio: transcribe with Whisper API or Workers AI
-4. Send to LLM as multi-modal content
+1. Add `dmPolicy: "pairing"` option
+2. Track pending pairing requests in `PersistedObject<Record<string, PendingPair>>`
+   ```typescript
+   pendingPairs: {
+     "whatsapp:+1234567890": {
+       channel: "whatsapp",
+       senderId: "+1234567890",
+       senderName: "John Doe",
+       requestedAt: 1234567890,
+       message: "Hi, can I chat?"  // First message they sent
+     }
+   }
+   ```
+3. When unknown sender messages with `dmPolicy: "pairing"`:
+   - Store in pendingPairs
+   - Optionally send them "Request pending approval" message
+4. CLI command: `gsv pair list` / `gsv pair approve whatsapp +1234567890`
+5. On approval: add to `allowFrom`, remove from pending, optionally notify user
 
 **Files to modify:**
-- `channels/whatsapp/src/whatsapp-account.ts` - Handle media in `handleMessagesUpsert()`
-- `channels/whatsapp/wrangler.jsonc` - Add R2 binding
-- `gateway/src/types.ts` - Extend `ChannelInboundParams` with media
+- `gateway/src/config.ts` - Add "pairing" to DmPolicy
+- `gateway/src/gateway.ts` - Add pendingPairs state, pairing logic
+- `cli/src/main.rs` - Add `pair` subcommand
 
-#### 2. Run Cancellation (`/stop`)
+---
+
+#### 2. Last Active Channel Tracking ✅ DONE
+**Status:** Implemented
+
+- Gateway tracks `lastActiveContext[agentId]` with channel, accountId, peer, sessionKey, timestamp
+- Updated on every inbound message
+- Visible in `gsv heartbeat status`
+- Heartbeat uses these to resolve delivery target
+
+**Implementation:**
+1. Add `lastActiveContext` to Gateway persisted state:
+   ```typescript
+   lastActiveContext: {
+     agentId: string;
+     channel: "whatsapp" | "cli" | etc;
+     accountId: string;
+     peer: PeerInfo;
+     timestamp: number;
+   } | null;
+   ```
+2. Update in `handleChannelInbound()` after successful routing
+3. Expose via `heartbeat.status` for debugging
+
+**Files to modify:**
+- `gateway/src/gateway.ts` - Add `lastActiveContext` state, update on inbound
+
+---
+
+#### 3. Fix Heartbeat to Deliver Responses
+**Priority:** High - Heartbeat runs but responses go nowhere
+
+**Problem:** Current heartbeat uses isolated session `agent:main:heartbeat:system:internal`. This session:
+- Has no connected WebSocket clients
+- Has no `pendingChannelResponses` entry
+- Response gets logged but not delivered
+
+**Clawdbot approach:**
+- Heartbeat runs in the **main session** (`agent:main:main`)
+- Uses `lastChannel`/`lastTo` from session to route response
+- Strips `HEARTBEAT_OK` token from response
+- Suppresses short acks (< 300 chars)
+- Deduplicates repeated responses within 24h
+
+**Implementation:**
+1. Change heartbeat session key from `agent:{agentId}:heartbeat:system:internal` to `agent:{agentId}:main` (or configurable)
+2. After agent responds, check if it's a heartbeat run:
+   - If response contains `HEARTBEAT_OK` and is short, suppress delivery
+   - Otherwise, use `lastActiveContext` to route to channel
+3. Add heartbeat tracking in session:
+   ```typescript
+   lastHeartbeatText?: string;
+   lastHeartbeatSentAt?: number;
+   ```
+4. Skip delivery if same text within 24h (dedupe)
+
+**Files to modify:**
+- `gateway/src/gateway.ts` - Change heartbeat session, add delivery routing
+- `gateway/src/heartbeat.ts` - Add response filtering logic
+- `gateway/src/session.ts` - Add heartbeat tracking fields
+
+---
+
+#### 4. Heartbeat Skip Optimizations
+**Priority:** Medium - Saves API costs
+
+**Clawdbot optimizations we should add:**
+1. **Empty HEARTBEAT.md** - If file only has comments/headers, skip LLM call
+2. **Outside active hours** - Skip if outside configured hours (e.g., 08:00-22:00)
+3. **Queue busy** - Skip if other requests are in flight (needs queue system)
+
+**Implementation:**
+1. In `runHeartbeat()`, read HEARTBEAT.md from R2 first
+2. Check if content is "effectively empty" (only `#` headers, empty lines)
+3. Check `activeHours` config before running
+4. Return early with `{ skipped: true, reason: "..." }`
+
+**Files to modify:**
+- `gateway/src/gateway.ts` - Add skip checks in `runHeartbeat()`
+- `gateway/src/config.ts` - Add `activeHours` to HeartbeatConfig
+
+---
+
+#### 5. Message Queue System
+**Priority:** Medium - Prevents race conditions, enables heartbeat skip
+
+**Problem:** If user sends multiple messages rapidly, or heartbeat fires while user message is processing, we get race conditions.
+
+**Clawdbot approach:**
+- Command queue with lanes (Main, Background)
+- Heartbeat skips if queue has items ("requests-in-flight")
+- Messages processed sequentially per session
+
+**Implementation (simple approach):**
+1. Add to Session DO:
+   ```typescript
+   pendingMessages: Array<{ text: string; runId: string; media?: MediaAttachment[] }> = [];
+   isProcessing: boolean = false;
+   ```
+2. In `chatSend()`:
+   - If `isProcessing`, push to queue and return `{ queued: true }`
+   - Otherwise, set `isProcessing = true`, run agent loop
+   - After completion, check queue and process next
+3. In Gateway, expose queue size for heartbeat skip check
+
+**Files to modify:**
+- `gateway/src/session.ts` - Add queue logic to `chatSend()`
+- `gateway/src/gateway.ts` - Check queue before heartbeat
+
+---
+
+#### 5b. Identity Links (Cross-Channel Session Routing)
+**Priority:** Medium - Useful for multi-platform users
+
+**Problem:** If the same person messages from WhatsApp AND Telegram, they get separate sessions with separate context. Identity links would route both to a single session.
+
+**Clawdbot approach:**
+```yaml
+session:
+  identityLinks:
+    steve:
+      - "+31628552611"           # WhatsApp number
+      - "telegram:123456789"     # Telegram user ID
+      - "whatsapp:+34675706329"  # Another WhatsApp number
+```
+
+With this config, messages from any of these identities route to `agent:main:steve` instead of separate per-channel sessions.
+
+**Implementation:**
+1. Add to GsvConfig:
+   ```typescript
+   session?: {
+     identityLinks?: Record<string, string[]>;  // canonical -> [channel:id, ...]
+   };
+   ```
+2. In `buildSessionKeyFromChannel()`:
+   - Check if sender matches any identity link
+   - If match found, use canonical name in session key: `agent:{agentId}:{canonical}`
+   - If no match, use existing per-channel-peer format
+3. Helper function `resolveLinkedIdentity(config, channel, peerId) -> string | null`
+
+**Files to modify:**
+- `gateway/src/config.ts` - Add identityLinks to config
+- `gateway/src/gateway.ts` - Update session key resolution
+
+---
+
+#### 6. Inject HEARTBEAT.md into System Prompt
+**Priority:** Medium - Agent can see heartbeat instructions
+
+**Current state:** Workspace loading includes SOUL.md, AGENTS.md, etc. but not HEARTBEAT.md.
+
+**Implementation:**
+1. In `loadAgentWorkspace()`, also load `HEARTBEAT.md`
+2. In `buildSystemPromptFromWorkspace()`, include heartbeat section (only for heartbeat runs or always?)
+3. Alternative: Agent reads it via file tools when prompted
+
+**Decision needed:** Always inject, or only inject during heartbeat runs?
+
+**Files to modify:**
+- `gateway/src/workspace.ts` - Load HEARTBEAT.md
+- `gateway/src/session.ts` - Pass heartbeat context flag
+
+---
+
+### High Priority
+
+#### 7. PDF/Document Support
+PDFs and documents are downloaded and stored in R2, but not sent to the LLM.
+
+**Current state:**
+- WhatsApp channel downloads documents via custom Workers-compatible decryption
+- Documents stored in R2 with `type: "document"`
+- `buildUserMessage()` only processes images and audio, ignores documents
+
+**Implementation:**
+1. Add document handling in `session.ts` `buildUserMessage()`
+2. Format as Anthropic `document` content block (base64 PDF)
+3. Consider text extraction fallback for non-Anthropic providers
+
+**Files to modify:**
+- `gateway/src/session.ts` - Add document handling in `buildUserMessage()`
+
+#### 2. Video Support
+Videos are downloaded but not sent to LLM (similar to documents).
+
+**Implementation:**
+- Could extract frames and send as images
+- Or wait for native video support in LLM APIs
+
+#### 9. Run Cancellation (`/stop`)
 Currently `/stop` is a placeholder. Need to implement actual run cancellation.
 
 **Implementation:**
@@ -85,7 +314,7 @@ Currently `/stop` is a placeholder. Need to implement actual run cancellation.
 - Cancel pending tool calls
 - Clean up partial state
 
-#### 3. Thinking Level Actually Used
+#### 10. Thinking Level Actually Used
 The `/think` command sets `thinkingLevel` in session settings, but it's not passed to the LLM yet.
 
 **Implementation:**
@@ -96,7 +325,7 @@ The `/think` command sets `thinkingLevel` in session settings, but it's not pass
 
 ### Medium Priority
 
-#### 4. Session Scope Configuration
+#### 11. Session Scope Configuration
 Add configurable session scoping.
 
 ```typescript
@@ -106,7 +335,7 @@ session: {
 }
 ```
 
-#### 5. Per-Chat-Type Reset Policies
+#### 12. Per-Chat-Type Reset Policies
 Different reset policies for DMs vs groups.
 
 ```typescript
@@ -118,20 +347,20 @@ session: {
 }
 ```
 
-#### 6. Typing Indicators
+#### 13. Typing Indicators
 Send typing indicators while processing.
 
 - Gateway sends `channel.typing` event
 - WhatsApp channel calls `sock.sendPresenceUpdate("composing", jid)`
 
-#### 7. `/usage` Command
+#### 14. `/usage` Command
 Show detailed token usage and estimated cost.
 
 ---
 
 ### Lower Priority
 
-#### 8. Message Queue/Debouncing
+#### 15. Message Debouncing
 Handle rapid message bursts gracefully.
 
 ```typescript
@@ -140,22 +369,14 @@ messages: {
 }
 ```
 
-#### 9. `/verbose` Command
+#### 16. `/verbose` Command
 Toggle verbose mode for debugging.
 
-#### 10. `/whoami` Command
+#### 17. `/whoami` Command
 Show sender ID and channel info.
 
-#### 11. Identity Links
-Map cross-platform identities to single session.
-
-```typescript
-session: {
-  identityLinks: {
-    "steve": ["whatsapp:+123", "telegram:456"]
-  }
-}
-```
+#### 18. Identity Links
+See section 5b above for detailed implementation plan.
 
 ---
 
@@ -207,17 +428,145 @@ session: {
 
 ## Implementation Order
 
+### Immediate (Heartbeat & Security) - DONE ✅
+1. [x] **Allowlist filtering** - Security first! Stop random people from using the bot
+2. [x] **Last active tracking** - Track where user last messaged from
+3. [x] **Fix heartbeat delivery** - Route responses to last active channel
+
+### High Priority
+4. [ ] **Pairing flow** - Let unknown senders request access, approve via CLI
+5. [ ] **Identity links** - Route multiple channel identities to single session
+6. [ ] **Heartbeat skip optimizations** - Empty file, active hours
+7. [ ] **Message queue** - Prevent race conditions
+
 ### Next Up
-1. [ ] Wire thinking level to LLM calls
-2. [ ] WhatsApp media download and R2 storage
-3. [ ] Audio transcription (Whisper)
-4. [ ] Run cancellation for `/stop`
+8. [ ] PDF/document support in `buildUserMessage()`
+9. [ ] Run cancellation for `/stop`
+10. [ ] Typing indicators
+11. [ ] Inject HEARTBEAT.md into system prompt
 
 ### Later
-5. [ ] Session scope config
-6. [ ] Typing indicators
-7. [ ] `/usage` command
-8. [ ] Message queue/debouncing
+12. [ ] Video support (frame extraction?)
+13. [ ] Session scope config
+14. [ ] `/usage` command
+15. [ ] Message debouncing
+16. [ ] Sticker support (treat as images)
+
+---
+
+## Agent Framework (Clawdbot Parity)
+
+The core agent loop is done. Now we need the **agent identity and memory system** that makes agents persistent entities rather than stateless chatbots.
+
+### Agent Workspace
+
+Each agent needs a workspace directory in R2:
+
+```
+gsv-storage/
+└── agents/{agentId}/
+    ├── AGENTS.md       # Operating instructions (read every session)
+    ├── SOUL.md         # Identity/personality (read every session)  
+    ├── USER.md         # Info about the human
+    ├── MEMORY.md       # Long-term curated memory (main session only)
+    ├── TOOLS.md        # Local tool notes
+    ├── HEARTBEAT.md    # Proactive check instructions
+    ├── memory/
+    │   └── YYYY-MM-DD.md   # Daily notes
+    ├── sessions/
+    │   └── {sessionId}.jsonl.gz   # Archived transcripts
+    └── skills/
+        └── {skillName}/
+            └── SKILL.md   # Skill definitions
+```
+
+**Implementation:**
+- [x] **1. Workspace loading** - Session reads AGENTS.md + SOUL.md + USER.md from R2 at start
+- [x] **2. System prompt injection** - Combine workspace files into system prompt
+- [x] **3. Daily memory loading** - Auto-load `memory/YYYY-MM-DD.md` (today + yesterday)
+- [x] **4. MEMORY.md security** - Only load in "main session" (direct DM with owner)
+- [x] **5. File tools in CLI** - Read, Write, Edit, Glob, Grep tools with workspace support
+- [x] **6. `gsv mount` command** - Mount R2 to local workspace via rclone FUSE
+
+### Multi-Agent Support
+
+```typescript
+// Config schema
+agents: {
+  list: [
+    { id: "main", default: true },
+    { id: "work", model: { provider: "anthropic", id: "claude-opus" } },
+    { id: "research", systemPrompt: "You are a research assistant..." }
+  ]
+}
+
+// Bindings map channels/chats to agents  
+bindings: [
+  { agentId: "work", match: { channel: "slack", accountId: "T123" } },
+  { agentId: "research", match: { channel: "telegram", peer: { kind: "dm", id: "456" } } }
+]
+```
+
+**Implementation:**
+- [ ] **6. Agent config schema** - Add `agents.list[]` and `bindings[]` to config
+- [ ] **7. Agent resolution** - Gateway resolves agentId from channel/peer match
+- [ ] **8. Per-agent settings** - Model, system prompt, workspace path per agent
+- [ ] **9. Agent isolation** - Each agent has separate workspace in R2
+
+### Skills System (DONE!)
+
+Skills are markdown files that provide context and instructions. The agent sees a list of available skills in its system prompt and reads the SKILL.md on-demand.
+
+**Implemented:**
+- [x] Skills loading from R2 (`agents/{agentId}/skills/*/SKILL.md`)
+- [x] Global skills support (`skills/*/SKILL.md`)
+- [x] YAML frontmatter parsing (name, description, always)
+- [x] Skills list injected into system prompt
+- [x] On-demand reading via `Read` tool
+
+```yaml
+# skills/web-search/SKILL.md
+---
+name: web-search
+always: true
+requires:
+  env: [SERP_API_KEY]
+---
+# Web Search
+
+Use web_search tool to find current information...
+```
+
+**Remaining:**
+- [ ] **Skill eligibility** - Check `requires` conditions (env vars, tools)
+
+### Heartbeat/Proactive Behavior
+
+Agents should be able to check in periodically:
+
+- [ ] **Heartbeat polls** - Scheduled messages that trigger agent to check HEARTBEAT.md
+- [ ] **Proactive actions** - Agent can send messages without user prompting
+- [ ] **Cron jobs** - Scheduled tasks with isolated sessions
+
+### Implementation Order
+
+**Phase 1: Basic Workspace (DONE!)**
+1. ✅ Workspace loading (AGENTS.md, SOUL.md, USER.md, TOOLS.md)
+2. ✅ System prompt injection from workspace files
+3. ✅ Daily memory loading (today + yesterday)
+4. ✅ Main session security for MEMORY.md
+5. ✅ File tools in CLI (Read, Write, Edit, Glob, Grep)
+6. ✅ `gsv mount` command for R2 FUSE mount
+7. ✅ Skills loading and injection
+
+**Phase 2: Multi-Agent**
+- Agent config schema
+- Agent resolution from bindings
+- Per-agent workspaces
+
+**Phase 3: Proactive**
+- Heartbeat system
+- Cron jobs
 
 ---
 
@@ -227,3 +576,6 @@ session: {
 - Commands parsed at Gateway for ALL entry points (channel.inbound + chat.send)
 - Architecture is distributed (better than clawdbot's monolithic approach)
 - Media files will be stored in R2 with signed URLs for LLM access
+- Agent workspaces live in R2, mountable locally via `gsv mount` (rclone FUSE)
+- Default workspace path: `~/gsv/` (configurable via `--workspace` or `GSV_WORKSPACE`)
+- CLI file tools (Read, Write, etc.) resolve paths relative to workspace
