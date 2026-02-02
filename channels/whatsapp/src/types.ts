@@ -76,6 +76,15 @@ export type ChannelOutboundPayload = {
   };
 };
 
+export type ChannelTypingPayload = {
+  channel: ChannelId;
+  accountId: string;
+  peer: PeerInfo;
+  sessionKey: string;
+  /** true = start typing indicator, false = stop */
+  typing: boolean;
+};
+
 // Protocol frame types (matching gateway)
 export type RequestFrame = {
   type: "req";

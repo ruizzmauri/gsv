@@ -138,6 +138,15 @@ export type ChannelOutboundPayload = {
   };
 };
 
+export type ChannelTypingPayload = {
+  channel: ChannelId;
+  accountId: string;
+  peer: PeerInfo;
+  sessionKey: string;
+  /** true = start typing indicator, false = stop */
+  typing: boolean;
+};
+
 export type ChannelRegistryEntry = {
   channel: ChannelId;
   accountId: string;

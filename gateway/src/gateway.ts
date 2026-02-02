@@ -16,6 +16,7 @@ import {
   SessionsListResult,
   ChannelInboundParams,
   ChannelOutboundPayload,
+  ChannelTypingPayload,
   ChannelRegistryEntry,
   ChannelId,
   PeerInfo,
@@ -1168,6 +1169,15 @@ export class Gateway extends DurableObject<Env> {
         timestamp: Date.now(),
       };
 
+      // Send typing indicator to channel before processing
+      this.sendTypingToChannel(
+        params.channel,
+        params.accountId,
+        params.peer,
+        sessionKey,
+        true,
+      );
+
       const result = await sessionStub.chatSend(
         directives.cleaned, // Send cleaned message without directives
         runId,
@@ -1356,6 +1366,41 @@ export class Gateway extends DurableObject<Env> {
     };
 
     channelWs.send(JSON.stringify(evt));
+  }
+
+  /**
+   * Send a typing indicator to a channel
+   */
+  private sendTypingToChannel(
+    channel: ChannelId,
+    accountId: string,
+    peer: PeerInfo,
+    sessionKey: string,
+    typing: boolean,
+  ): void {
+    const channelKey = `${channel}:${accountId}`;
+    const channelWs = this.channels.get(channelKey);
+    
+    if (!channelWs || channelWs.readyState !== WebSocket.OPEN) {
+      return; // Silently ignore if channel not connected
+    }
+
+    const payload: ChannelTypingPayload = {
+      channel,
+      accountId,
+      peer,
+      sessionKey,
+      typing,
+    };
+
+    const evt: EventFrame<ChannelTypingPayload> = {
+      type: "evt",
+      event: "channel.typing",
+      payload,
+    };
+
+    channelWs.send(JSON.stringify(evt));
+    console.log(`[Gateway] Sent typing=${typing} to ${channelKey} for ${peer.id}`);
   }
 
   pendingChannelResponses = PersistedObject<Record<string, {

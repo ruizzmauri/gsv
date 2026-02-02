@@ -31,6 +31,7 @@ import type {
   WhatsAppAccountState,
   ChannelInboundParams,
   ChannelOutboundPayload,
+  ChannelTypingPayload,
   PeerInfo,
   MediaAttachment,
 } from "./types";
@@ -580,6 +581,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
       token: this.env.GSV_GATEWAY_TOKEN,
       accountId: this.state.selfE164 || this.state.accountId,
       onOutbound: (payload) => this.handleOutbound(payload),
+      onTyping: (payload) => this.handleTyping(payload),
       onDisconnect: () => {
         this.ctx.storage.setAlarm(Date.now() + 3000);
       },
@@ -605,6 +607,30 @@ export class WhatsAppAccount extends DurableObject<Env> {
       console.log(`[WA] Sent to ${jid}: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
     } catch (e) {
       console.error(`[WA] Send failed:`, e);
+    }
+  }
+
+  /**
+   * Handle typing indicator from Gateway
+   * Sends presence update to WhatsApp to show "typing..." status
+   */
+  private async handleTyping(payload: ChannelTypingPayload): Promise<void> {
+    if (!this.sock || !this.state.connected) return;
+
+    // Convert peer ID to WhatsApp JID format
+    let jid = payload.peer.id;
+    if (jid.startsWith("+") && !jid.includes("@")) {
+      jid = `${jid.slice(1)}@s.whatsapp.net`;
+    }
+
+    try {
+      // "composing" shows typing indicator, "paused" stops it
+      const presence = payload.typing ? "composing" : "paused";
+      await this.sock.sendPresenceUpdate(presence, jid);
+      console.log(`[WA] Sent presence=${presence} to ${jid}`);
+    } catch (e) {
+      // Typing indicators are best-effort, don't fail on errors
+      console.error(`[WA] Presence update failed:`, e);
     }
   }
 

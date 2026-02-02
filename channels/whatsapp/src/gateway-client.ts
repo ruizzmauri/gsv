@@ -9,6 +9,7 @@ import type {
   EventFrame,
   ChannelInboundParams,
   ChannelOutboundPayload,
+  ChannelTypingPayload,
 } from "./types";
 
 export type GatewayClientOptions = {
@@ -16,6 +17,7 @@ export type GatewayClientOptions = {
   token?: string;
   accountId: string;
   onOutbound: (payload: ChannelOutboundPayload) => Promise<void>;
+  onTyping?: (payload: ChannelTypingPayload) => Promise<void>;
   onDisconnect?: () => void;
 };
 
@@ -102,6 +104,9 @@ export class GatewayClient {
     if (frame.event === "channel.outbound") {
       const payload = frame.payload as ChannelOutboundPayload;
       this.options.onOutbound(payload).catch(() => {});
+    } else if (frame.event === "channel.typing") {
+      const payload = frame.payload as ChannelTypingPayload;
+      this.options.onTyping?.(payload).catch(() => {});
     }
   }
 
