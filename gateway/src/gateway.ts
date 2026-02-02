@@ -21,7 +21,7 @@ import {
   PeerInfo,
 } from "./types";
 import { isWebSocketRequest, validateFrame, isWsConnected } from "./utils";
-import { GsvConfig, DEFAULT_CONFIG, mergeConfig, resolveAgentIdFromBinding, getAgentConfig, parseDuration, HeartbeatConfig, isAllowedSender, PendingPair, normalizeE164 } from "./config";
+import { GsvConfig, DEFAULT_CONFIG, mergeConfig, resolveAgentIdFromBinding, getAgentConfig, parseDuration, HeartbeatConfig, isAllowedSender, PendingPair, normalizeE164, resolveLinkedIdentity } from "./config";
 import { 
   HeartbeatState, 
   getHeartbeatConfig, 
@@ -1014,6 +1014,7 @@ export class Gateway extends DurableObject<Env> {
 
     // Generate session key from channel context
     // Format: agent:{agentId}:{channel}:{peerKind}:{peerId}
+    // Or if identity link matched: agent:{agentId}:{canonicalName}
     // Resolve agentId from bindings configuration
     const agentId = resolveAgentIdFromBinding(
       config,
@@ -1021,7 +1022,9 @@ export class Gateway extends DurableObject<Env> {
       params.accountId,
       params.peer,
     );
-    const sessionKey = this.buildSessionKeyFromChannel(agentId, params.channel, params.peer);
+    // Pass senderId for identity link resolution (useful for groups where sender != peer)
+    // Note: senderId is already declared above for allowlist checking
+    const sessionKey = this.buildSessionKeyFromChannel(agentId, params.channel, params.peer, senderId);
 
     const channelKey = `${params.channel}:${params.accountId}`;
     const existing = this.channelRegistry[channelKey];
@@ -1360,7 +1363,26 @@ export class Gateway extends DurableObject<Env> {
     inboundMessageId: string;
   }>>(this.ctx.storage.kv, { prefix: "pendingChannelResponses:" });
 
-  private buildSessionKeyFromChannel(agentId: string, channel: ChannelId, peer: PeerInfo): string {
+  private buildSessionKeyFromChannel(
+    agentId: string, 
+    channel: ChannelId, 
+    peer: PeerInfo,
+    senderId?: string,
+  ): string {
+    const config = this.getFullConfig();
+    
+    // Check for identity link - use senderId if provided (for groups), otherwise peer.id
+    const idToCheck = senderId || peer.id;
+    const linkedIdentity = resolveLinkedIdentity(config, channel, idToCheck);
+    
+    if (linkedIdentity) {
+      // Identity link found - use canonical name for session key
+      // Format: agent:{agentId}:{canonicalName}
+      console.log(`[Gateway] Identity link: ${idToCheck} -> ${linkedIdentity}`);
+      return `agent:${agentId}:${linkedIdentity}`;
+    }
+    
+    // No identity link - use standard channel:peer format
     const sanitizedPeerId = peer.id.replace(/[^a-zA-Z0-9+\-_@.]/g, "_");
     return `agent:${agentId}:${channel}:${peer.kind}:${sanitizedPeerId}`;
   }

@@ -2,6 +2,8 @@ import { defineWorkersConfig } from "@cloudflare/vitest-pool-workers/config";
 
 export default defineWorkersConfig({
   test: {
+    // Exclude e2e tests (they use bun:test, not vitest)
+    exclude: ["**/alchemy/**", "**/node_modules/**"],
     deps: {
       optimizer: {
         ssr: {

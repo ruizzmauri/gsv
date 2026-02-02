@@ -83,6 +83,13 @@ export interface ChannelsConfig {
   // Future: telegram, discord, etc.
 }
 
+export interface SessionConfig {
+  // Identity links: map multiple channel identities to a single session
+  // Key is canonical name, value is array of channel:id strings
+  // Example: { "steve": ["+31628552611", "telegram:123456789"] }
+  identityLinks?: Record<string, string[]>;
+}
+
 export interface GsvConfig {
   // Model settings (default for all agents)
   model: {
@@ -116,6 +123,9 @@ export interface GsvConfig {
 
   // System prompt (default for all agents)
   systemPrompt?: string;
+  
+  // Session configuration (identity links, scoping)
+  session?: SessionConfig;
   
   // Multi-agent configuration
   agents?: {
@@ -159,6 +169,9 @@ export function mergeConfig(base: GsvConfig, overrides: Partial<GsvConfig>): Gsv
       whatsapp: { ...base.channels?.whatsapp, ...overrides.channels.whatsapp },
     } : base.channels,
     systemPrompt: overrides.systemPrompt ?? base.systemPrompt,
+    session: overrides.session ? {
+      identityLinks: { ...base.session?.identityLinks, ...overrides.session.identityLinks },
+    } : base.session,
     agents: overrides.agents ? {
       list: overrides.agents.list ?? base.agents?.list,
       bindings: overrides.agents.bindings ?? base.agents?.bindings,
@@ -329,4 +342,61 @@ export function resolveAgentIdFromBinding(
   
   // No binding matched, return default agent
   return getDefaultAgentId(config);
+}
+
+/**
+ * Resolve linked identity for session routing.
+ * 
+ * Identity links allow multiple channel identities (WhatsApp number, Telegram ID, etc.)
+ * to route to a single session using a canonical name.
+ * 
+ * Config example:
+ * ```
+ * session:
+ *   identityLinks:
+ *     steve:
+ *       - "+31628552611"           # WhatsApp number (E.164)
+ *       - "telegram:123456789"     # Telegram user ID
+ *       - "whatsapp:+34675706329"  # Explicit channel prefix
+ * ```
+ * 
+ * @param config - GsvConfig containing identity links
+ * @param channel - Channel name (e.g., "whatsapp", "telegram", "cli")
+ * @param senderId - Sender ID (phone number, user ID, etc.)
+ * @returns Canonical name if found, null otherwise
+ */
+export function resolveLinkedIdentity(
+  config: GsvConfig,
+  channel: string,
+  senderId: string,
+): string | null {
+  const links = config.session?.identityLinks;
+  if (!links) return null;
+  
+  // Normalize sender ID for matching
+  const normalizedSender = normalizeE164(senderId);
+  
+  for (const [canonicalName, identities] of Object.entries(links)) {
+    for (const identity of identities) {
+      // Check for channel-prefixed format: "whatsapp:+123" or "telegram:456"
+      if (identity.includes(":")) {
+        const [idChannel, idValue] = identity.split(":", 2);
+        if (idChannel.toLowerCase() === channel.toLowerCase()) {
+          const normalizedIdValue = normalizeE164(idValue);
+          if (normalizedIdValue === normalizedSender) {
+            return canonicalName;
+          }
+        }
+        continue;
+      }
+      
+      // No prefix - assume it's a phone number (matches any channel)
+      const normalizedIdentity = normalizeE164(identity);
+      if (normalizedIdentity && normalizedIdentity === normalizedSender) {
+        return canonicalName;
+      }
+    }
+  }
+  
+  return null;
 }
