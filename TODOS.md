@@ -23,7 +23,7 @@ Core platform is working:
 | **Onboarding Wizard** | Interactive wizard with "hatching" | `install.sh` + manual config | High |
 | **Multiple Channels** | WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Teams | WhatsApp only | High |
 | **Web UI** | Full dashboard served by Gateway | None | High |
-| **PDF/Document Support** | Text extraction + image fallback | Downloaded but not sent to LLM | High |
+| **PDF/Document Support** | Text extraction + image fallback | Placeholder text (no extraction yet) | Medium |
 | **Run Cancellation** | `/stop` works | Done | Done |
 | **Thinking Level** | `/think` wired to LLM | Done | Done |
 | **Doctor Command** | Diagnose/repair config | None | Medium |
@@ -59,10 +59,11 @@ Levels: off, minimal, low, medium, high, xhigh
 - Agent loop checks flag at key points and exits early
 - Broadcasts "Run cancelled by user" error event
 
-#### 4. PDF/Document Support
-Documents are in R2, just need to send to LLM:
-- Format as Anthropic `document` content block
-- Consider text extraction for non-Anthropic providers
+#### 4. PDF/Document Support - PARTIAL
+Documents attached to messages now appear as text placeholders:
+- `[Document attached: filename.pdf (123KB), type: application/pdf]`
+- pi-ai library doesn't support native document content blocks
+- Future: text extraction via Workers AI or pdf.js
 
 ---
 

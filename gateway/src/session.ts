@@ -739,6 +739,7 @@ export class Session extends DurableObject<Env> {
   ): UserMessage {
     // Separate media by type
     const images = media?.filter((m) => m.type === "image") ?? [];
+    const documents = media?.filter((m) => m.type === "document") ?? [];
     const audioWithTranscript =
       media?.filter((m) => m.type === "audio" && m.transcription) ?? [];
     const audioWithoutTranscript =
@@ -747,6 +748,7 @@ export class Session extends DurableObject<Env> {
     // If no processable media, use simple string content
     if (
       images.length === 0 &&
+      documents.length === 0 &&
       audioWithTranscript.length === 0 &&
       audioWithoutTranscript.length === 0
     ) {
@@ -800,6 +802,18 @@ export class Session extends DurableObject<Env> {
       content.push({
         type: "text",
         text: `[Voice message received - transcription unavailable]`,
+      });
+    }
+
+    // Add documents as text placeholders
+    // TODO: Future enhancement - extract text or convert to images for vision models
+    for (const doc of documents) {
+      const filename = doc.filename || "document";
+      const mimeType = doc.mimeType || "application/octet-stream";
+      const size = doc.size ? ` (${Math.round(doc.size / 1024)}KB)` : "";
+      content.push({
+        type: "text",
+        text: `[Document attached: ${filename}${size}, type: ${mimeType}]`,
       });
     }
 
