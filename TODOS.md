@@ -5,7 +5,7 @@
 Core platform is working:
 - Gateway + Session Durable Objects on Cloudflare
 - Multi-provider LLM (Anthropic, OpenAI, Google via pi-ai)
-- Rust CLI with tool namespacing (`macbook:Bash`, `server:Read`)
+- Rust CLI with tool namespacing (`macbook__Bash`, `server__Read`)
 - WhatsApp channel (media, voice transcription, pairing flow)
 - Agent workspace (SOUL.md, AGENTS.md, USER.md, MEMORY.md, skills)
 - Session management (reset, compact, archive, token tracking)
@@ -24,7 +24,7 @@ Core platform is working:
 | **Multiple Channels** | WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Teams | WhatsApp only | High |
 | **Web UI** | Full dashboard served by Gateway | None | High |
 | **PDF/Document Support** | Text extraction + image fallback | Downloaded but not sent to LLM | High |
-| **Run Cancellation** | `/stop` works | Placeholder | High |
+| **Run Cancellation** | `/stop` works | Done | Done |
 | **Thinking Level** | `/think` wired to LLM | Done | Done |
 | **Doctor Command** | Diagnose/repair config | None | Medium |
 | **Cron Jobs** | Full scheduled task system | Heartbeat only | Medium |
@@ -52,10 +52,12 @@ Levels: off, minimal, low, medium, high, xhigh
 - Error occurs during processing
 - Session errors out
 
-#### 3. Run Cancellation (`/stop`)
-- Track `runId` in Session
-- Add `session.abort()` RPC
-- Cancel pending tool calls
+#### 3. Run Cancellation (`/stop`) - DONE
+`/stop` cancels the current agent run:
+- Sets `aborted` flag in `currentRun` state
+- Clears pending tool calls
+- Agent loop checks flag at key points and exits early
+- Broadcasts "Run cancelled by user" error event
 
 #### 4. PDF/Document Support
 Documents are in R2, just need to send to LLM:
@@ -190,7 +192,7 @@ Small improvements that add polish:
 | Feature | Why It's Better |
 |---------|-----------------|
 | **Cloudflare Edge** | Global, no server to run, hibernation |
-| **Tool Namespacing** | `macbook:Bash` vs `server:Bash` - LLM picks target |
+| **Tool Namespacing** | `macbook__Bash` vs `server__Bash` - LLM picks target |
 | **Distributed** | DOs scale automatically, wake on demand |
 | **No Local Install** | Gateway in cloud, CLI is just a client |
 | **R2 Mount** | Edit workspace locally, syncs to cloud |

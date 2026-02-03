@@ -457,10 +457,18 @@ export class Gateway extends DurableObject<Env> {
         }
 
         case "stop": {
-          return {
-            handled: true,
-            response: "Stop command received. (Run cancellation not yet implemented)",
-          };
+          const result = await sessionStub.abort();
+          if (result.wasRunning) {
+            return {
+              handled: true,
+              response: `Stopped run ${result.runId}${result.pendingToolsCancelled > 0 ? `, cancelled ${result.pendingToolsCancelled} pending tool(s)` : ""}.`,
+            };
+          } else {
+            return {
+              handled: true,
+              response: "No run in progress.",
+            };
+          }
         }
 
         case "status": {
@@ -1276,11 +1284,18 @@ export class Gateway extends DurableObject<Env> {
         }
 
         case "stop": {
-          // TODO: Implement run cancellation
-          return {
-            handled: true,
-            response: "Stop command received. (Run cancellation not yet implemented)",
-          };
+          const result = await sessionStub.abort();
+          if (result.wasRunning) {
+            return {
+              handled: true,
+              response: `Stopped run \`${result.runId}\`${result.pendingToolsCancelled > 0 ? `, cancelled ${result.pendingToolsCancelled} pending tool(s)` : ""}.`,
+            };
+          } else {
+            return {
+              handled: true,
+              response: "No run in progress.",
+            };
+          }
         }
 
         case "status": {

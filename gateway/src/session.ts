@@ -95,6 +95,7 @@ export type CurrentRun = {
     model?: { provider: string; id: string };
   };
   startedAt: number;
+  aborted?: boolean;
 };
 
 // State stored in PersistedObject (small, no messages)
@@ -172,6 +173,13 @@ export type SessionPatchParams = {
   settings?: Partial<SessionSettings>;
   label?: string;
   resetPolicy?: ResetPolicy;
+};
+
+export type AbortResult = {
+  ok: boolean;
+  wasRunning: boolean;
+  runId?: string;
+  pendingToolsCancelled: number;
 };
 
 // LRU cache for fetched media (in-memory, survives within request but not hibernation)
@@ -574,6 +582,12 @@ export class Session extends DurableObject<Env> {
    * Called from toolResult() via waitUntil().
    */
   private async continueAgentLoop(): Promise<void> {
+    // Check if run was aborted
+    if (this.currentRun?.aborted) {
+      console.log(`[Session] Run ${this.currentRun.runId} was aborted, stopping agent loop`);
+      return;
+    }
+
     // Process pending tool results
     const pendingCallIds = Object.keys(this.pendingToolCalls);
     if (pendingCallIds.length > 0) {
@@ -610,6 +624,12 @@ export class Session extends DurableObject<Env> {
         error: e instanceof Error ? e.message : String(e),
       });
       this.finishRun();
+      return;
+    }
+
+    // Check if run was aborted while waiting for LLM
+    if (this.currentRun?.aborted) {
+      console.log(`[Session] Run ${this.currentRun.runId} was aborted during LLM call`);
       return;
     }
 
@@ -1171,6 +1191,58 @@ export class Session extends DurableObject<Env> {
 
   async reset(): Promise<ResetResult> {
     return this.doReset();
+  }
+
+  /**
+   * Abort the current run if one is in progress.
+   * Sets the aborted flag and clears pending tool calls.
+   * The agent loop will check this flag and exit early.
+   */
+  async abort(): Promise<AbortResult> {
+    if (!this.currentRun) {
+      return {
+        ok: true,
+        wasRunning: false,
+        pendingToolsCancelled: 0,
+      };
+    }
+
+    const runId = this.currentRun.runId;
+    const pendingToolsCancelled = Object.keys(this.pendingToolCalls).length;
+
+    // Mark the run as aborted
+    this.currentRun = {
+      ...this.currentRun,
+      aborted: true,
+    };
+
+    // Clear pending tool calls
+    for (const callId of Object.keys(this.pendingToolCalls)) {
+      delete this.pendingToolCalls[callId];
+    }
+
+    // Clear any alarm (tool timeout)
+    this.ctx.storage.deleteAlarm();
+
+    console.log(`[Session] Aborted run ${runId}, cancelled ${pendingToolsCancelled} pending tools`);
+
+    // Broadcast abort event
+    await this.broadcastToClients({
+      runId,
+      sessionKey: this.meta.sessionKey,
+      state: "error",
+      error: "Run cancelled by user",
+    });
+
+    // Clean up run state
+    this.finishRun();
+
+    return {
+      ok: true,
+      wasRunning: true,
+      runId,
+      pendingToolsCancelled,
+    };
   }
 
   async get(): Promise<SessionInfo> {

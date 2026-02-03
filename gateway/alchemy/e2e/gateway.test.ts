@@ -344,6 +344,21 @@ describe("Slash Commands", () => {
     
     ws.close();
   });
+
+  it("/stop when no run returns 'No run in progress'", async () => {
+    const wsUrl = gatewayUrl.replace("https://", "wss://") + "/ws";
+    const ws = await connectAndAuth(wsUrl);
+    
+    const result = await sendRequest(ws, "chat.send", {
+      sessionKey: "stop-test-idle",
+      message: "/stop",
+    }) as { status: string; response?: string };
+    
+    expect(result.status).toBe("command");
+    expect(result.response).toBe("No run in progress.");
+    
+    ws.close();
+  });
 });
 
 // ============================================================================
