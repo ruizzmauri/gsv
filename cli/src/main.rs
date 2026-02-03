@@ -360,7 +360,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_client(&url, token, message, &session).await
         }
         Commands::Node { id, workspace } => {
-            let workspace = workspace.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let workspace =
+                workspace.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             run_node(&url, token, id, workspace).await
         }
         Commands::Config { action } => run_config(&url, token, action).await,
@@ -906,14 +907,14 @@ async fn run_whatsapp(
 
             let client = reqwest::Client::new();
             let url = format!("{}/account/{}/login", whatsapp_url, account_id);
-            
+
             let mut req = client.post(&url);
             if let Some(token) = &auth_token {
                 req = req.header("Authorization", format!("Bearer {}", token));
             }
 
             let res = req.send().await?;
-            
+
             if !res.status().is_success() {
                 let status = res.status();
                 let body = res.text().await.unwrap_or_default();
@@ -922,8 +923,12 @@ async fn run_whatsapp(
             }
 
             let data: serde_json::Value = res.json().await?;
-            
-            if data.get("connected").and_then(|c| c.as_bool()).unwrap_or(false) {
+
+            if data
+                .get("connected")
+                .and_then(|c| c.as_bool())
+                .unwrap_or(false)
+            {
                 println!("Already connected to WhatsApp!");
                 return Ok(());
             }
@@ -934,7 +939,10 @@ async fn run_whatsapp(
                 println!("\nQR code expires in ~20 seconds. Re-run command if needed.");
                 println!("After scanning, the account will auto-connect.");
             } else {
-                let msg = data.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+                let msg = data
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Unknown error");
                 eprintln!("Failed to get QR code: {}", msg);
             }
         }
@@ -942,14 +950,14 @@ async fn run_whatsapp(
         WhatsAppAction::Status { account_id } => {
             let client = reqwest::Client::new();
             let url = format!("{}/account/{}/status", whatsapp_url, account_id);
-            
+
             let mut req = client.get(&url);
             if let Some(token) = &auth_token {
                 req = req.header("Authorization", format!("Bearer {}", token));
             }
 
             let res = req.send().await?;
-            
+
             if !res.status().is_success() {
                 let status = res.status();
                 let body = res.text().await.unwrap_or_default();
@@ -958,9 +966,14 @@ async fn run_whatsapp(
             }
 
             let data: serde_json::Value = res.json().await?;
-            
+
             println!("WhatsApp account: {}", account_id);
-            println!("  Connected: {}", data.get("connected").and_then(|c| c.as_bool()).unwrap_or(false));
+            println!(
+                "  Connected: {}",
+                data.get("connected")
+                    .and_then(|c| c.as_bool())
+                    .unwrap_or(false)
+            );
             if let Some(jid) = data.get("selfJid").and_then(|j| j.as_str()) {
                 println!("  JID: {}", jid);
             }
@@ -977,17 +990,17 @@ async fn run_whatsapp(
 
         WhatsAppAction::Logout { account_id } => {
             println!("Logging out WhatsApp account: {}", account_id);
-            
+
             let client = reqwest::Client::new();
             let url = format!("{}/account/{}/logout", whatsapp_url, account_id);
-            
+
             let mut req = client.post(&url);
             if let Some(token) = &auth_token {
                 req = req.header("Authorization", format!("Bearer {}", token));
             }
 
             let res = req.send().await?;
-            
+
             if res.status().is_success() {
                 println!("Logged out successfully. Credentials cleared.");
             } else {
@@ -999,17 +1012,17 @@ async fn run_whatsapp(
 
         WhatsAppAction::Stop { account_id } => {
             println!("Stopping WhatsApp account: {}", account_id);
-            
+
             let client = reqwest::Client::new();
             let url = format!("{}/account/{}/stop", whatsapp_url, account_id);
-            
+
             let mut req = client.post(&url);
             if let Some(token) = &auth_token {
                 req = req.header("Authorization", format!("Bearer {}", token));
             }
 
             let res = req.send().await?;
-            
+
             if res.status().is_success() {
                 println!("Stopped.");
             } else {
@@ -1024,8 +1037,8 @@ async fn run_whatsapp(
 }
 
 fn render_qr_terminal(data: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use qrcode::QrCode;
     use qrcode::render::unicode;
+    use qrcode::QrCode;
 
     let code = QrCode::new(data.as_bytes())?;
     let image = code
@@ -1033,7 +1046,7 @@ fn render_qr_terminal(data: &str) -> Result<(), Box<dyn std::error::Error>> {
         .dark_color(unicode::Dense1x2::Light)
         .light_color(unicode::Dense1x2::Dark)
         .build();
-    
+
     println!("{}", image);
     Ok(())
 }
@@ -1211,7 +1224,10 @@ async fn run_tools(
         ToolsAction::Call { tool, args } => {
             // Parse args as JSON
             let args: serde_json::Value = serde_json::from_str(&args).map_err(|e| {
-                format!("Invalid JSON args: {}. Expected format: '{{\"key\": \"value\"}}'", e)
+                format!(
+                    "Invalid JSON args: {}. Expected format: '{{\"key\": \"value\"}}'",
+                    e
+                )
             })?;
 
             println!("Calling tool: {}", tool);
@@ -1843,10 +1859,7 @@ async fn run_node(
     }
 }
 
-async fn run_mount(
-    action: MountAction,
-    cfg: &CliConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_mount(action: MountAction, cfg: &CliConfig) -> Result<(), Box<dyn std::error::Error>> {
     let config_dir = dirs::config_dir()
         .ok_or("Could not find config directory")?
         .join("gsv");
@@ -2166,7 +2179,6 @@ remote = gsv-r2:{}
                     .arg(&bucket_mount)
                     .status();
             }
-
         }
 
         MountAction::Status => {
