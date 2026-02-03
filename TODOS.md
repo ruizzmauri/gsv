@@ -46,8 +46,11 @@ Core platform is working:
 `/think` and `/t:level` directives now pass reasoning level to pi-ai.
 Levels: off, minimal, low, medium, high, xhigh
 
-#### 2. Typing Stop Event
-Send `typing=false` when response completes or errors.
+#### 2. Typing Stop Event - DONE
+`typing=false` is sent when:
+- Response completes (final state)
+- Error occurs during processing
+- Session errors out
 
 #### 3. Run Cancellation (`/stop`)
 - Track `runId` in Session

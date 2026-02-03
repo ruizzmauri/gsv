@@ -1224,6 +1224,16 @@ export class Gateway extends DurableObject<Env> {
         } : undefined,
       });
     } catch (e) {
+      // Stop typing indicator on error
+      this.sendTypingToChannel(
+        params.channel,
+        params.accountId,
+        params.peer,
+        sessionKey,
+        false,
+      );
+      // Clean up pending channel response
+      delete this.pendingChannelResponses[sessionKey];
       this.sendError(ws, frame.id, 500, String(e));
     }
   }
