@@ -17,20 +17,20 @@ export type GsvInfraOptions = {
   entrypoint?: string;
   /** Enable public URL (for testing) */
   url?: boolean;
+  /** Deploy test channel alongside Gateway */
+  withTestChannel?: boolean;
 };
 
 export async function createGsvInfra(opts: GsvInfraOptions) {
-  const { name, entrypoint = "src/index.ts", url = false } = opts;
+  const { name, entrypoint = "src/index.ts", url = false, withTestChannel = false } = opts;
 
   // R2 bucket for storage (sessions, skills, media)
-  // adopt: true allows alchemy to take over existing resources
   const storage = await R2Bucket(`${name}-storage`, {
     name: `${name}-storage`,
     adopt: true,
   });
 
-  // Main gateway worker with all bindings
-  // adopt: true allows alchemy to take over existing workers
+  // Main gateway worker
   const gateway = await Worker(`${name}-worker`, {
     name,
     entrypoint,
@@ -55,5 +55,31 @@ export async function createGsvInfra(opts: GsvInfraOptions) {
     },
   });
 
-  return { gateway, storage };
+  // Optional test channel for e2e testing
+  let testChannel: Awaited<ReturnType<typeof Worker>> | undefined;
+  
+  if (withTestChannel) {
+    testChannel = await Worker(`${name}-test-channel`, {
+      name: `${name}-test-channel`,
+      entrypoint: "../channels/test/src/index.ts",
+      adopt: true,
+      bindings: {
+        // Service binding to Gateway's entrypoint
+        GATEWAY: {
+          type: "service" as const,
+          service: name, // Gateway's worker name
+          __entrypoint__: "GatewayEntrypoint",
+        },
+      },
+      url: true,
+      compatibilityDate: "2026-01-28",
+      compatibilityFlags: ["nodejs_compat"],
+      bundle: {
+        format: "esm",
+        target: "es2022",
+      },
+    });
+  }
+
+  return { gateway, storage, testChannel };
 }

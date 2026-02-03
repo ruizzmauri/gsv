@@ -27,8 +27,12 @@
       "new_sqlite_classes": ["WhatsAppAccount"]
     }
   ],
-  "vars": {
-    // Production Gateway URL
-    "GSV_GATEWAY_URL": "wss://gateway.stevej.workers.dev/ws"
-  }
+  // Service binding to Gateway for RPC
+  "services": [
+    {
+      "binding": "GATEWAY",
+      "service": "gateway",
+      "entrypoint": "GatewayEntrypoint"
+    }
+  ]
 }

@@ -4,8 +4,8 @@
  * Manages a single WhatsApp account connection:
  * - Stores auth credentials in DO storage
  * - Maintains WebSocket connection to WhatsApp via Baileys
- * - Connects to GSV Gateway as a channel
- * - Routes messages between WhatsApp and Gateway
+ * - Sends messages to Gateway via Service Binding RPC
+ * - Receives outbound messages via HTTP endpoint
  */
 
 import { DurableObject } from "cloudflare:workers";
@@ -24,26 +24,41 @@ import {
   getMediaKeys,
   getUrlFromDirectPath,
 } from "@whiskeysockets/baileys/lib/Utils/messages-media";
-import QRCode from "qrcode";
 import { useDOAuthState, clearAuthState, hasAuthState } from "./auth-store";
-import { GatewayClient } from "./gateway-client";
 import type {
   WhatsAppAccountState,
-  ChannelInboundParams,
-  ChannelOutboundPayload,
-  ChannelTypingPayload,
   PeerInfo,
   MediaAttachment,
 } from "./types";
+import type {
+  ChannelInboundMessage,
+  ChannelOutboundMessage,
+  ChannelPeer,
+  ChannelAccountStatus,
+} from "./channel-types";
+
+// Gateway RPC interface (via Service Binding to GatewayEntrypoint)
+interface GatewayRpc {
+  channelInbound(
+    channelId: string,
+    accountId: string,
+    message: ChannelInboundMessage,
+  ): Promise<{ ok: boolean; sessionKey?: string; error?: string }>;
+  
+  channelStatusChanged(
+    channelId: string,
+    accountId: string,
+    status: ChannelAccountStatus,
+  ): Promise<void>;
+}
 
 interface Env {
-  GSV_GATEWAY_URL: string;
-  GSV_GATEWAY_TOKEN?: string;
+  // Gateway service binding for RPC
+  GATEWAY: Fetcher & GatewayRpc;
 }
 
 export class WhatsAppAccount extends DurableObject<Env> {
   private sock: WASocket | null = null;
-  private gatewayClient: GatewayClient | null = null;
   private state: WhatsAppAccountState = {
     accountId: "",
     connected: false,
@@ -57,7 +72,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
   }
 
   /**
-   * HTTP fetch handler - used for management API
+   * HTTP fetch handler - internal API for WhatsAppChannel entrypoint
    */
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -68,18 +83,23 @@ export class WhatsAppAccount extends DurableObject<Env> {
         case "/status":
           return this.handleStatus();
         case "/login":
-          return await this.handleLogin(url);
+          return await this.handleLogin(url, request.method === "POST");
         case "/logout":
           return await this.handleLogout();
         case "/stop":
           return await this.handleStop();
         case "/wake":
           return await this.handleWake();
+        case "/send":
+          return await this.handleSend(request);
+        case "/typing":
+          return await this.handleTyping(request);
         default:
           return new Response("Not Found", { status: 404 });
       }
     } catch (e) {
-      return new Response(String(e), { status: 500 });
+      console.error(`[WhatsAppAccount] Error handling ${path}:`, e);
+      return Response.json({ error: String(e) }, { status: 500 });
     }
   }
 
@@ -91,21 +111,13 @@ export class WhatsAppAccount extends DurableObject<Env> {
       selfE164: this.state.selfE164,
       lastConnectedAt: this.state.lastConnectedAt,
       lastMessageAt: this.state.lastMessageAt,
-      hasAuth: this.sock !== null,
-      gatewayConnected: this.gatewayClient?.isConnected() ?? false,
+      hasSocket: this.sock !== null,
     });
   }
 
-  private async handleLogin(url: URL): Promise<Response> {
-    const format = url.searchParams.get("format") || "json";
-    
+  private async handleLogin(url: URL, isPost: boolean): Promise<Response> {
     // If already connected, return success
     if (this.state.connected && this.sock) {
-      if (format === "html") {
-        return new Response(this.renderHtml("Connected", "<p>Already connected to WhatsApp.</p>"), {
-          headers: { "Content-Type": "text/html" },
-        });
-      }
       return Response.json({ connected: true, message: "Already connected" });
     }
 
@@ -118,30 +130,10 @@ export class WhatsAppAccount extends DurableObject<Env> {
     const result = await this.waitForQrOrConnection(60000);
     
     if (result.connected) {
-      if (format === "html") {
-        return new Response(this.renderHtml("Connected", "<p>Successfully connected to WhatsApp!</p>"), {
-          headers: { "Content-Type": "text/html" },
-        });
-      }
       return Response.json({ connected: true, message: "Connected" });
     }
     
     if (result.qr) {
-      if (format === "html") {
-        // Generate QR code as SVG
-        const qrSvg = await QRCode.toString(result.qr, { type: "svg", width: 300 });
-        const html = this.renderHtml("Scan QR Code", `
-          <p>Scan this QR code with WhatsApp to connect:</p>
-          <div style="background: white; padding: 20px; display: inline-block; border-radius: 8px;">
-            ${qrSvg}
-          </div>
-          <p style="margin-top: 20px; color: #888;">QR code expires in ~20 seconds. Refresh if needed.</p>
-          <script>setTimeout(() => location.reload(), 25000);</script>
-        `);
-        return new Response(html, {
-          headers: { "Content-Type": "text/html" },
-        });
-      }
       return Response.json({ 
         connected: false, 
         qr: result.qr,
@@ -149,65 +141,20 @@ export class WhatsAppAccount extends DurableObject<Env> {
       });
     }
 
-    if (format === "html") {
-      return new Response(this.renderHtml("Error", "<p>Failed to get QR code. Please try again.</p>"), {
-        status: 500,
-        headers: { "Content-Type": "text/html" },
-      });
-    }
     return Response.json({ 
       connected: false, 
       message: "Failed to get QR code" 
     }, { status: 500 });
   }
 
-  private renderHtml(title: string, body: string): string {
-    return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${title} - GSV WhatsApp</title>
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #1a1a2e;
-      color: #eee;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      min-height: 100vh;
-      margin: 0;
-      text-align: center;
-    }
-    .container {
-      padding: 40px;
-    }
-    h1 { color: #25D366; margin-bottom: 20px; }
-    p { margin: 10px 0; }
-    a { color: #25D366; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>${title}</h1>
-    ${body}
-  </div>
-</body>
-</html>`;
-  }
-
   private async handleLogout(): Promise<Response> {
-    // Close socket
     if (this.sock) {
       this.sock.end(undefined);
       this.sock = null;
     }
 
-    // Clear auth state
     await clearAuthState(this.ctx.storage);
     
-    // Reset state
     this.state = {
       accountId: this.state.accountId,
       connected: false,
@@ -217,9 +164,6 @@ export class WhatsAppAccount extends DurableObject<Env> {
   }
 
   private async handleStop(): Promise<Response> {
-    this.gatewayClient?.close();
-    this.gatewayClient = null;
-
     if (this.sock) {
       this.sock.end(undefined);
       this.sock = null;
@@ -228,17 +172,15 @@ export class WhatsAppAccount extends DurableObject<Env> {
     this.state.connected = false;
     this.state.lastDisconnectedAt = Date.now();
 
+    // Notify Gateway of status change
+    await this.notifyGatewayStatus();
+
     return Response.json({ success: true, message: "Stopped" });
   }
 
-  /**
-   * Wake up the DO and reconnect if needed
-   * This is useful when the DO has hibernated and lost connections
-   */
   private async handleWake(): Promise<Response> {
     const actions: string[] = [];
     
-    // Check if we have auth
     const hasAuth = await hasAuthState(this.ctx.storage);
     if (!hasAuth) {
       return Response.json({ 
@@ -249,26 +191,13 @@ export class WhatsAppAccount extends DurableObject<Env> {
     }
 
     // Check WhatsApp connection
-    const waConnected = this.sock !== null && this.state.connected;
-    if (!waConnected) {
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Wake: WhatsApp not connected, reconnecting...`);
+    if (!this.sock || !this.state.connected) {
+      console.log(`[WhatsAppAccount:${this.state.accountId}] Wake: Reconnecting...`);
       actions.push("reconnecting_whatsapp");
       await this.startSocket();
-      
-      // Wait a bit for connection to establish
       await new Promise(resolve => setTimeout(resolve, 3000));
     } else {
       actions.push("whatsapp_already_connected");
-    }
-
-    // Check Gateway connection
-    const gwConnected = this.gatewayClient?.isConnected() ?? false;
-    if (!gwConnected && this.state.connected) {
-      console.log(`[WhatsAppAccount:${this.state.accountId}] Wake: Gateway not connected, reconnecting...`);
-      actions.push("reconnecting_gateway");
-      await this.connectToGateway();
-    } else if (gwConnected) {
-      actions.push("gateway_already_connected");
     }
 
     return Response.json({
@@ -277,18 +206,70 @@ export class WhatsAppAccount extends DurableObject<Env> {
       actions,
       status: {
         whatsappConnected: this.state.connected,
-        gatewayConnected: this.gatewayClient?.isConnected() ?? false,
         selfJid: this.state.selfJid,
       },
     });
   }
 
+  /**
+   * Handle outbound message from Gateway (via WorkerEntrypoint)
+   */
+  private async handleSend(request: Request): Promise<Response> {
+    if (!this.sock || !this.state.connected) {
+      return Response.json({ error: "Not connected" }, { status: 503 });
+    }
+
+    const message = await request.json() as ChannelOutboundMessage;
+    
+    // Convert peer ID to WhatsApp JID format
+    let jid = message.peer.id;
+    if (jid.startsWith("+") && !jid.includes("@")) {
+      jid = `${jid.slice(1)}@s.whatsapp.net`;
+    }
+
+    try {
+      const sent = await this.sock.sendMessage(jid, { text: message.text });
+      console.log(`[WA] Sent to ${jid}: "${message.text.substring(0, 50)}..."`);
+      return Response.json({ messageId: sent?.key?.id });
+    } catch (e) {
+      console.error(`[WA] Send failed:`, e);
+      return Response.json({ error: String(e) }, { status: 500 });
+    }
+  }
+
+  /**
+   * Handle typing indicator from Gateway
+   */
+  private async handleTyping(request: Request): Promise<Response> {
+    if (!this.sock || !this.state.connected) {
+      return Response.json({ error: "Not connected" }, { status: 503 });
+    }
+
+    const { peer, typing } = await request.json() as { peer: ChannelPeer; typing: boolean };
+    
+    let jid = peer.id;
+    if (jid.startsWith("+") && !jid.includes("@")) {
+      jid = `${jid.slice(1)}@s.whatsapp.net`;
+    }
+
+    try {
+      const presence = typing ? "composing" : "paused";
+      await this.sock.sendPresenceUpdate(presence, jid);
+      return Response.json({ ok: true });
+    } catch (e) {
+      // Typing is best-effort
+      return Response.json({ ok: true });
+    }
+  }
+
   private async startSocket(): Promise<void> {
     const { state: authState, saveCreds } = await useDOAuthState(this.ctx.storage);
-
     const { version } = await fetchLatestBaileysVersion();
 
-    const noopLogger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, trace: () => {}, child: () => noopLogger } as any;
+    const noopLogger = { 
+      info: () => {}, warn: () => {}, error: () => {}, 
+      debug: () => {}, trace: () => {}, child: () => noopLogger 
+    } as any;
     
     this.sock = makeWASocket({
       auth: {
@@ -297,7 +278,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
       },
       version,
       printQRInTerminal: false,
-      browser: ["GSV WhatsApp", "Channel", "1.0.0"],
+      browser: ["GSV WhatsApp", "Channel", "2.0.0"],
       syncFullHistory: false,
       markOnlineOnConnect: false,
       logger: noopLogger,
@@ -328,7 +309,6 @@ export class WhatsAppAccount extends DurableObject<Env> {
       this.state.lastConnectedAt = Date.now();
       this.state.selfJid = this.sock?.user?.id;
       
-      // Extract E164 from JID (format: 14155551234@s.whatsapp.net or 14155551234:13@s.whatsapp.net)
       if (this.state.selfJid) {
         const match = this.state.selfJid.match(/^(\d+)(?::\d+)?@/);
         if (match) {
@@ -336,10 +316,8 @@ export class WhatsAppAccount extends DurableObject<Env> {
         }
       }
       
-      this.connectToGateway().catch((e) => {
-        console.error(`[WA] Gateway connect failed:`, e);
-      });
-      
+      // Notify Gateway of status change
+      this.notifyGatewayStatus().catch(console.error);
       this.scheduleKeepAlive();
     }
 
@@ -352,13 +330,12 @@ export class WhatsAppAccount extends DurableObject<Env> {
       this.state.connected = false;
       this.state.lastDisconnectedAt = Date.now();
 
+      // Notify Gateway
+      this.notifyGatewayStatus().catch(console.error);
+
       if (isLoggedOut) {
-        console.log(`[WA] Logged out - clearing auth state`);
         clearAuthState(this.ctx.storage);
-        // Don't schedule alarm - user needs to re-auth
       } else {
-        // Quick reconnect attempt
-        console.log(`[WA] Scheduling reconnect alarm in 5s`);
         this.ctx.storage.setAlarm(Date.now() + 5000);
       }
     }
@@ -368,22 +345,19 @@ export class WhatsAppAccount extends DurableObject<Env> {
     if (m.type !== "notify") return;
 
     for (const msg of m.messages) {
-      // Skip our own messages
       if (msg.key.fromMe) continue;
 
-      // Check for media messages
       const hasImage = !!msg.message?.imageMessage;
       const hasVideo = !!msg.message?.videoMessage;
       const hasAudio = !!msg.message?.audioMessage;
       const hasDocument = !!msg.message?.documentMessage;
       const hasMedia = hasImage || hasVideo || hasAudio || hasDocument;
 
-      // Get text content (could be caption for media or regular text)
       const text = msg.message?.conversation || 
                    msg.message?.extendedTextMessage?.text ||
                    msg.message?.imageMessage?.caption ||
                    msg.message?.videoMessage?.caption ||
-                   (hasMedia ? "" : undefined); // Allow empty text if media present
+                   (hasMedia ? "" : undefined);
       
       if (text === undefined) continue;
 
@@ -391,24 +365,18 @@ export class WhatsAppAccount extends DurableObject<Env> {
       const isGroup = remoteJid.endsWith("@g.us");
       const isLid = remoteJid.endsWith("@lid");
       
-      // For LID-based JIDs, we need to:
-      // 1. Use the original remoteJid (LID) for sending replies (WhatsApp requires this)
-      // 2. Extract the real phone number from senderPn for allowlist/display purposes
-      // The peer.id must be the JID we send replies to, but we pass the E.164 number
-      // separately for the gateway to use in allowlist checks.
       let senderId: string | undefined;
       if (isLid && msg.key.senderPn) {
         const senderPn = msg.key.senderPn as string;
         const match = senderPn.match(/^(\d+)@/);
         if (match) {
-          senderId = `+${match[1]}`;  // E.164 format for allowlist
+          senderId = `+${match[1]}`;
         }
-        console.log(`[WA] LID: ${senderId}`);
       }
       
       const peer: PeerInfo = {
         kind: isGroup ? "group" : "dm",
-        id: remoteJid,  // Keep original JID for replies (including LID)
+        id: remoteJid,
         name: msg.pushName ?? undefined,
       };
 
@@ -428,46 +396,45 @@ export class WhatsAppAccount extends DurableObject<Env> {
 
       console.log(`[WA] ${remoteJid}: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"${media.length > 0 ? ` +${media.length} media` : ''}`);
 
-      // Build inbound params
-      // For LID-based DMs, we pass the E.164 number in sender.id for allowlist checking
-      // The peer.id contains the actual JID to reply to (which may be a LID)
-      const inbound: ChannelInboundParams = {
-        channel: "whatsapp",
-        accountId: this.state.selfE164 || this.state.accountId,
-        peer,
+      // Build inbound message for Gateway
+      const inbound: ChannelInboundMessage = {
+        messageId: msg.key.id!,
+        peer: {
+          kind: peer.kind,
+          id: peer.id,
+          name: peer.name,
+        },
         sender: isGroup ? {
           id: msg.key.participant!,
           name: msg.pushName ?? undefined,
         } : (senderId ? {
-          id: senderId,  // E.164 number for allowlist
+          id: senderId,
           name: msg.pushName ?? undefined,
         } : undefined),
-        message: {
-          id: msg.key.id!,
-          text: text || (media.length > 0 ? "[Media]" : ""),
-          timestamp: msg.messageTimestamp as number,
-          replyToId: msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? undefined,
-          media: media.length > 0 ? media : undefined,
-        },
+        text: text || (media.length > 0 ? "[Media]" : ""),
+        media: media.length > 0 ? media : undefined,
+        replyToId: msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? undefined,
+        timestamp: msg.messageTimestamp as number,
       };
 
-      // Send to gateway
-      if (this.gatewayClient?.isConnected()) {
-        try {
-          await this.gatewayClient.sendInbound(inbound);
+      // Send to Gateway via Service Binding RPC
+      try {
+        const accountId = this.state.selfE164 || this.state.accountId;
+        const result = await this.env.GATEWAY.channelInbound("whatsapp", accountId, inbound);
+        
+        if (result.ok) {
           this.state.lastMessageAt = Date.now();
-        } catch (e) {
-          console.error(`[WA] Gateway send failed:`, e);
+        } else {
+          console.error(`[WA] Gateway rejected message: ${result.error}`);
         }
+      } catch (e) {
+        console.error(`[WA] Gateway RPC failed:`, e);
       }
     }
   }
 
   /**
-   * Download media from a WhatsApp message and return as MediaAttachment
-   * 
-   * Custom implementation for Cloudflare Workers since Baileys' downloadMediaMessage
-   * uses Node.js streams (pipe) which aren't supported in Workers.
+   * Download media from a WhatsApp message
    */
   private async downloadMedia(msg: WAMessage): Promise<MediaAttachment | null> {
     if (!this.sock) return null;
@@ -478,7 +445,6 @@ export class WhatsAppAccount extends DurableObject<Env> {
     const contentType = getContentType(mContent);
     if (!contentType) return null;
 
-    // Determine media type and get metadata
     let mediaType: MediaAttachment["type"];
     let mimeType: string;
     let filename: string | undefined;
@@ -518,19 +484,14 @@ export class WhatsAppAccount extends DurableObject<Env> {
     if (!media.url && !media.directPath) return null;
     if (!media.mediaKey) return null;
 
-    // Get download URL
     const isValidMediaUrl = media.url?.startsWith("https://mmg.whatsapp.net/");
     const downloadUrl = isValidMediaUrl ? media.url : getUrlFromDirectPath(media.directPath!);
     if (!downloadUrl) return null;
 
-    // Get decryption keys
     const keys = await getMediaKeys(media.mediaKey, baileysMediaType as any);
 
-    // Download encrypted content using fetch (Workers-compatible)
     const response = await fetch(downloadUrl, {
-      headers: {
-        Origin: "https://web.whatsapp.com",
-      },
+      headers: { Origin: "https://web.whatsapp.com" },
     });
 
     if (!response.ok) {
@@ -538,13 +499,8 @@ export class WhatsAppAccount extends DurableObject<Env> {
     }
 
     const encryptedData = new Uint8Array(await response.arrayBuffer());
-
-    // WhatsApp media format: [encrypted data][10-byte MAC]
-    // The last 10 bytes are the HMAC-SHA256 truncated to 10 bytes
     const ciphertext = encryptedData.slice(0, -10);
-    // const mac = encryptedData.slice(-10); // Could verify MAC if needed
 
-    // Decrypt using AES-256-CBC
     const cryptoKey = await crypto.subtle.importKey(
       "raw",
       keys.cipherKey,
@@ -560,8 +516,6 @@ export class WhatsAppAccount extends DurableObject<Env> {
     );
 
     const decryptedArray = new Uint8Array(decrypted);
-
-    // Convert to base64
     const base64 = btoa(String.fromCharCode(...decryptedArray));
 
     return {
@@ -573,64 +527,24 @@ export class WhatsAppAccount extends DurableObject<Env> {
     };
   }
 
-  private async connectToGateway(): Promise<void> {
-    if (this.gatewayClient?.isConnected()) return;
-
-    this.gatewayClient = new GatewayClient({
-      url: this.env.GSV_GATEWAY_URL,
-      token: this.env.GSV_GATEWAY_TOKEN,
-      accountId: this.state.selfE164 || this.state.accountId,
-      onOutbound: (payload) => this.handleOutbound(payload),
-      onTyping: (payload) => this.handleTyping(payload),
-      onDisconnect: () => {
-        this.ctx.storage.setAlarm(Date.now() + 3000);
-      },
-    });
-
-    await this.gatewayClient.connect();
-  }
-
-  private async handleOutbound(payload: ChannelOutboundPayload): Promise<void> {
-    if (!this.sock || !this.state.connected) return;
-
-    // Convert peer ID to WhatsApp JID format
-    // E.164 format (+31649988417) -> WhatsApp JID (31649988417@s.whatsapp.net)
-    let jid = payload.peer.id;
-    if (jid.startsWith("+") && !jid.includes("@")) {
-      jid = `${jid.slice(1)}@s.whatsapp.net`;
-    }
-    
-    const text = payload.message.text;
-
-    try {
-      await this.sock.sendMessage(jid, { text });
-      console.log(`[WA] Sent to ${jid}: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
-    } catch (e) {
-      console.error(`[WA] Send failed:`, e);
-    }
-  }
-
   /**
-   * Handle typing indicator from Gateway
-   * Sends presence update to WhatsApp to show "typing..." status
+   * Notify Gateway of status change via Service Binding
    */
-  private async handleTyping(payload: ChannelTypingPayload): Promise<void> {
-    if (!this.sock || !this.state.connected) return;
-
-    // Convert peer ID to WhatsApp JID format
-    let jid = payload.peer.id;
-    if (jid.startsWith("+") && !jid.includes("@")) {
-      jid = `${jid.slice(1)}@s.whatsapp.net`;
-    }
-
+  private async notifyGatewayStatus(): Promise<void> {
     try {
-      // "composing" shows typing indicator, "paused" stops it
-      const presence = payload.typing ? "composing" : "paused";
-      await this.sock.sendPresenceUpdate(presence, jid);
-      console.log(`[WA] Sent presence=${presence} to ${jid}`);
+      const accountId = this.state.selfE164 || this.state.accountId;
+      const status: ChannelAccountStatus = {
+        accountId,
+        connected: this.state.connected,
+        authenticated: !!this.state.selfJid,
+        mode: "websocket",
+        lastActivity: this.state.lastMessageAt,
+        extra: { selfJid: this.state.selfJid },
+      };
+      
+      await this.env.GATEWAY.channelStatusChanged("whatsapp", accountId, status);
     } catch (e) {
-      // Typing indicators are best-effort, don't fail on errors
-      console.error(`[WA] Presence update failed:`, e);
+      console.error(`[WA] Failed to notify Gateway of status:`, e);
     }
   }
 
@@ -655,51 +569,31 @@ export class WhatsAppAccount extends DurableObject<Env> {
     });
   }
 
-  // Keep-alive interval in ms 10 seconds
   private static readonly KEEP_ALIVE_INTERVAL_MS = 10_000;
 
-  /** Schedule a keep-alive alarm to prevent DO hibernation */
   private scheduleKeepAlive(): void {
     this.ctx.storage.setAlarm(Date.now() + WhatsAppAccount.KEEP_ALIVE_INTERVAL_MS);
   }
 
-  /** Alarm handler - reconnection and keep-alive */
   async alarm(): Promise<void> {
     const hasAuth = await hasAuthState(this.ctx.storage);
-    if (!hasAuth) {
-      // No auth, nothing to do - don't schedule another alarm
-      return;
-    }
+    if (!hasAuth) return;
 
-    // ALWAYS schedule next alarm first, before any async work that might fail
-    // This ensures we never lose the keep-alive loop
     this.scheduleKeepAlive();
 
-    // Reconnect WhatsApp if needed (sock is lost on hibernation)
     if (!this.sock) {
-      console.log(`[WA] Alarm: WhatsApp socket lost, reconnecting...`);
+      console.log(`[WA] Alarm: Reconnecting WhatsApp...`);
       try {
         await this.startSocket();
       } catch (e) {
-        console.error(`[WA] Alarm: WhatsApp reconnect failed:`, e);
+        console.error(`[WA] Alarm: Reconnect failed:`, e);
       }
       return;
     }
 
-    // WhatsApp socket exists but not connected - might be mid-reconnect
     if (!this.state.connected) {
-      console.log(`[WA] Alarm: WhatsApp socket exists but not connected, waiting...`);
+      console.log(`[WA] Alarm: Socket exists but not connected, waiting...`);
       return;
-    }
-
-    // WhatsApp connected - check Gateway connection
-    if (!this.gatewayClient?.isConnected()) {
-      console.log(`[WA] Alarm: Gateway not connected, reconnecting...`);
-      try {
-        await this.connectToGateway();
-      } catch (e) {
-        console.error(`[WA] Alarm: Gateway reconnect failed:`, e);
-      }
     }
   }
 }
