@@ -13,6 +13,7 @@ type GsvConfig = {
     anthropic?: string;
     openai?: string;
     google?: string;
+    openrouter?: string;
   };
   timeouts: { llmMs: number; toolMs: number };
   auth: { token?: string };
@@ -286,6 +287,21 @@ function renderApiKeysSection(app: GsvApp, config: GsvConfig) {
             }}
           />
           <p class="form-hint">${apiKeys.google ? "✓ Configured" : "Required for Gemini models"}</p>
+        </div>
+        
+        <div class="form-group">
+          <label class="form-label">OpenRouter API Key</label>
+          <input 
+            type="password" 
+            class="form-input mono"
+            .value=${apiKeys.openrouter || ""}
+            placeholder="sk-or-..."
+            @change=${(e: Event) => {
+              const val = (e.target as HTMLInputElement).value;
+              app.saveConfig("apiKeys.openrouter", val || undefined);
+            }}
+          />
+          <p class="form-hint">${apiKeys.openrouter ? "✓ Configured" : "Required for OpenRouter models"}</p>
         </div>
       </div>
     </div>

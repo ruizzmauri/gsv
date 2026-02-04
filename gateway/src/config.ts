@@ -102,6 +102,7 @@ export interface GsvConfig {
     anthropic?: string;
     openai?: string;
     google?: string;
+    openrouter?: string;
   };
 
   // Timeouts

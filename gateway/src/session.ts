@@ -970,6 +970,11 @@ export class Session extends DurableObject<Env> {
         "google",
         modelId as Parameters<typeof getModel<"google", any>>[1],
       );
+    } else if (provider === "openrouter") {
+      model = getModel(
+        "openrouter",
+        modelId as Parameters<typeof getModel<"openrouter", any>>[1],
+      );
     } else {
       throw new Error(`Unsupported provider: ${provider}`);
     }
@@ -985,6 +990,8 @@ export class Session extends DurableObject<Env> {
       apiKey = config.apiKeys.openai;
     } else if (provider === "google") {
       apiKey = config.apiKeys.google;
+    } else if (provider === "openrouter") {
+      apiKey = config.apiKeys.openrouter;
     }
 
     if (!apiKey) {

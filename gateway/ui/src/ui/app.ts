@@ -39,6 +39,8 @@ export class GsvApp extends LitElement {
   // ---- Connection State ----
   @state() connectionState: ConnectionState = "disconnected";
   @state() settings: UiSettings = loadSettings();
+  @state() connectionError: string | null = null;
+  @state() showConnectScreen = true; // Show connect screen until first successful connection
   
   client: GatewayClient | null = null;
 
@@ -82,7 +84,13 @@ export class GsvApp extends LitElement {
   connectedCallback() {
     super.connectedCallback();
     applyTheme(this.settings.theme);
-    this.startConnection();
+    
+    // Only auto-connect if we have previously connected successfully
+    // (token is set or user explicitly clicked connect)
+    if (this.settings.token || localStorage.getItem("gsv-connected-once")) {
+      this.showConnectScreen = false;
+      this.startConnection();
+    }
     
     // Handle browser back/forward
     window.addEventListener("popstate", this.handlePopState);
@@ -105,19 +113,40 @@ export class GsvApp extends LitElement {
       this.client.stop();
     }
 
+    this.connectionError = null;
+
     this.client = new GatewayClient({
       url: getGatewayUrl(this.settings),
       token: this.settings.token || undefined,
       onStateChange: (state) => {
         this.connectionState = state;
         if (state === "connected") {
+          this.connectionError = null;
+          this.showConnectScreen = false;
+          localStorage.setItem("gsv-connected-once", "true");
           this.onConnected();
         }
+      },
+      onError: (error) => {
+        this.connectionError = error;
       },
       onEvent: (event) => this.handleEvent(event),
     });
 
     this.client.start();
+  }
+
+  /** Manual connect triggered from connect screen */
+  connect() {
+    this.showConnectScreen = false;
+    this.startConnection();
+  }
+
+  /** Disconnect and show connect screen */
+  disconnect() {
+    this.client?.stop();
+    this.showConnectScreen = true;
+    localStorage.removeItem("gsv-connected-once");
   }
 
   private async onConnected() {
@@ -397,6 +426,11 @@ export class GsvApp extends LitElement {
   // ---- Render ----
 
   render() {
+    // Show connect screen if not connected yet
+    if (this.showConnectScreen) {
+      return this.renderConnectScreen();
+    }
+
     return html`
       <div class="app-shell">
         ${this.renderNav()}
@@ -404,6 +438,92 @@ export class GsvApp extends LitElement {
           ${this.renderTopbar()}
           <div class="page-content">
             ${this.renderView()}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderConnectScreen() {
+    const isConnecting = this.connectionState === "connecting";
+    
+    return html`
+      <div class="connect-screen">
+        <div class="connect-card">
+          <div class="connect-header">
+            <span class="connect-logo">🚀</span>
+            <h1>GSV</h1>
+            <p class="text-secondary">Connect to your Gateway</p>
+          </div>
+          
+          <div class="connect-form">
+            <div class="form-group">
+              <label class="form-label">Gateway URL</label>
+              <input 
+                type="text" 
+                class="form-input mono"
+                placeholder=${getGatewayUrl(this.settings)}
+                .value=${this.settings.gatewayUrl}
+                @input=${(e: Event) => {
+                  this.settings = { ...this.settings, gatewayUrl: (e.target as HTMLInputElement).value };
+                }}
+                ?disabled=${isConnecting}
+              />
+              <p class="form-hint">
+                ${this.settings.gatewayUrl 
+                  ? "Custom WebSocket URL" 
+                  : `Will connect to: ${getGatewayUrl(this.settings)}`}
+              </p>
+            </div>
+            
+            <div class="form-group">
+              <label class="form-label">Auth Token</label>
+              <input 
+                type="password" 
+                class="form-input mono"
+                placeholder="Leave empty if no auth required"
+                .value=${this.settings.token}
+                @input=${(e: Event) => {
+                  this.settings = { ...this.settings, token: (e.target as HTMLInputElement).value };
+                }}
+                ?disabled=${isConnecting}
+              />
+              <p class="form-hint">Required if your Gateway has authentication enabled</p>
+            </div>
+            
+            ${this.connectionError ? html`
+              <div class="connect-error">
+                ${this.connectionError}
+              </div>
+            ` : nothing}
+            
+            <button 
+              class="btn btn-primary btn-lg connect-btn"
+              @click=${() => {
+                saveSettings({ gatewayUrl: this.settings.gatewayUrl, token: this.settings.token });
+                this.connect();
+              }}
+              ?disabled=${isConnecting}
+            >
+              ${isConnecting ? html`<span class="spinner"></span> Connecting...` : "Connect"}
+            </button>
+          </div>
+          
+          <div class="connect-footer">
+            <p class="text-secondary">
+              Theme: 
+              <button 
+                class="btn btn-ghost btn-sm"
+                @click=${() => {
+                  const newTheme = this.settings.theme === "dark" ? "light" : "dark";
+                  this.settings = { ...this.settings, theme: newTheme };
+                  saveSettings({ theme: newTheme });
+                  applyTheme(newTheme);
+                }}
+              >
+                ${this.settings.theme === "dark" ? "🌙 Dark" : "☀️ Light"}
+              </button>
+            </p>
           </div>
         </div>
       </div>

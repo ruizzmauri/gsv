@@ -14,6 +14,7 @@ export type GatewayClientOptions = {
   token?: string;
   onStateChange?: (state: ConnectionState) => void;
   onEvent?: (event: EventFrame) => void;
+  onError?: (error: string) => void;
 };
 
 type PendingRequest = {
@@ -92,9 +93,11 @@ export class GatewayClient {
       
       this.ws.onerror = (error) => {
         console.error("[GatewayClient] Error:", error);
+        this.options.onError?.("Connection failed");
       };
     } catch (e) {
       console.error("[GatewayClient] Failed to connect:", e);
+      this.options.onError?.(`Failed to connect: ${e}`);
       this.scheduleReconnect();
     }
   }
@@ -128,13 +131,17 @@ export class GatewayClient {
       });
       
       if (!response.ok) {
-        throw new Error(response.error?.message || "Handshake failed");
+        const errorMsg = response.error?.message || "Handshake failed";
+        this.options.onError?.(errorMsg);
+        throw new Error(errorMsg);
       }
       
       console.log("[GatewayClient] Handshake complete");
       this.setState("connected");
     } catch (e) {
       console.error("[GatewayClient] Handshake failed:", e);
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      this.options.onError?.(errorMsg);
       this.ws?.close();
     }
   }
