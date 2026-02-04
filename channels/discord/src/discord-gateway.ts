@@ -11,7 +11,7 @@ import { DurableObject } from "cloudflare:workers";
 import type {
   ChannelAccountStatus,
   ChannelInboundMessage,
-  GatewayChannelInterface,
+  ChannelQueueMessage,
 } from "./types";
 
 const DISCORD_GATEWAY_URL = "https://discord.com/api/v10/gateway";
@@ -42,6 +42,7 @@ const INTENTS = {
 } as const;
 
 type GatewayState = {
+  accountId: string | null;  // The name used to create this DO (e.g., "default")
   botToken: string | null;
   sessionId: string | null;
   resumeGatewayUrl: string | null;
@@ -52,13 +53,16 @@ type GatewayState = {
 };
 
 interface Env {
-  GATEWAY: GatewayChannelInterface;
+  GATEWAY_QUEUE: Queue<ChannelQueueMessage>;
 }
 
 export class DiscordGateway extends DurableObject<Env> {
+  private static readonly KEEP_ALIVE_INTERVAL_MS = 10_000; // 10 seconds
+  
   private ws: WebSocket | null = null;
   private heartbeatInterval: number = 0;
   private state: GatewayState = {
+    accountId: null,
     botToken: null,
     sessionId: null,
     resumeGatewayUrl: null,
@@ -88,15 +92,22 @@ export class DiscordGateway extends DurableObject<Env> {
   // Public RPC Methods (called by WorkerEntrypoint)
   // ─────────────────────────────────────────────────────────
 
-  async start(botToken: string): Promise<void> {
+  async start(botToken: string, accountId?: string): Promise<void> {
     if (this.ws && this.state.connected) {
       console.log("[DiscordGateway] Already connected");
       return;
     }
 
+    // Store the accountId name (not the hex DO id) for consistent queue messages
+    if (accountId) {
+      this.state.accountId = accountId;
+    }
     this.state.botToken = botToken;
     await this.saveState();
     await this.connect();
+    
+    // Schedule keep-alive to prevent DO hibernation
+    this.scheduleKeepAlive();
   }
 
   async stop(): Promise<void> {
@@ -111,7 +122,7 @@ export class DiscordGateway extends DurableObject<Env> {
 
   async getStatus(): Promise<ChannelAccountStatus> {
     return {
-      accountId: this.ctx.id.toString(),
+      accountId: this.getAccountId(),
       connected: this.state.connected,
       authenticated: !!this.state.sessionId,
       mode: "gateway",
@@ -123,13 +134,50 @@ export class DiscordGateway extends DurableObject<Env> {
       },
     };
   }
+  
+  /** Get the account ID name (e.g., "default"), falling back to hex DO id */
+  private getAccountId(): string {
+    return this.state.accountId ?? this.ctx.id.toString();
+  }
 
   // ─────────────────────────────────────────────────────────
-  // Alarm Handler (for heartbeats)
+  // Alarm Handler (keep-alive + heartbeats)
   // ─────────────────────────────────────────────────────────
 
   async alarm() {
-    await this.sendHeartbeat();
+    // Reload state in case we hibernated
+    await this.loadState();
+    
+    // No token = not started, don't reschedule
+    if (!this.state.botToken) {
+      console.log("[DiscordGateway] No bot token, alarm stopping");
+      return;
+    }
+    
+    // Always reschedule to keep DO alive
+    this.scheduleKeepAlive();
+    
+    // Reconnect if WebSocket is gone
+    if (!this.ws) {
+      console.log("[DiscordGateway] WebSocket lost, reconnecting...");
+      try {
+        await this.connect();
+      } catch (e) {
+        console.error("[DiscordGateway] Reconnect failed:", e);
+        this.state.lastError = e instanceof Error ? e.message : String(e);
+        await this.saveState();
+      }
+      return;
+    }
+    
+    // Send heartbeat if connected
+    if (this.state.connected && this.heartbeatInterval > 0) {
+      await this.sendHeartbeat();
+    }
+  }
+  
+  private scheduleKeepAlive(): void {
+    this.ctx.storage.setAlarm(Date.now() + DiscordGateway.KEEP_ALIVE_INTERVAL_MS);
   }
 
   // ─────────────────────────────────────────────────────────
@@ -234,7 +282,30 @@ export class DiscordGateway extends DurableObject<Env> {
         this.state.resumeGatewayUrl = d.resume_gateway_url as string;
         this.state.connected = true;
         this.state.lastError = null;
-        console.log(`[DiscordGateway] Connected as ${(d.user as { username: string })?.username}`);
+        
+        // Store bot user info for mention detection
+        const botUser = d.user as { id: string; username: string } | undefined;
+        if (botUser) {
+          await this.ctx.storage.put("botUser", { id: botUser.id, username: botUser.username });
+        }
+        
+        console.log(`[DiscordGateway] Connected as ${botUser?.username} (${botUser?.id})`);
+        
+        // Notify Gateway of status change via queue
+        const accountId = this.getAccountId();
+        await this.env.GATEWAY_QUEUE.send({
+          type: "status",
+          channelId: "discord",
+          accountId,
+          status: {
+            accountId,
+            connected: true,
+            authenticated: true,
+            mode: "gateway",
+            extra: { botUserId: botUser?.id, botUsername: botUser?.username },
+          },
+        });
+        
         await this.saveState();
         break;
 
@@ -254,7 +325,7 @@ export class DiscordGateway extends DurableObject<Env> {
   }
 
   private async handleMessageCreate(data: Record<string, unknown>) {
-    const author = data.author as { id: string; username: string; bot?: boolean } | undefined;
+    const author = data.author as { id: string; username: string; bot?: boolean; discriminator?: string } | undefined;
     
     // Ignore bot messages
     if (author?.bot) return;
@@ -267,6 +338,11 @@ export class DiscordGateway extends DurableObject<Env> {
     const channelId = data.channel_id as string;
     const messageId = data.id as string;
 
+    // Check if bot was mentioned
+    const mentions = data.mentions as Array<{ id: string }> | undefined;
+    const botUser = await this.ctx.storage.get<{ id: string }>("botUser");
+    const wasMentioned = mentions?.some(m => m.id === botUser?.id) ?? false;
+
     // Build inbound message
     const message: ChannelInboundMessage = {
       messageId,
@@ -278,19 +354,25 @@ export class DiscordGateway extends DurableObject<Env> {
       sender: author ? {
         id: author.id,
         name: author.username,
-        handle: author.username,
+        handle: author.discriminator ? `${author.username}#${author.discriminator}` : author.username,
       } : undefined,
       text: content,
       timestamp: data.timestamp ? new Date(data.timestamp as string).getTime() : Date.now(),
-      // TODO: Handle mentions, attachments, embeds
+      wasMentioned,
+      // TODO: Handle attachments, embeds
     };
 
-    // Forward to GSV Gateway
+    // Forward to GSV Gateway via queue
     try {
-      const accountId = this.ctx.id.toString();
-      await this.env.GATEWAY.channelInbound("discord", accountId, message);
+      await this.env.GATEWAY_QUEUE.send({
+        type: "inbound",
+        channelId: "discord",
+        accountId: this.getAccountId(),
+        message,
+      });
+      console.log(`[DiscordGateway] Queued message ${messageId} from ${author?.username}`);
     } catch (e) {
-      console.error("[DiscordGateway] Failed to forward message to gateway:", e);
+      console.error("[DiscordGateway] Failed to queue message:", e);
     }
   }
 
@@ -346,12 +428,9 @@ export class DiscordGateway extends DurableObject<Env> {
   }
 
   private async scheduleHeartbeat() {
-    if (this.heartbeatInterval > 0) {
-      // Add jitter as recommended by Discord
-      const jitter = Math.random();
-      const delay = Math.floor(this.heartbeatInterval * jitter);
-      await this.ctx.storage.setAlarm(Date.now() + this.heartbeatInterval + delay);
-    }
+    // Heartbeats are now sent via the keep-alive alarm
+    // This method is kept for the initial heartbeat after HELLO
+    // No need to schedule separate alarms - keep-alive handles it
   }
 
   private handleClose(event: CloseEvent) {

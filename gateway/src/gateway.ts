@@ -241,6 +241,16 @@ export class Gateway extends DurableObject<Env> {
         return this.handleChannelInbound(ws, frame);
       case "channels.list":
         return this.handleChannelsList(ws, frame);
+      case "channel.start":
+        return this.handleChannelStart(ws, frame);
+      case "channel.stop":
+        return this.handleChannelStop(ws, frame);
+      case "channel.status":
+        return this.handleChannelStatus(ws, frame);
+      case "channel.login":
+        return this.handleChannelLogin(ws, frame);
+      case "channel.logout":
+        return this.handleChannelLogout(ws, frame);
       case "heartbeat.trigger":
         return this.handleHeartbeatTrigger(ws, frame);
       case "heartbeat.status":
@@ -325,7 +335,7 @@ export class Gateway extends DurableObject<Env> {
       protocol: 1,
       server: { version: "0.0.1", connectionId: attachments.id },
       features: {
-        methods: ["tools.list", "chat.send", "tool.request", "tool.result", "channel.inbound"],
+        methods: ["tools.list", "chat.send", "tool.request", "tool.result", "channel.inbound", "channel.start", "channel.stop", "channel.status", "channel.login", "channel.logout", "channels.list"],
         events: ["chat", "tool.invoke", "tool.result", "channel.outbound"],
       },
     });
@@ -1571,6 +1581,179 @@ export class Gateway extends DurableObject<Env> {
     });
   }
 
+  // ---- Channel Management RPC handlers ----
+
+  async handleChannelStart(ws: WebSocket, frame: RequestFrame) {
+    const params = frame.params as { channel: string; accountId?: string; config?: Record<string, unknown> } | undefined;
+
+    if (!params?.channel) {
+      this.sendError(ws, frame.id, 400, "channel required");
+      return;
+    }
+
+    const channel = params.channel as ChannelId;
+    const accountId = params.accountId ?? "default";
+    const config = params.config ?? {};
+
+    const binding = this.getChannelBinding(channel);
+    if (!binding) {
+      this.sendError(ws, frame.id, 404, `Unknown channel: ${channel}`);
+      return;
+    }
+
+    try {
+      const result = await binding.start(accountId, config);
+      if (result.ok) {
+        // Update channel registry
+        const channelKey = `${channel}:${accountId}`;
+        this.channelRegistry[channelKey] = {
+          channel,
+          accountId,
+          connectedAt: Date.now(),
+        };
+        this.sendOk(ws, frame.id, { ok: true, channel, accountId });
+      } else {
+        this.sendError(ws, frame.id, 500, result.error);
+      }
+    } catch (e) {
+      this.sendError(ws, frame.id, 500, e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async handleChannelStop(ws: WebSocket, frame: RequestFrame) {
+    const params = frame.params as { channel: string; accountId?: string } | undefined;
+
+    if (!params?.channel) {
+      this.sendError(ws, frame.id, 400, "channel required");
+      return;
+    }
+
+    const channel = params.channel as ChannelId;
+    const accountId = params.accountId ?? "default";
+
+    const binding = this.getChannelBinding(channel);
+    if (!binding) {
+      this.sendError(ws, frame.id, 404, `Unknown channel: ${channel}`);
+      return;
+    }
+
+    try {
+      const result = await binding.stop(accountId);
+      if (result.ok) {
+        // Remove from channel registry
+        const channelKey = `${channel}:${accountId}`;
+        delete this.channelRegistry[channelKey];
+        this.sendOk(ws, frame.id, { ok: true, channel, accountId });
+      } else {
+        this.sendError(ws, frame.id, 500, result.error);
+      }
+    } catch (e) {
+      this.sendError(ws, frame.id, 500, e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async handleChannelStatus(ws: WebSocket, frame: RequestFrame) {
+    const params = frame.params as { channel: string; accountId?: string } | undefined;
+
+    if (!params?.channel) {
+      this.sendError(ws, frame.id, 400, "channel required");
+      return;
+    }
+
+    const channel = params.channel as ChannelId;
+    const accountId = params.accountId;
+
+    const binding = this.getChannelBinding(channel);
+    if (!binding) {
+      this.sendError(ws, frame.id, 404, `Unknown channel: ${channel}`);
+      return;
+    }
+
+    try {
+      const statuses = await binding.status(accountId);
+      this.sendOk(ws, frame.id, { channel, accounts: statuses });
+    } catch (e) {
+      this.sendError(ws, frame.id, 500, e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async handleChannelLogin(ws: WebSocket, frame: RequestFrame) {
+    const params = frame.params as { channel: string; accountId?: string; force?: boolean } | undefined;
+
+    if (!params?.channel) {
+      this.sendError(ws, frame.id, 400, "channel required");
+      return;
+    }
+
+    const channel = params.channel as ChannelId;
+    const accountId = params.accountId ?? "default";
+
+    const binding = this.getChannelBinding(channel);
+    if (!binding) {
+      this.sendError(ws, frame.id, 404, `Unknown channel: ${channel}`);
+      return;
+    }
+
+    if (!binding.login) {
+      this.sendError(ws, frame.id, 400, `Channel ${channel} does not support login flow`);
+      return;
+    }
+
+    try {
+      const result = await binding.login(accountId, { force: params.force });
+      if (result.ok) {
+        this.sendOk(ws, frame.id, { 
+          ok: true, 
+          channel, 
+          accountId,
+          qrDataUrl: result.qrDataUrl,
+          message: result.message,
+        });
+      } else {
+        this.sendError(ws, frame.id, 500, result.error);
+      }
+    } catch (e) {
+      this.sendError(ws, frame.id, 500, e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async handleChannelLogout(ws: WebSocket, frame: RequestFrame) {
+    const params = frame.params as { channel: string; accountId?: string } | undefined;
+
+    if (!params?.channel) {
+      this.sendError(ws, frame.id, 400, "channel required");
+      return;
+    }
+
+    const channel = params.channel as ChannelId;
+    const accountId = params.accountId ?? "default";
+
+    const binding = this.getChannelBinding(channel);
+    if (!binding) {
+      this.sendError(ws, frame.id, 404, `Unknown channel: ${channel}`);
+      return;
+    }
+
+    if (!binding.logout) {
+      this.sendError(ws, frame.id, 400, `Channel ${channel} does not support logout`);
+      return;
+    }
+
+    try {
+      const result = await binding.logout(accountId);
+      if (result.ok) {
+        // Remove from channel registry
+        const channelKey = `${channel}:${accountId}`;
+        delete this.channelRegistry[channelKey];
+        this.sendOk(ws, frame.id, { ok: true, channel, accountId });
+      } else {
+        this.sendError(ws, frame.id, 500, result.error);
+      }
+    } catch (e) {
+      this.sendError(ws, frame.id, 500, e instanceof Error ? e.message : String(e));
+    }
+  }
+
   // ---- Heartbeat RPC handlers ----
 
   async handleHeartbeatTrigger(ws: WebSocket, frame: RequestFrame) {
@@ -1807,14 +1990,7 @@ export class Gateway extends DurableObject<Env> {
     },
     payload: ChatEventPayload,
   ): void {
-    const channelKey = `${context.channel}:${context.accountId}`;
-    const channelWs = this.channels.get(channelKey);
-    
-    if (!channelWs || channelWs.readyState !== WebSocket.OPEN) {
-      console.log(`[Gateway] Channel ${channelKey} not connected for outbound`);
-      return;
-    }
-
+    // Extract text from response
     let text = "";
     const msg = payload.message as { content?: unknown } | undefined;
     if (msg?.content) {
@@ -1852,6 +2028,46 @@ export class Gateway extends DurableObject<Env> {
       text = cleanedText || text;
     }
 
+    const replyToId = isHeartbeat ? undefined : context.inboundMessageId;
+
+    // Try Service Binding RPC first (preferred for queue-based channels like Discord)
+    const channelBinding = this.getChannelBinding(context.channel);
+    
+    if (channelBinding) {
+      // Clone the message to ensure it's a plain object (not a proxy)
+      // This is necessary for Service Binding RPC serialization
+      const message: ChannelOutboundMessage = JSON.parse(JSON.stringify({
+        peer: {
+          kind: context.peer.kind,
+          id: context.peer.id,
+          name: context.peer.name,
+        },
+        text,
+        replyToId,
+      }));
+      channelBinding.send(context.accountId, message)
+        .then(result => {
+          if (result.ok) {
+            console.log(`[Gateway] Routed response via RPC to ${context.channel}:${context.accountId}${isHeartbeat ? ' (heartbeat)' : ''}`);
+          } else {
+            console.error(`[Gateway] Channel RPC send failed: ${result.error}`);
+          }
+        })
+        .catch(e => {
+          console.error(`[Gateway] Channel RPC error:`, e);
+        });
+      return;
+    }
+
+    // WebSocket fallback (for channels that connect via WebSocket)
+    const channelKey = `${context.channel}:${context.accountId}`;
+    const channelWs = this.channels.get(channelKey);
+    
+    if (!channelWs || channelWs.readyState !== WebSocket.OPEN) {
+      console.log(`[Gateway] Channel ${channelKey} not connected for outbound (no RPC binding, no WebSocket)`);
+      return;
+    }
+
     const outbound: ChannelOutboundPayload = {
       channel: context.channel,
       accountId: context.accountId,
@@ -1859,7 +2075,7 @@ export class Gateway extends DurableObject<Env> {
       sessionKey,
       message: {
         text,
-        replyToId: isHeartbeat ? undefined : context.inboundMessageId, // Don't reply to heartbeat
+        replyToId,
       },
     };
 

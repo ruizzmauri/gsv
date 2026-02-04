@@ -154,7 +154,15 @@ enum ChannelAction {
         #[command(subcommand)]
         action: WhatsAppAction,
     },
-    // TODO: Add Discord, Telegram, etc.
+
+    /// Discord channel management
+    Discord {
+        #[command(subcommand)]
+        action: DiscordAction,
+    },
+
+    /// List all channel accounts
+    List,
 }
 
 #[derive(Subcommand)]
@@ -181,6 +189,30 @@ enum WhatsAppAction {
     },
 
     /// Stop WhatsApp connection
+    Stop {
+        /// Account ID
+        #[arg(default_value = "default")]
+        account_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DiscordAction {
+    /// Start Discord bot connection
+    Start {
+        /// Account ID (arbitrary name for this Discord bot)
+        #[arg(default_value = "default")]
+        account_id: String,
+    },
+
+    /// Check Discord bot status
+    Status {
+        /// Account ID
+        #[arg(default_value = "default")]
+        account_id: String,
+    },
+
+    /// Stop Discord bot connection
     Stop {
         /// Account ID
         #[arg(default_value = "default")]
@@ -378,7 +410,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Mount { action } => run_mount(action, &cfg).await,
         Commands::Heartbeat { action } => run_heartbeat(&url, token, action).await,
         Commands::Pair { action } => run_pair(&url, token, action).await,
-        Commands::Channel { action } => run_channel(action, &cfg).await,
+        Commands::Channel { action } => run_channel(action, &url, token, &cfg).await,
     }
 }
 
@@ -890,154 +922,301 @@ async fn run_pair(
 
 async fn run_channel(
     action: ChannelAction,
-    cfg: &CliConfig,
+    url: &str,
+    token: Option<String>,
+    _cfg: &CliConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
-        ChannelAction::Whatsapp { action } => run_whatsapp(action, cfg).await,
+        ChannelAction::Whatsapp { action } => run_whatsapp_via_gateway(url, token, action).await,
+        ChannelAction::Discord { action } => run_discord_via_gateway(url, token, action).await,
+        ChannelAction::List => run_channels_list(url, token).await,
     }
 }
 
-async fn run_whatsapp(
-    action: WhatsAppAction,
-    cfg: &CliConfig,
+async fn run_channels_list(
+    url: &str,
+    token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // WhatsApp channel URL - derive from gateway URL or use explicit config
-    // Gateway URL: wss://gateway.example.com/ws
-    // WhatsApp URL: https://gsv-channel-whatsapp.example.workers.dev
-    let whatsapp_url = cfg.whatsapp_url().ok_or(
-        "WhatsApp channel URL not configured. Set channels.whatsapp.url in config or WHATSAPP_CHANNEL_URL env var"
-    )?;
-    let auth_token = cfg.whatsapp_token();
+    let conn = Connection::connect_with_options(url, "client", None, |_| {}, None, token).await?;
+
+    let res = conn.request("channels.list", None).await?;
+
+    if res.ok {
+        if let Some(payload) = res.payload {
+            if let Some(channels) = payload.get("channels").and_then(|c| c.as_array()) {
+                if channels.is_empty() {
+                    println!("No channel accounts connected");
+                } else {
+                    println!("Connected channel accounts ({}):\n", channels.len());
+                    for ch in channels {
+                        let channel = ch.get("channel").and_then(|c| c.as_str()).unwrap_or("?");
+                        let account_id = ch.get("accountId").and_then(|a| a.as_str()).unwrap_or("?");
+                        let connected_at = ch.get("connectedAt").and_then(|t| t.as_i64());
+                        let last_msg = ch.get("lastMessageAt").and_then(|t| t.as_i64());
+
+                        print!("  {}:{}", channel, account_id);
+                        
+                        if let Some(ts) = connected_at {
+                            if let Some(dt) = chrono::DateTime::from_timestamp_millis(ts) {
+                                print!(" (connected {})", dt.format("%Y-%m-%d %H:%M"));
+                            }
+                        }
+                        
+                        if let Some(ts) = last_msg {
+                            if let Some(dt) = chrono::DateTime::from_timestamp_millis(ts) {
+                                print!(", last msg {}", dt.format("%H:%M:%S"));
+                            }
+                        }
+                        println!();
+                    }
+                }
+            }
+        }
+    } else if let Some(err) = res.error {
+        eprintln!("Error: {}", err.message);
+    }
+
+    Ok(())
+}
+
+async fn run_whatsapp_via_gateway(
+    url: &str,
+    token: Option<String>,
+    action: WhatsAppAction,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::connect_with_options(url, "client", None, |_| {}, None, token).await?;
 
     match action {
         WhatsAppAction::Login { account_id } => {
             println!("Logging in to WhatsApp account: {}", account_id);
-            println!("Connecting to {}...", whatsapp_url);
 
-            let client = reqwest::Client::new();
-            let url = format!("{}/account/{}/login", whatsapp_url, account_id);
+            let res = conn
+                .request(
+                    "channel.login",
+                    Some(json!({
+                        "channel": "whatsapp",
+                        "accountId": account_id,
+                    })),
+                )
+                .await?;
 
-            let mut req = client.post(&url);
-            if let Some(token) = &auth_token {
-                req = req.header("Authorization", format!("Bearer {}", token));
-            }
-
-            let res = req.send().await?;
-
-            if !res.status().is_success() {
-                let status = res.status();
-                let body = res.text().await.unwrap_or_default();
-                eprintln!("Error: {} - {}", status, body);
-                return Ok(());
-            }
-
-            let data: serde_json::Value = res.json().await?;
-
-            if data
-                .get("connected")
-                .and_then(|c| c.as_bool())
-                .unwrap_or(false)
-            {
-                println!("Already connected to WhatsApp!");
-                return Ok(());
-            }
-
-            if let Some(qr) = data.get("qr").and_then(|q| q.as_str()) {
-                println!("\nScan this QR code with WhatsApp:\n");
-                render_qr_terminal(qr)?;
-                println!("\nQR code expires in ~20 seconds. Re-run command if needed.");
-                println!("After scanning, the account will auto-connect.");
-            } else {
-                let msg = data
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown error");
-                eprintln!("Failed to get QR code: {}", msg);
+            if res.ok {
+                if let Some(payload) = res.payload {
+                    if let Some(qr_data_url) = payload.get("qrDataUrl").and_then(|q| q.as_str()) {
+                        // qrDataUrl is a data URL, extract the QR data
+                        println!("\nScan this QR code with WhatsApp:\n");
+                        
+                        // The qrDataUrl from WhatsApp channel is actually the raw QR string
+                        // Try to render it
+                        render_qr_terminal(qr_data_url)?;
+                        println!("\nQR code expires in ~20 seconds. Re-run command if needed.");
+                    } else if let Some(msg) = payload.get("message").and_then(|m| m.as_str()) {
+                        println!("{}", msg);
+                    }
+                }
+            } else if let Some(err) = res.error {
+                eprintln!("Error: {}", err.message);
             }
         }
 
         WhatsAppAction::Status { account_id } => {
-            let client = reqwest::Client::new();
-            let url = format!("{}/account/{}/status", whatsapp_url, account_id);
+            let res = conn
+                .request(
+                    "channel.status",
+                    Some(json!({
+                        "channel": "whatsapp",
+                        "accountId": account_id,
+                    })),
+                )
+                .await?;
 
-            let mut req = client.get(&url);
-            if let Some(token) = &auth_token {
-                req = req.header("Authorization", format!("Bearer {}", token));
-            }
-
-            let res = req.send().await?;
-
-            if !res.status().is_success() {
-                let status = res.status();
-                let body = res.text().await.unwrap_or_default();
-                eprintln!("Error: {} - {}", status, body);
-                return Ok(());
-            }
-
-            let data: serde_json::Value = res.json().await?;
-
-            println!("WhatsApp account: {}", account_id);
-            println!(
-                "  Connected: {}",
-                data.get("connected")
-                    .and_then(|c| c.as_bool())
-                    .unwrap_or(false)
-            );
-            if let Some(jid) = data.get("selfJid").and_then(|j| j.as_str()) {
-                println!("  JID: {}", jid);
-            }
-            if let Some(e164) = data.get("selfE164").and_then(|e| e.as_str()) {
-                println!("  Phone: {}", e164);
-            }
-            if let Some(last) = data.get("lastConnectedAt").and_then(|t| t.as_i64()) {
-                let dt = chrono::DateTime::from_timestamp_millis(last);
-                if let Some(dt) = dt {
-                    println!("  Last connected: {}", dt.format("%Y-%m-%d %H:%M:%S"));
+            if res.ok {
+                if let Some(payload) = res.payload {
+                    if let Some(accounts) = payload.get("accounts").and_then(|a| a.as_array()) {
+                        if accounts.is_empty() {
+                            println!("WhatsApp account '{}': not found", account_id);
+                        } else {
+                            for acc in accounts {
+                                let acc_id = acc.get("accountId").and_then(|a| a.as_str()).unwrap_or(&account_id);
+                                let connected = acc.get("connected").and_then(|c| c.as_bool()).unwrap_or(false);
+                                let authenticated = acc.get("authenticated").and_then(|a| a.as_bool()).unwrap_or(false);
+                                
+                                println!("WhatsApp account: {}", acc_id);
+                                println!("  Connected: {}", connected);
+                                println!("  Authenticated: {}", authenticated);
+                                
+                                if let Some(error) = acc.get("error").and_then(|e| e.as_str()) {
+                                    println!("  Error: {}", error);
+                                }
+                                
+                                if let Some(extra) = acc.get("extra") {
+                                    if let Some(jid) = extra.get("selfJid").and_then(|j| j.as_str()) {
+                                        println!("  JID: {}", jid);
+                                    }
+                                    if let Some(e164) = extra.get("selfE164").and_then(|e| e.as_str()) {
+                                        println!("  Phone: {}", e164);
+                                    }
+                                }
+                                
+                                if let Some(last) = acc.get("lastActivity").and_then(|t| t.as_i64()) {
+                                    if let Some(dt) = chrono::DateTime::from_timestamp_millis(last) {
+                                        println!("  Last activity: {}", dt.format("%Y-%m-%d %H:%M:%S"));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
+            } else if let Some(err) = res.error {
+                eprintln!("Error: {}", err.message);
             }
         }
 
         WhatsAppAction::Logout { account_id } => {
             println!("Logging out WhatsApp account: {}", account_id);
 
-            let client = reqwest::Client::new();
-            let url = format!("{}/account/{}/logout", whatsapp_url, account_id);
+            let res = conn
+                .request(
+                    "channel.logout",
+                    Some(json!({
+                        "channel": "whatsapp",
+                        "accountId": account_id,
+                    })),
+                )
+                .await?;
 
-            let mut req = client.post(&url);
-            if let Some(token) = &auth_token {
-                req = req.header("Authorization", format!("Bearer {}", token));
-            }
-
-            let res = req.send().await?;
-
-            if res.status().is_success() {
+            if res.ok {
                 println!("Logged out successfully. Credentials cleared.");
-            } else {
-                let status = res.status();
-                let body = res.text().await.unwrap_or_default();
-                eprintln!("Error: {} - {}", status, body);
+            } else if let Some(err) = res.error {
+                eprintln!("Error: {}", err.message);
             }
         }
 
         WhatsAppAction::Stop { account_id } => {
             println!("Stopping WhatsApp account: {}", account_id);
 
-            let client = reqwest::Client::new();
-            let url = format!("{}/account/{}/stop", whatsapp_url, account_id);
+            let res = conn
+                .request(
+                    "channel.stop",
+                    Some(json!({
+                        "channel": "whatsapp",
+                        "accountId": account_id,
+                    })),
+                )
+                .await?;
 
-            let mut req = client.post(&url);
-            if let Some(token) = &auth_token {
-                req = req.header("Authorization", format!("Bearer {}", token));
-            }
-
-            let res = req.send().await?;
-
-            if res.status().is_success() {
+            if res.ok {
                 println!("Stopped.");
-            } else {
-                let status = res.status();
-                let body = res.text().await.unwrap_or_default();
-                eprintln!("Error: {} - {}", status, body);
+            } else if let Some(err) = res.error {
+                eprintln!("Error: {}", err.message);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_discord_via_gateway(
+    url: &str,
+    token: Option<String>,
+    action: DiscordAction,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::connect_with_options(url, "client", None, |_| {}, None, token).await?;
+
+    match action {
+        DiscordAction::Start { account_id } => {
+            println!("Starting Discord bot account: {}", account_id);
+
+            let res = conn
+                .request(
+                    "channel.start",
+                    Some(json!({
+                        "channel": "discord",
+                        "accountId": account_id,
+                    })),
+                )
+                .await?;
+
+            if res.ok {
+                println!("Discord bot started successfully.");
+                println!("\nThe bot will connect using the DISCORD_BOT_TOKEN configured on the channel worker.");
+            } else if let Some(err) = res.error {
+                eprintln!("Error: {}", err.message);
+            }
+        }
+
+        DiscordAction::Status { account_id } => {
+            let res = conn
+                .request(
+                    "channel.status",
+                    Some(json!({
+                        "channel": "discord",
+                        "accountId": account_id,
+                    })),
+                )
+                .await?;
+
+            if res.ok {
+                if let Some(payload) = res.payload {
+                    if let Some(accounts) = payload.get("accounts").and_then(|a| a.as_array()) {
+                        if accounts.is_empty() {
+                            println!("Discord account '{}': not found", account_id);
+                        } else {
+                            for acc in accounts {
+                                let acc_id = acc.get("accountId").and_then(|a| a.as_str()).unwrap_or(&account_id);
+                                let connected = acc.get("connected").and_then(|c| c.as_bool()).unwrap_or(false);
+                                let authenticated = acc.get("authenticated").and_then(|a| a.as_bool()).unwrap_or(false);
+                                
+                                println!("Discord account: {}", acc_id);
+                                println!("  Connected: {}", connected);
+                                println!("  Authenticated: {}", authenticated);
+                                
+                                if let Some(error) = acc.get("error").and_then(|e| e.as_str()) {
+                                    println!("  Error: {}", error);
+                                }
+                                
+                                if let Some(extra) = acc.get("extra") {
+                                    if let Some(bot_user) = extra.get("botUser") {
+                                        if let Some(username) = bot_user.get("username").and_then(|u| u.as_str()) {
+                                            println!("  Bot username: {}", username);
+                                        }
+                                        if let Some(id) = bot_user.get("id").and_then(|i| i.as_str()) {
+                                            println!("  Bot ID: {}", id);
+                                        }
+                                    }
+                                }
+                                
+                                if let Some(last) = acc.get("lastActivity").and_then(|t| t.as_i64()) {
+                                    if let Some(dt) = chrono::DateTime::from_timestamp_millis(last) {
+                                        println!("  Last activity: {}", dt.format("%Y-%m-%d %H:%M:%S"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(err) = res.error {
+                eprintln!("Error: {}", err.message);
+            }
+        }
+
+        DiscordAction::Stop { account_id } => {
+            println!("Stopping Discord bot account: {}", account_id);
+
+            let res = conn
+                .request(
+                    "channel.stop",
+                    Some(json!({
+                        "channel": "discord",
+                        "accountId": account_id,
+                    })),
+                )
+                .await?;
+
+            if res.ok {
+                println!("Stopped.");
+            } else if let Some(err) = res.error {
+                eprintln!("Error: {}", err.message);
             }
         }
     }

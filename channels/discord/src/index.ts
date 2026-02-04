@@ -13,10 +13,10 @@ import type {
   ChannelAccountStatus,
   ChannelOutboundMessage,
   ChannelPeer,
+  ChannelQueueMessage,
   StartResult,
   StopResult,
   SendResult,
-  GatewayChannelInterface,
 } from "./types";
 
 export { DiscordGateway } from "./discord-gateway";
@@ -26,7 +26,7 @@ export type * from "./types";
 
 interface Env {
   DISCORD_GATEWAY: DurableObjectNamespace;
-  GATEWAY: GatewayChannelInterface;
+  GATEWAY_QUEUE: Queue<ChannelQueueMessage>;
   // Secrets
   DISCORD_BOT_TOKEN?: string;
 }
@@ -38,7 +38,8 @@ const DISCORD_API = "https://discord.com/api/v10";
  * 
  * Gateway calls these methods via Service Binding.
  */
-export default class DiscordChannel extends WorkerEntrypoint<Env> implements ChannelWorkerInterface {
+// Named export for service binding entrypoint
+export class DiscordChannel extends WorkerEntrypoint<Env> implements ChannelWorkerInterface {
   readonly channelId = "discord";
   
   readonly capabilities: ChannelCapabilities = {
@@ -62,7 +63,7 @@ export default class DiscordChannel extends WorkerEntrypoint<Env> implements Cha
 
     try {
       const gateway = this.getGatewayDO(accountId);
-      await gateway.start(botToken);
+      await gateway.start(botToken, accountId);
       return { ok: true };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -186,7 +187,136 @@ export default class DiscordChannel extends WorkerEntrypoint<Env> implements Cha
 
 // Type for DO stub methods
 interface DiscordGatewayStub {
-  start(botToken: string): Promise<void>;
+  start(botToken: string, accountId?: string): Promise<void>;
   stop(): Promise<void>;
   getStatus(): Promise<ChannelAccountStatus>;
 }
+
+// Default export: HTTP handler for direct requests
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/" || url.pathname === "/health") {
+      return Response.json({
+        service: "gsv-channel-discord",
+        status: "ok",
+        hasToken: !!env.DISCORD_BOT_TOKEN,
+      });
+    }
+
+    // GET /setup - Verify bot configuration and show setup info
+    if (url.pathname === "/setup" && request.method === "GET") {
+      const botToken = env.DISCORD_BOT_TOKEN;
+      if (!botToken) {
+        return Response.json({
+          ok: false,
+          error: "DISCORD_BOT_TOKEN not configured",
+          help: "Set via: wrangler secret put DISCORD_BOT_TOKEN",
+        }, { status: 400 });
+      }
+
+      // Fetch bot info from Discord API
+      try {
+        const response = await fetch("https://discord.com/api/v10/users/@me", {
+          headers: { Authorization: `Bot ${botToken}` },
+        });
+
+        if (!response.ok) {
+          const error = await response.text();
+          return Response.json({
+            ok: false,
+            error: `Discord API error: ${response.status}`,
+            details: error,
+            help: "Check that your bot token is valid",
+          }, { status: 400 });
+        }
+
+        const bot = await response.json<{ id: string; username: string; discriminator: string }>();
+        
+        // Fetch application info for invite URL
+        const appResponse = await fetch("https://discord.com/api/v10/oauth2/applications/@me", {
+          headers: { Authorization: `Bot ${botToken}` },
+        });
+        
+        let appId = "UNKNOWN";
+        if (appResponse.ok) {
+          const app = await appResponse.json<{ id: string }>();
+          appId = app.id;
+        }
+
+        const inviteUrl = `https://discord.com/oauth2/authorize?client_id=${appId}&permissions=68608&scope=bot`;
+
+        return Response.json({
+          ok: true,
+          bot: {
+            id: bot.id,
+            username: bot.username,
+            tag: `${bot.username}#${bot.discriminator}`,
+          },
+          applicationId: appId,
+          inviteUrl,
+          setup: {
+            step1: "Ensure MESSAGE_CONTENT intent is enabled in Discord Developer Portal",
+            step2: `Invite bot to server: ${inviteUrl}`,
+            step3: "Start the bot: POST /start",
+          },
+        });
+      } catch (e) {
+        return Response.json({
+          ok: false,
+          error: `Failed to verify bot: ${e}`,
+        }, { status: 500 });
+      }
+    }
+
+    // POST /start?accountId=xxx
+    if (url.pathname === "/start" && request.method === "POST") {
+      const accountId = url.searchParams.get("accountId") || "default";
+      const botToken = env.DISCORD_BOT_TOKEN;
+      if (!botToken) {
+        return Response.json({ ok: false, error: "No bot token configured" }, { status: 400 });
+      }
+      
+      const id = env.DISCORD_GATEWAY.idFromName(accountId);
+      const gateway = env.DISCORD_GATEWAY.get(id) as unknown as DiscordGatewayStub;
+      
+      try {
+        await gateway.start(botToken, accountId);
+        return Response.json({ ok: true, accountId });
+      } catch (e) {
+        return Response.json({ ok: false, error: String(e) }, { status: 500 });
+      }
+    }
+
+    // POST /stop?accountId=xxx
+    if (url.pathname === "/stop" && request.method === "POST") {
+      const accountId = url.searchParams.get("accountId") || "default";
+      const id = env.DISCORD_GATEWAY.idFromName(accountId);
+      const gateway = env.DISCORD_GATEWAY.get(id) as unknown as DiscordGatewayStub;
+      
+      try {
+        await gateway.stop();
+        return Response.json({ ok: true, accountId });
+      } catch (e) {
+        return Response.json({ ok: false, error: String(e) }, { status: 500 });
+      }
+    }
+
+    // GET /status?accountId=xxx
+    if (url.pathname === "/status" && request.method === "GET") {
+      const accountId = url.searchParams.get("accountId") || "default";
+      const id = env.DISCORD_GATEWAY.idFromName(accountId);
+      const gateway = env.DISCORD_GATEWAY.get(id) as unknown as DiscordGatewayStub;
+      
+      try {
+        const status = await gateway.getStatus();
+        return Response.json(status);
+      } catch (e) {
+        return Response.json({ error: String(e) }, { status: 500 });
+      }
+    }
+
+    return new Response("Not Found", { status: 404 });
+  },
+};

@@ -30,12 +30,14 @@ export type GsvInfraOptions = {
   withTestChannel?: boolean;
   /** Deploy WhatsApp channel */
   withWhatsApp?: boolean;
+  /** Deploy Discord channel */
+  withDiscord?: boolean;
   /** Upload workspace templates */
   withTemplates?: boolean;
   /** Secrets to configure */
   secrets?: {
     authToken?: string;
-    anthropicApiKey?: string;
+    discordBotToken?: string;
   };
 };
 
@@ -46,6 +48,7 @@ export async function createGsvInfra(opts: GsvInfraOptions) {
     url = false, 
     withTestChannel = false,
     withWhatsApp = false,
+    withDiscord = false,
     withTemplates = false,
     secrets = {},
   } = opts;
@@ -128,6 +131,29 @@ export async function createGsvInfra(opts: GsvInfraOptions) {
     });
   }
 
+  // Deploy Discord channel
+  let discordChannel: Awaited<ReturnType<typeof Worker>> | undefined;
+  
+  if (withDiscord) {
+    discordChannel = await Worker(`${name}-channel-discord`, {
+      name: `${name}-channel-discord`,
+      entrypoint: "../channels/discord/src/index.ts",
+      adopt: true,
+      bindings: {
+        DISCORD_GATEWAY: DurableObjectNamespace("discord-gateway", {
+          className: "DiscordGateway",
+          sqlite: true,
+        }),
+        // Queue for sending inbound messages to Gateway (producer binding)
+        GATEWAY_QUEUE: channelInboundQueue,
+        ...(secrets.discordBotToken ? { DISCORD_BOT_TOKEN: alchemy.secret(secrets.discordBotToken) } : {}),
+      },
+      url: true,
+      compatibilityDate: "2025-02-11",
+      compatibilityFlags: ["nodejs_compat"],
+    });
+  }
+
   // =========================================================================
   // Deploy Gateway AFTER channels (so service bindings can resolve)
   // =========================================================================
@@ -163,9 +189,15 @@ export async function createGsvInfra(opts: GsvInfraOptions) {
           __entrypoint__: "TestChannel",
         }
       } : {}),
+      ...(withDiscord ? {
+        CHANNEL_DISCORD: {
+          type: "service" as const,
+          service: `${name}-channel-discord`,
+          __entrypoint__: "DiscordChannel",
+        }
+      } : {}),
       // Secrets
       ...(secrets.authToken ? { AUTH_TOKEN: alchemy.secret(secrets.authToken) } : {}),
-      ...(secrets.anthropicApiKey ? { ANTHROPIC_API_KEY: alchemy.secret(secrets.anthropicApiKey) } : {}),
     },
     // Queue consumer: process inbound messages from channels
     eventSources: [{
@@ -181,7 +213,7 @@ export async function createGsvInfra(opts: GsvInfraOptions) {
     compatibilityFlags: ["nodejs_compat"],
   });
 
-  return { gateway, storage, whatsappChannel, testChannel };
+  return { gateway, storage, whatsappChannel, testChannel, discordChannel };
 }
 
 /**
