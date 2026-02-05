@@ -50,11 +50,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Build CLI
+      - name: Build CLI (Linux - use rustls to avoid OpenSSL)
+        if: runner.os == 'Linux'
         working-directory: cli
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features --features rustls
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Build CLI (macOS - use native-tls for system certs)
+        if: runner.os == 'macOS'
+        working-directory: cli
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
         run: |

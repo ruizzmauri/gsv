@@ -19,9 +19,28 @@ regex = "1"
 toml = "0.8"
 qrcode = "0.14"
 
-# Use rustls everywhere for portability (no OpenSSL dependency)
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# TLS backends - use native-tls by default (respects system certs)
+# CI builds for Linux use rustls feature to avoid OpenSSL dependency
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
-# Ensure rustls has a crypto provider (ring)
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Only needed when rustls feature is enabled
+rustls_crate = { package = "rustls", version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+
+[features]
+default = ["native-tls"]
+
+# Use native-tls (macOS: Security.framework, Windows: SChannel, Linux: OpenSSL)
+# This respects system certificate stores (important for corporate proxies/VPNs)
+native-tls = [
+    "tokio-tungstenite/native-tls",
+    "reqwest/native-tls",
+]
+
+# Use rustls with bundled Mozilla roots (no system dependencies)
+# Good for static Linux builds but ignores system cert store
+rustls = [
+    "tokio-tungstenite/rustls-tls-webpki-roots", 
+    "reqwest/rustls-tls",
+    "rustls_crate",
+]

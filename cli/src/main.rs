@@ -371,9 +371,12 @@ enum SessionAction {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Install rustls crypto provider BEFORE tokio runtime starts
     // (required for rustls 0.23+ - must happen before any TLS operations)
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
+    #[cfg(feature = "rustls")]
+    {
+        rustls_crate::crypto::ring::default_provider()
+            .install_default()
+            .expect("Failed to install rustls crypto provider");
+    }
 
     // Now start tokio runtime and run async main
     tokio::runtime::Builder::new_multi_thread()
@@ -1483,10 +1486,6 @@ async fn run_session(
                                     .get("sessionKey")
                                     .and_then(|k| k.as_str())
                                     .unwrap_or("?");
-                                let msg_count = session
-                                    .get("messageCount")
-                                    .and_then(|c| c.as_i64())
-                                    .unwrap_or(0);
                                 let label = session.get("label").and_then(|l| l.as_str());
                                 let last_active =
                                     session.get("lastActiveAt").and_then(|t| t.as_i64());
@@ -1498,14 +1497,11 @@ async fn run_session(
 
                                 if let Some(label) = label {
                                     println!(
-                                        "  {} ({}) - {} msgs, last active: {}",
-                                        key, label, msg_count, last_active_str
+                                        "  {} ({}) - last active: {}",
+                                        key, label, last_active_str
                                     );
                                 } else {
-                                    println!(
-                                        "  {} - {} msgs, last active: {}",
-                                        key, msg_count, last_active_str
-                                    );
+                                    println!("  {} - last active: {}", key, last_active_str);
                                 }
                             }
                         }
