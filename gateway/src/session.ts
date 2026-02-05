@@ -231,6 +231,25 @@ export class Session extends DurableObject<Env> {
     return crypto.randomUUID();
   }
 
+  /**
+   * Extract agentId from session key.
+   * Session key format: agent:{agentId}:{channel}:{peerKind}:{peerId}
+   * Or with identity link: agent:{agentId}:{canonicalName}
+   * Falls back to "main" if not parseable.
+   */
+  private getAgentId(): string {
+    const sessionKey = this.meta.sessionKey;
+    if (!sessionKey) return "main";
+    
+    const parts = sessionKey.split(":");
+    // Format: agent:{agentId}:...
+    if (parts[0] === "agent" && parts[1]) {
+      return parts[1];
+    }
+    
+    return "main";
+  }
+
   // Metadata (small, uses PersistedObject)
   meta = PersistedObject<SessionMeta>(this.ctx.storage.kv, {
     prefix: "meta:",
@@ -1055,8 +1074,7 @@ export class Session extends DurableObject<Env> {
     config: GsvConfig,
     sessionSettings: SessionSettings,
   ): Promise<string> {
-    // Extract agentId from session key (format: agent:{agentId}:{channel}:{peerKind}:{peerId})
-    const agentId = this.meta.sessionKey?.split(":")[1] || "main";
+    const agentId = this.getAgentId();
     
     // Check if this is main session (for MEMORY.md security)
     const mainSession = isMainSession(this.meta.sessionKey || "");
@@ -1114,8 +1132,7 @@ export class Session extends DurableObject<Env> {
 
     // Check if this is a workspace tool (gsv__*) - handle locally
     if (isWorkspaceTool(toolCall.name)) {
-      // Extract agentId from session key (format: agent:{agentId}:{channel}:{peerKind}:{peerId})
-      const agentId = this.meta.sessionKey?.split(":")[1] || "main";
+      const agentId = this.getAgentId();
       
       console.log(`[Session] Executing workspace tool ${toolCall.name} for agent ${agentId}`);
       
@@ -1193,12 +1210,14 @@ export class Session extends DurableObject<Env> {
     if (messageCount > 0 && sessionKey) {
       try {
         const messages = this.getMessages();
+        const agentId = this.getAgentId();
         archivedTo = await archiveSession(
           this.env.STORAGE,
           sessionKey,
           oldSessionId,
           messages,
           tokensCleared,
+          agentId,
         );
         console.log(
           `[Session] Archived ${messageCount} messages to ${archivedTo}`,
@@ -1395,12 +1414,14 @@ export class Session extends DurableObject<Env> {
     if (messagesToArchive.length > 0 && this.meta.sessionKey) {
       try {
         const partNumber = Date.now();
+        const agentId = this.getAgentId();
         archivedTo = await archivePartialMessages(
           this.env.STORAGE,
           this.meta.sessionKey,
           this.meta.sessionId,
           messagesToArchive,
           partNumber,
+          agentId,
         );
         console.log(
           `[Session] Compacted: archived ${trimCount} messages to ${archivedTo}`,
