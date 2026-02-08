@@ -42,7 +42,7 @@ enum Commands {
         /// Message to send (if omitted, enters interactive mode)
         message: Option<String>,
 
-        /// Session key (default from config or "main")
+        /// Session key (default from config or "agent:main:cli:dm:main")
         #[arg(short, long)]
         session: Option<String>,
     },
@@ -317,20 +317,20 @@ enum SessionAction {
     },
     /// Reset a session (clear message history, archive to R2)
     Reset {
-        /// Session key (default: "main")
-        #[arg(default_value = "main")]
+        /// Session key (default: "agent:main:cli:dm:main")
+        #[arg(default_value = "agent:main:cli:dm:main")]
         session_key: String,
     },
     /// Get session info
     Get {
-        /// Session key (default: "main")
-        #[arg(default_value = "main")]
+        /// Session key (default: "agent:main:cli:dm:main")
+        #[arg(default_value = "agent:main:cli:dm:main")]
         session_key: String,
     },
     /// Get session stats (token usage)
     Stats {
-        /// Session key (default: "main")
-        #[arg(default_value = "main")]
+        /// Session key (default: "agent:main:cli:dm:main")
+        #[arg(default_value = "agent:main:cli:dm:main")]
         session_key: String,
     },
     /// Update session settings
@@ -344,8 +344,8 @@ enum SessionAction {
     },
     /// Compact session (trim to last N messages)
     Compact {
-        /// Session key (default: "main")
-        #[arg(default_value = "main")]
+        /// Session key (default: "agent:main:cli:dm:main")
+        #[arg(default_value = "agent:main:cli:dm:main")]
         session_key: String,
         /// Number of messages to keep (default: 20)
         #[arg(short, long, default_value = "20")]
@@ -353,14 +353,14 @@ enum SessionAction {
     },
     /// Show session history (previous session IDs)
     History {
-        /// Session key (default: "main")
-        #[arg(default_value = "main")]
+        /// Session key (default: "agent:main:cli:dm:main")
+        #[arg(default_value = "agent:main:cli:dm:main")]
         session_key: String,
     },
     /// Preview session messages
     Preview {
-        /// Session key (default: "main")
-        #[arg(default_value = "main")]
+        /// Session key (default: "agent:main:cli:dm:main")
+        #[arg(default_value = "agent:main:cli:dm:main")]
         session_key: String,
         /// Number of messages to show (default: all)
         #[arg(short, long)]
@@ -399,6 +399,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Init { force } => run_init(force),
         Commands::Client { message, session } => {
             let session = session.unwrap_or_else(|| cfg.default_session());
+            let session = config::normalize_session_key(&session);
             run_client(&url, token, message, &session).await
         }
         Commands::Node { id, workspace } => {
@@ -503,7 +504,9 @@ fn run_local_config(action: LocalConfigAction) -> Result<(), Box<dyn std::error:
                 "r2.access_key_id" => cfg.r2.access_key_id = Some(value.clone()),
                 "r2.secret_access_key" => cfg.r2.secret_access_key = Some(value.clone()),
                 "r2.bucket" => cfg.r2.bucket = Some(value.clone()),
-                "session.default_key" => cfg.session.default_key = Some(value.clone()),
+                "session.default_key" => {
+                    cfg.session.default_key = Some(config::normalize_session_key(&value))
+                }
                 "channels.whatsapp.url" => cfg.channels.whatsapp.url = Some(value.clone()),
                 "channels.whatsapp.token" => cfg.channels.whatsapp.token = Some(value.clone()),
                 _ => {
@@ -513,13 +516,18 @@ fn run_local_config(action: LocalConfigAction) -> Result<(), Box<dyn std::error:
             }
 
             cfg.save()?;
+            let display_value = if key == "session.default_key" {
+                cfg.session.default_key.as_deref().unwrap_or(&value)
+            } else {
+                &value
+            };
             println!(
                 "Set {} = {}",
                 key,
                 if key.contains("token") || key.contains("secret") {
                     "****"
                 } else {
-                    &value
+                    display_value
                 }
             );
         }
@@ -953,18 +961,19 @@ async fn run_channels_list(
                     println!("Connected channel accounts ({}):\n", channels.len());
                     for ch in channels {
                         let channel = ch.get("channel").and_then(|c| c.as_str()).unwrap_or("?");
-                        let account_id = ch.get("accountId").and_then(|a| a.as_str()).unwrap_or("?");
+                        let account_id =
+                            ch.get("accountId").and_then(|a| a.as_str()).unwrap_or("?");
                         let connected_at = ch.get("connectedAt").and_then(|t| t.as_i64());
                         let last_msg = ch.get("lastMessageAt").and_then(|t| t.as_i64());
 
                         print!("  {}:{}", channel, account_id);
-                        
+
                         if let Some(ts) = connected_at {
                             if let Some(dt) = chrono::DateTime::from_timestamp_millis(ts) {
                                 print!(" (connected {})", dt.format("%Y-%m-%d %H:%M"));
                             }
                         }
-                        
+
                         if let Some(ts) = last_msg {
                             if let Some(dt) = chrono::DateTime::from_timestamp_millis(ts) {
                                 print!(", last msg {}", dt.format("%H:%M:%S"));
@@ -1008,7 +1017,7 @@ async fn run_whatsapp_via_gateway(
                     if let Some(qr_data_url) = payload.get("qrDataUrl").and_then(|q| q.as_str()) {
                         // qrDataUrl is a data URL, extract the QR data
                         println!("\nScan this QR code with WhatsApp:\n");
-                        
+
                         // The qrDataUrl from WhatsApp channel is actually the raw QR string
                         // Try to render it
                         render_qr_terminal(qr_data_url)?;
@@ -1040,30 +1049,47 @@ async fn run_whatsapp_via_gateway(
                             println!("WhatsApp account '{}': not found", account_id);
                         } else {
                             for acc in accounts {
-                                let acc_id = acc.get("accountId").and_then(|a| a.as_str()).unwrap_or(&account_id);
-                                let connected = acc.get("connected").and_then(|c| c.as_bool()).unwrap_or(false);
-                                let authenticated = acc.get("authenticated").and_then(|a| a.as_bool()).unwrap_or(false);
-                                
+                                let acc_id = acc
+                                    .get("accountId")
+                                    .and_then(|a| a.as_str())
+                                    .unwrap_or(&account_id);
+                                let connected = acc
+                                    .get("connected")
+                                    .and_then(|c| c.as_bool())
+                                    .unwrap_or(false);
+                                let authenticated = acc
+                                    .get("authenticated")
+                                    .and_then(|a| a.as_bool())
+                                    .unwrap_or(false);
+
                                 println!("WhatsApp account: {}", acc_id);
                                 println!("  Connected: {}", connected);
                                 println!("  Authenticated: {}", authenticated);
-                                
+
                                 if let Some(error) = acc.get("error").and_then(|e| e.as_str()) {
                                     println!("  Error: {}", error);
                                 }
-                                
+
                                 if let Some(extra) = acc.get("extra") {
-                                    if let Some(jid) = extra.get("selfJid").and_then(|j| j.as_str()) {
+                                    if let Some(jid) = extra.get("selfJid").and_then(|j| j.as_str())
+                                    {
                                         println!("  JID: {}", jid);
                                     }
-                                    if let Some(e164) = extra.get("selfE164").and_then(|e| e.as_str()) {
+                                    if let Some(e164) =
+                                        extra.get("selfE164").and_then(|e| e.as_str())
+                                    {
                                         println!("  Phone: {}", e164);
                                     }
                                 }
-                                
-                                if let Some(last) = acc.get("lastActivity").and_then(|t| t.as_i64()) {
-                                    if let Some(dt) = chrono::DateTime::from_timestamp_millis(last) {
-                                        println!("  Last activity: {}", dt.format("%Y-%m-%d %H:%M:%S"));
+
+                                if let Some(last) = acc.get("lastActivity").and_then(|t| t.as_i64())
+                                {
+                                    if let Some(dt) = chrono::DateTime::from_timestamp_millis(last)
+                                    {
+                                        println!(
+                                            "  Last activity: {}",
+                                            dt.format("%Y-%m-%d %H:%M:%S")
+                                        );
                                     }
                                 }
                             }
@@ -1166,32 +1192,50 @@ async fn run_discord_via_gateway(
                             println!("Discord account '{}': not found", account_id);
                         } else {
                             for acc in accounts {
-                                let acc_id = acc.get("accountId").and_then(|a| a.as_str()).unwrap_or(&account_id);
-                                let connected = acc.get("connected").and_then(|c| c.as_bool()).unwrap_or(false);
-                                let authenticated = acc.get("authenticated").and_then(|a| a.as_bool()).unwrap_or(false);
-                                
+                                let acc_id = acc
+                                    .get("accountId")
+                                    .and_then(|a| a.as_str())
+                                    .unwrap_or(&account_id);
+                                let connected = acc
+                                    .get("connected")
+                                    .and_then(|c| c.as_bool())
+                                    .unwrap_or(false);
+                                let authenticated = acc
+                                    .get("authenticated")
+                                    .and_then(|a| a.as_bool())
+                                    .unwrap_or(false);
+
                                 println!("Discord account: {}", acc_id);
                                 println!("  Connected: {}", connected);
                                 println!("  Authenticated: {}", authenticated);
-                                
+
                                 if let Some(error) = acc.get("error").and_then(|e| e.as_str()) {
                                     println!("  Error: {}", error);
                                 }
-                                
+
                                 if let Some(extra) = acc.get("extra") {
                                     if let Some(bot_user) = extra.get("botUser") {
-                                        if let Some(username) = bot_user.get("username").and_then(|u| u.as_str()) {
+                                        if let Some(username) =
+                                            bot_user.get("username").and_then(|u| u.as_str())
+                                        {
                                             println!("  Bot username: {}", username);
                                         }
-                                        if let Some(id) = bot_user.get("id").and_then(|i| i.as_str()) {
+                                        if let Some(id) =
+                                            bot_user.get("id").and_then(|i| i.as_str())
+                                        {
                                             println!("  Bot ID: {}", id);
                                         }
                                     }
                                 }
-                                
-                                if let Some(last) = acc.get("lastActivity").and_then(|t| t.as_i64()) {
-                                    if let Some(dt) = chrono::DateTime::from_timestamp_millis(last) {
-                                        println!("  Last activity: {}", dt.format("%Y-%m-%d %H:%M:%S"));
+
+                                if let Some(last) = acc.get("lastActivity").and_then(|t| t.as_i64())
+                                {
+                                    if let Some(dt) = chrono::DateTime::from_timestamp_millis(last)
+                                    {
+                                        println!(
+                                            "  Last activity: {}",
+                                            dt.format("%Y-%m-%d %H:%M:%S")
+                                        );
                                     }
                                 }
                             }
@@ -1513,6 +1557,7 @@ async fn run_session(
         }
 
         SessionAction::Reset { session_key } => {
+            let session_key = config::normalize_session_key(&session_key);
             let res = conn
                 .request("session.reset", Some(json!({ "sessionKey": session_key })))
                 .await?;
@@ -1549,6 +1594,7 @@ async fn run_session(
         }
 
         SessionAction::Get { session_key } => {
+            let session_key = config::normalize_session_key(&session_key);
             let res = conn
                 .request("session.get", Some(json!({ "sessionKey": session_key })))
                 .await?;
@@ -1626,6 +1672,7 @@ async fn run_session(
         }
 
         SessionAction::Stats { session_key } => {
+            let session_key = config::normalize_session_key(&session_key);
             let res = conn
                 .request("session.stats", Some(json!({ "sessionKey": session_key })))
                 .await?;
@@ -1666,6 +1713,7 @@ async fn run_session(
             path,
             value,
         } => {
+            let session_key = config::normalize_session_key(&session_key);
             // Build the patch params based on the path
             let parsed_value: serde_json::Value = serde_json::from_str(&value)
                 .unwrap_or_else(|_| serde_json::Value::String(value.clone()));
@@ -1734,6 +1782,7 @@ async fn run_session(
         }
 
         SessionAction::Compact { session_key, keep } => {
+            let session_key = config::normalize_session_key(&session_key);
             let res = conn
                 .request(
                     "session.compact",
@@ -1774,6 +1823,7 @@ async fn run_session(
         }
 
         SessionAction::History { session_key } => {
+            let session_key = config::normalize_session_key(&session_key);
             let res = conn
                 .request(
                     "session.history",
@@ -1814,6 +1864,7 @@ async fn run_session(
         }
 
         SessionAction::Preview { session_key, limit } => {
+            let session_key = config::normalize_session_key(&session_key);
             let mut params = json!({ "sessionKey": session_key });
             if let Some(l) = limit {
                 params["limit"] = json!(l);
@@ -1982,13 +2033,12 @@ async fn run_node(
                             {
                                 println!("Tool invoke: {} ({})", invoke.tool, invoke.call_id);
 
-                                let result = match tools
-                                    .iter()
-                                    .find(|t| t.definition().name == invoke.tool)
-                                {
-                                    Some(tool) => tool.execute(invoke.args.clone()).await,
-                                    None => Err(format!("Tool not found: {}", invoke.tool)),
-                                };
+                                let result =
+                                    match tools.iter().find(|t| t.definition().name == invoke.tool)
+                                    {
+                                        Some(tool) => tool.execute(invoke.args.clone()).await,
+                                        None => Err(format!("Tool not found: {}", invoke.tool)),
+                                    };
 
                                 let params = match result {
                                     Ok(res) => ToolResultParams {

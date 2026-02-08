@@ -1,16 +1,15 @@
-/**
+/*
  * Workspace Tools - Native R2 tools for agent workspace access
- * 
+ *
  * These tools allow agents to read/write their own workspace files
  * directly through R2, without requiring a connected node.
- * 
+ *
  * Tools are prefixed with "gsv__" to distinguish from node-provided tools.
  * The agent's workspace is scoped to: agents/{agentId}/
  */
 
-import type { ToolDefinition } from "./types";
+import type { ToolDefinition } from "../types";
 
-// Tool names (PascalCase to match CLI tools like Bash, Edit, Write)
 export const WORKSPACE_TOOL_PREFIX = "gsv__";
 export const WORKSPACE_TOOLS = {
   LIST_FILES: `${WORKSPACE_TOOL_PREFIX}ListFiles`,
@@ -19,21 +18,19 @@ export const WORKSPACE_TOOLS = {
   DELETE_FILE: `${WORKSPACE_TOOL_PREFIX}DeleteFile`,
 };
 
-/**
- * Tool definitions for workspace tools
- * These are always available, even without connected nodes
- */
 export function getWorkspaceToolDefinitions(): ToolDefinition[] {
   return [
     {
       name: WORKSPACE_TOOLS.LIST_FILES,
-      description: "List files and directories in your workspace. Your workspace persists across sessions and contains your identity files (SOUL.md, IDENTITY.md, etc.), memory files, and any other files you create.",
+      description:
+        "List files and directories in your workspace. Your workspace persists across sessions and contains your identity files (SOUL.md, IDENTITY.md, etc.), memory files, and any other files you create.",
       inputSchema: {
         type: "object",
         properties: {
           path: {
             type: "string",
-            description: "Directory path relative to workspace root (e.g., '/' for root, 'memory/' for memory directory). Defaults to '/'.",
+            description:
+              "Directory path relative to workspace root (e.g., '/' for root, 'memory/' for memory directory). Defaults to '/'.",
           },
         },
         required: [],
@@ -41,13 +38,15 @@ export function getWorkspaceToolDefinitions(): ToolDefinition[] {
     },
     {
       name: WORKSPACE_TOOLS.READ_FILE,
-      description: "Read a file from your workspace. Use this to read your identity files, memory files, or any files you've created.",
+      description:
+        "Read a file from your workspace. Use this to read your identity files, memory files, or any files you've created.",
       inputSchema: {
         type: "object",
         properties: {
           path: {
             type: "string",
-            description: "File path relative to workspace root (e.g., 'SOUL.md', 'memory/2024-01-15.md')",
+            description:
+              "File path relative to workspace root (e.g., 'SOUL.md', 'memory/2024-01-15.md')",
           },
         },
         required: ["path"],
@@ -55,13 +54,15 @@ export function getWorkspaceToolDefinitions(): ToolDefinition[] {
     },
     {
       name: WORKSPACE_TOOLS.WRITE_FILE,
-      description: "Write or update a file in your workspace. Use this to update your identity (SOUL.md, IDENTITY.md), create memory files, or store any data you need to persist. Creates parent directories automatically.",
+      description:
+        "Write or update a file in your workspace. Use this to update your identity (SOUL.md, IDENTITY.md), create memory files, or store any data you need to persist. Creates parent directories automatically.",
       inputSchema: {
         type: "object",
         properties: {
           path: {
             type: "string",
-            description: "File path relative to workspace root (e.g., 'SOUL.md', 'memory/2024-01-15.md')",
+            description:
+              "File path relative to workspace root (e.g., 'SOUL.md', 'memory/2024-01-15.md')",
           },
           content: {
             type: "string",
@@ -73,13 +74,15 @@ export function getWorkspaceToolDefinitions(): ToolDefinition[] {
     },
     {
       name: WORKSPACE_TOOLS.DELETE_FILE,
-      description: "Delete a file from your workspace. Use with caution - deleted files cannot be recovered.",
+      description:
+        "Delete a file from your workspace. Use with caution - deleted files cannot be recovered.",
       inputSchema: {
         type: "object",
         properties: {
           path: {
             type: "string",
-            description: "File path relative to workspace root (e.g., 'BOOTSTRAP.md')",
+            description:
+              "File path relative to workspace root (e.g., 'BOOTSTRAP.md')",
           },
         },
         required: ["path"],
@@ -110,7 +113,11 @@ export async function executeWorkspaceTool(
   try {
     switch (toolName) {
       case WORKSPACE_TOOLS.LIST_FILES:
-        return await listFiles(bucket, basePath, args.path as string | undefined);
+        return await listFiles(
+          bucket,
+          basePath,
+          args.path as string | undefined,
+        );
 
       case WORKSPACE_TOOLS.READ_FILE:
         return await readFile(bucket, basePath, args.path as string);
@@ -141,20 +148,23 @@ export async function executeWorkspaceTool(
 /**
  * Normalize and validate a path within the workspace
  */
-function normalizePath(basePath: string, relativePath: string | undefined): string {
+function normalizePath(
+  basePath: string,
+  relativePath: string | undefined,
+): string {
   // Default to root
   let path = (relativePath || "/").trim();
-  
+
   // Remove leading slash for R2 path construction
   if (path.startsWith("/")) {
     path = path.slice(1);
   }
-  
+
   // Prevent path traversal
   if (path.includes("..")) {
     throw new Error("Path traversal not allowed");
   }
-  
+
   // Construct full path
   return path ? `${basePath}/${path}` : basePath;
 }
@@ -169,17 +179,17 @@ async function listFiles(
 ): Promise<{ ok: boolean; result?: unknown; error?: string }> {
   const fullPath = normalizePath(basePath, relativePath);
   const prefix = fullPath.endsWith("/") ? fullPath : `${fullPath}/`;
-  
+
   // List objects with this prefix
   const listed = await bucket.list({
     prefix: fullPath === basePath ? `${basePath}/` : prefix,
     delimiter: "/",
   });
-  
+
   // Extract file names and directories
   const files: string[] = [];
   const directories: string[] = [];
-  
+
   // Files (objects)
   for (const obj of listed.objects) {
     // Get relative path from workspace root
@@ -188,7 +198,7 @@ async function listFiles(
       files.push(relPath);
     }
   }
-  
+
   // Directories (common prefixes)
   for (const prefix of listed.delimitedPrefixes || []) {
     const relPath = prefix.replace(`${basePath}/`, "");
@@ -196,7 +206,7 @@ async function listFiles(
       directories.push(relPath);
     }
   }
-  
+
   return {
     ok: true,
     result: {
@@ -218,16 +228,16 @@ async function readFile(
   if (!relativePath) {
     return { ok: false, error: "path is required" };
   }
-  
+
   const fullPath = normalizePath(basePath, relativePath);
   const object = await bucket.get(fullPath);
-  
+
   if (!object) {
     return { ok: false, error: `File not found: ${relativePath}` };
   }
-  
+
   const content = await object.text();
-  
+
   return {
     ok: true,
     result: {
@@ -254,9 +264,9 @@ async function writeFile(
   if (content === undefined || content === null) {
     return { ok: false, error: "content is required" };
   }
-  
+
   const fullPath = normalizePath(basePath, relativePath);
-  
+
   // Determine content type based on extension
   let contentType = "text/plain";
   if (relativePath.endsWith(".md")) {
@@ -266,15 +276,15 @@ async function writeFile(
   } else if (relativePath.endsWith(".yaml") || relativePath.endsWith(".yml")) {
     contentType = "text/yaml";
   }
-  
+
   await bucket.put(fullPath, content, {
     httpMetadata: {
       contentType,
     },
   });
-  
+
   console.log(`[WorkspaceTools] Wrote ${fullPath} (${content.length} bytes)`);
-  
+
   return {
     ok: true,
     result: {
@@ -296,19 +306,19 @@ async function deleteFile(
   if (!relativePath) {
     return { ok: false, error: "path is required" };
   }
-  
+
   const fullPath = normalizePath(basePath, relativePath);
-  
+
   // Check if file exists first
   const existing = await bucket.head(fullPath);
   if (!existing) {
     return { ok: false, error: `File not found: ${relativePath}` };
   }
-  
+
   await bucket.delete(fullPath);
-  
+
   console.log(`[WorkspaceTools] Deleted ${fullPath}`);
-  
+
   return {
     ok: true,
     result: {

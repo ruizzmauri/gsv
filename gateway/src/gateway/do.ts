@@ -2,7 +2,6 @@ import { DurableObject, env } from "cloudflare:workers";
 import { PersistedObject } from "../shared/persisted-object";
 import {
   Frame,
-  RequestFrame,
   EventFrame,
   ErrorShape,
   ResponseFrame,
@@ -47,22 +46,22 @@ import {
   shouldDeliverResponse,
   HeartbeatResult,
 } from "./heartbeat";
-import { loadHeartbeatFile, isHeartbeatFileEmpty } from "../workspace";
+import { loadHeartbeatFile, isHeartbeatFileEmpty } from "../workspace/loader";
 import {
   parseCommand,
   HELP_TEXT,
   normalizeThinkLevel,
   resolveModelAlias,
   listModelAliases,
-} from "../commands";
+} from "./commands";
 import {
   parseDirectives,
   isDirectiveOnly,
   formatDirectiveAck,
-} from "../directives";
+} from "./directives";
 import { processMediaWithTranscription } from "../transcription";
-import { processInboundMedia } from "../storage";
-import { getWorkspaceToolDefinitions } from "../workspace-tools";
+import { processInboundMedia } from "../storage/media";
+import { getWorkspaceToolDefinitions } from "../workspace/tools";
 import type {
   ChannelRegistryEntry,
   ChannelId,

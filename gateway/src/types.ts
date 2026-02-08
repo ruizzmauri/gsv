@@ -1,8 +1,5 @@
+//TODO: move each type to corresponding file
 import type { ChannelId } from "./protocol/channel";
-
-export type AuthParams = {
-  token?: string;
-};
 
 export type ConnectParams = {
   minProtocol: number;
@@ -16,7 +13,9 @@ export type ConnectParams = {
     accountId?: string;
   };
   tools?: ToolDefinition[];
-  auth?: AuthParams;
+  auth?: {
+    token?: string;
+  };
 };
 
 export type SessionRegistryEntry = {
@@ -24,11 +23,6 @@ export type SessionRegistryEntry = {
   createdAt: number;
   lastActiveAt: number;
   label?: string;
-};
-
-export type SessionsListResult = {
-  sessions: SessionRegistryEntry[];
-  count: number;
 };
 
 export type ToolDefinition = {
@@ -67,19 +61,5 @@ export type ChatEventPayload = {
   sessionKey: string;
   state: "partial" | "final" | "error";
   message?: unknown;
-  error?: string;
-};
-
-export type Message = {
-  role: "user" | "assistant" | "tool";
-  content: string | unknown[];
-  toolCallId?: string;
-};
-
-export type ToolCall = {
-  id: string;
-  name: string;
-  args: Record<string, unknown>;
-  result?: unknown;
   error?: string;
 };

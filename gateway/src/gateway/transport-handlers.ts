@@ -163,7 +163,7 @@ const handleToolInvoke = (ctx: TransportHandlerContext): DeferredResponse => {
 const handleToolResult = async (
   ctx: TransportHandlerContext,
 ): Promise<unknown> => {
-  const { ws, frame, gateway: gw } = ctx;
+  const { frame, gateway: gw } = ctx;
   const params = frame.params as ToolResultParams;
   if (!params?.callId) {
     throw new RpcError(400, "callId required");

@@ -12,7 +12,7 @@ export const DEFAULT_CONFIG: GsvConfig = {
   },
   auth: {},
   transcription: {
-    provider: "workers-ai", // Free default
+    provider: "workers-ai",
   },
   channels: {
     whatsapp: { dmPolicy: "pairing", allowFrom: [] },

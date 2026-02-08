@@ -1,6 +1,19 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub const DEFAULT_SESSION_KEY: &str = "agent:main:cli:dm:main";
+
+/// Normalize legacy/alias session keys to canonical format.
+pub fn normalize_session_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+
+    if trimmed.is_empty() || trimmed == "main" {
+        return DEFAULT_SESSION_KEY.to_string();
+    }
+
+    trimmed.to_string()
+}
+
 /// CLI configuration loaded from ~/.config/gsv/config.toml
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CliConfig {
@@ -79,7 +92,7 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            default_key: Some("main".to_string()),
+            default_key: Some(DEFAULT_SESSION_KEY.to_string()),
         }
     }
 }
@@ -143,10 +156,12 @@ impl CliConfig {
 
     /// Get default session key
     pub fn default_session(&self) -> String {
-        self.session
+        let raw = self
+            .session
             .default_key
-            .clone()
-            .unwrap_or_else(|| "main".to_string())
+            .as_deref()
+            .unwrap_or(DEFAULT_SESSION_KEY);
+        normalize_session_key(raw)
     }
 
     /// Get the GSV home directory (~/.gsv)
@@ -201,7 +216,7 @@ token = "your-token-here"
 
 [session]
 # Default session key
-default_key = "main"
+default_key = "agent:main:cli:dm:main"
 
 [channels.whatsapp]
 # WhatsApp channel worker URL

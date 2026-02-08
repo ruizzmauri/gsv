@@ -1,6 +1,10 @@
 import { env } from "cloudflare:workers";
-import { parseCommand } from "../../commands";
-import { formatDirectiveAck, isDirectiveOnly, parseDirectives } from "../../directives";
+import { parseCommand } from "../commands";
+import {
+  formatDirectiveAck,
+  isDirectiveOnly,
+  parseDirectives,
+} from "../directives";
 import type { Handler } from "../../protocol/methods";
 import { RpcError } from "../../shared/utils";
 

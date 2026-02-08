@@ -20,19 +20,11 @@ import {
   type Model,
   type Api,
 } from "@mariozechner/pi-ai";
-import {
-  archivePartialMessages,
-  archiveSession,
-  fetchMediaFromR2,
-  deleteSessionMedia,
-} from "./storage";
-import {
-  loadAgentWorkspace,
-  buildSystemPromptFromWorkspace,
-  isMainSession,
-  type AgentWorkspace,
-} from "./workspace";
-import { isWorkspaceTool, executeWorkspaceTool } from "./workspace-tools";
+import { archivePartialMessages, archiveSession } from "./storage/archive";
+import { fetchMediaFromR2, deleteSessionMedia } from "./storage/media";
+import { loadAgentWorkspace, isMainSession } from "./workspace/loader";
+import { buildSystemPromptFromWorkspace } from "./workspace/prompt";
+import { isWorkspaceTool, executeWorkspaceTool } from "./workspace/tools";
 
 type PendingToolCall = {
   id: string;
