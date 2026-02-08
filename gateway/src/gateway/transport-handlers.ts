@@ -7,14 +7,16 @@ import type {
   ToolInvokePayload,
   ToolResultParams,
 } from "../types";
-import { timingSafeEqualStr } from "../shared/utils";
+import { RpcError, timingSafeEqualStr } from "../shared/utils";
 
-const handleConnect = (ctx: TransportHandlerContext, gw: Gateway): void => {
-  const { ws, frame } = ctx;
+export const DEFER_RESPONSE = Symbol("defer-response");
+export type DeferredResponse = typeof DEFER_RESPONSE;
+
+const handleConnect = (ctx: TransportHandlerContext): unknown => {
+  const { ws, frame, gateway: gw } = ctx;
   const params = frame.params as ConnectParams;
   if (params?.minProtocol !== 1) {
-    gw.sendError(ws, frame.id, 102, "Unsupported protocol version");
-    return;
+    throw new RpcError(102, "Unsupported protocol version");
   }
 
   // Check auth token if configured
@@ -23,21 +25,14 @@ const handleConnect = (ctx: TransportHandlerContext, gw: Gateway): void => {
   if (authToken) {
     const providedToken = params?.auth?.token;
     if (!providedToken || !timingSafeEqualStr(providedToken, authToken)) {
-      gw.sendError(
-        ws,
-        frame.id,
-        401,
-        "Unauthorized: invalid or missing token",
-      );
       ws.close(4001, "Unauthorized");
-      return;
+      throw new RpcError(401, "Unauthorized: invalid or missing token");
     }
   }
 
   const mode = params?.client?.mode;
   if (!mode || !["client", "node", "channel"].includes(mode)) {
-    gw.sendError(ws, frame.id, 103, "Invalid client mode");
-    return;
+    throw new RpcError(103, "Invalid client mode");
   }
 
   let attachments = ws.deserializeAttachment();
@@ -60,8 +55,7 @@ const handleConnect = (ctx: TransportHandlerContext, gw: Gateway): void => {
     const channel = params.client.channel;
     const accountId = params.client.accountId ?? params.client.id;
     if (!channel) {
-      gw.sendError(ws, frame.id, 103, "Channel mode requires channel field");
-      return;
+      throw new RpcError(103, "Channel mode requires channel field");
     }
     const channelKey = `${channel}:${accountId}`;
     attachments.channelKey = channelKey;
@@ -78,7 +72,7 @@ const handleConnect = (ctx: TransportHandlerContext, gw: Gateway): void => {
   }
 
   ws.serializeAttachment(attachments);
-  gw.sendOk(ws, frame.id, {
+  const payload = {
     type: "hello-ok",
     protocol: 1,
     server: { version: "0.0.1", connectionId: attachments.id },
@@ -98,7 +92,7 @@ const handleConnect = (ctx: TransportHandlerContext, gw: Gateway): void => {
       ],
       events: ["chat", "tool.invoke", "tool.result", "channel.outbound"],
     },
-  });
+  };
 
   // Auto-start heartbeat scheduler on first connection (if not already initialized)
   if (!gw.heartbeatScheduler.initialized) {
@@ -110,36 +104,49 @@ const handleConnect = (ctx: TransportHandlerContext, gw: Gateway): void => {
         );
       })
       .catch((e) => {
-        console.error(`[Gateway] Failed to auto-initialize heartbeat scheduler:`, e);
+        console.error(
+          `[Gateway] Failed to auto-initialize heartbeat scheduler:`,
+          e,
+        );
       });
   }
+
+  return payload;
 };
 
-const handleToolInvoke = (ctx: TransportHandlerContext, gw: Gateway): void => {
-  const { ws, frame } = ctx;
+const handleToolInvoke = (ctx: TransportHandlerContext): DeferredResponse => {
+  const { ws, frame, gateway: gw } = ctx;
   const params = frame.params as {
     tool: string;
     args?: Record<string, unknown>;
   };
   if (!params?.tool) {
-    gw.sendError(ws, frame.id, 400, "tool required");
-    return;
+    throw new RpcError(400, "tool required");
   }
 
   const resolved = gw.findNodeForTool(params.tool);
   if (!resolved) {
-    gw.sendError(ws, frame.id, 404, `No node provides tool: ${params.tool}`);
-    return;
+    throw new RpcError(404, `No node provides tool: ${params.tool}`);
   }
 
   const nodeWs = gw.nodes.get(resolved.nodeId);
   if (!nodeWs) {
-    gw.sendError(ws, frame.id, 503, "Node not connected");
-    return;
+    throw new RpcError(503, "Node not connected");
+  }
+
+  const attachment = ws.deserializeAttachment();
+  const clientId = attachment.clientId as string | undefined;
+  if (!clientId) {
+    throw new RpcError(101, "Not connected");
   }
 
   const callId = crypto.randomUUID();
-  gw.pendingClientCalls.set(callId, { ws, frameId: frame.id });
+  gw.pendingToolCalls[callId] = {
+    kind: "client",
+    clientId,
+    frameId: frame.id,
+    createdAt: Date.now(),
+  };
 
   // Send the original (un-namespaced) tool name to the node
   const evt: EventFrame<ToolInvokePayload> = {
@@ -148,41 +155,47 @@ const handleToolInvoke = (ctx: TransportHandlerContext, gw: Gateway): void => {
     payload: { callId, tool: resolved.toolName, args: params.args ?? {} },
   };
   nodeWs.send(JSON.stringify(evt));
+
+  // Response is deferred until corresponding tool.result arrives.
+  return DEFER_RESPONSE;
 };
 
 const handleToolResult = async (
   ctx: TransportHandlerContext,
-  gw: Gateway,
-): Promise<void> => {
-  const { ws, frame } = ctx;
+): Promise<unknown> => {
+  const { ws, frame, gateway: gw } = ctx;
   const params = frame.params as ToolResultParams;
   if (!params?.callId) {
-    gw.sendError(ws, frame.id, 400, "callId required");
-    return;
+    throw new RpcError(400, "callId required");
   }
 
-  const clientCall = gw.pendingClientCalls.get(params.callId);
-  if (clientCall) {
-    gw.pendingClientCalls.delete(params.callId);
-    if (params.error) {
-      gw.sendError(clientCall.ws, clientCall.frameId, 500, params.error);
-    } else {
-      gw.sendOk(clientCall.ws, clientCall.frameId, {
-        result: params.result,
-      });
-    }
-    gw.sendOk(ws, frame.id, { ok: true });
-    return;
-  }
-
-  const sessionKey = gw.pendingToolCalls[params.callId];
-  if (!sessionKey) {
-    gw.sendError(ws, frame.id, 404, "Unknown callId");
-    return;
+  const route = gw.pendingToolCalls[params.callId];
+  if (!route) {
+    throw new RpcError(404, "Unknown callId");
   }
 
   delete gw.pendingToolCalls[params.callId];
 
+  if (route.kind === "client") {
+    const clientWs = gw.clients.get(route.clientId);
+    if (!clientWs || clientWs.readyState !== WebSocket.OPEN) {
+      console.log(
+        `[Gateway] Dropping tool.result for disconnected client ${route.clientId} (callId=${params.callId})`,
+      );
+      return { ok: true, dropped: true };
+    }
+
+    if (params.error) {
+      gw.sendError(clientWs, route.frameId, 500, params.error);
+    } else {
+      gw.sendOk(clientWs, route.frameId, {
+        result: params.result,
+      });
+    }
+    return { ok: true };
+  }
+
+  const sessionKey = route.sessionKey;
   const sessionStub = env.SESSION.getByName(sessionKey);
   await sessionStub.toolResult({
     callId: params.callId,
@@ -190,21 +203,26 @@ const handleToolResult = async (
     error: params.error,
   });
 
-  gw.sendOk(ws, frame.id, { ok: true });
+  return { ok: true };
 };
 
 export type TransportMethod = "connect" | "tool.invoke" | "tool.result";
-export type TransportHandlerContext = { ws: WebSocket; frame: RequestFrame };
+export type TransportHandlerContext = {
+  ws: WebSocket;
+  frame: RequestFrame;
+  gateway: Gateway;
+};
 export type TransportHandler = (
   ctx: TransportHandlerContext,
-) => Promise<void> | void;
+) => Promise<unknown | DeferredResponse> | unknown | DeferredResponse;
 
-export function buildTransportHandlers(
-  gw: Gateway,
-): Record<TransportMethod, TransportHandler> {
+export function buildTransportHandlers(): Record<
+  TransportMethod,
+  TransportHandler
+> {
   return {
-    connect: (ctx) => handleConnect(ctx, gw),
-    "tool.invoke": (ctx) => handleToolInvoke(ctx, gw),
-    "tool.result": (ctx) => handleToolResult(ctx, gw),
+    connect: (ctx) => handleConnect(ctx),
+    "tool.invoke": (ctx) => handleToolInvoke(ctx),
+    "tool.result": (ctx) => handleToolResult(ctx),
   };
 }

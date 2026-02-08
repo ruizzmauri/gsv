@@ -72,10 +72,15 @@ import type {
 import { Handler, RpcMethod } from "./protocol/methods";
 import { buildRpcHandlers } from "./gateway/rpc-handlers/";
 import {
+  DEFER_RESPONSE,
   buildTransportHandlers,
   type TransportMethod,
   type TransportHandler,
 } from "./gateway/transport-handlers";
+
+export type PendingToolRoute =
+  | { kind: "session"; sessionKey: string }
+  | { kind: "client"; clientId: string; frameId: string; createdAt: number };
 
 export class Gateway extends DurableObject<Env> {
   clients: Map<string, WebSocket> = new Map();
@@ -87,7 +92,7 @@ export class Gateway extends DurableObject<Env> {
     { prefix: "toolRegistry:" },
   );
 
-  readonly pendingToolCalls = PersistedObject<Record<string, string>>(
+  readonly pendingToolCalls = PersistedObject<Record<string, PendingToolRoute>>(
     this.ctx.storage.kv,
     { prefix: "pendingToolCalls:" },
   );
@@ -138,16 +143,9 @@ export class Gateway extends DurableObject<Env> {
     { prefix: "heartbeatScheduler:", defaults: { initialized: false } },
   );
 
-  private readonly transportHandlers: Record<
-    TransportMethod,
-    TransportHandler
-  > = {
-    ...buildTransportHandlers(this),
-  };
+  private readonly transportHandlers = buildTransportHandlers();
 
-  private readonly rpcHandlers: Partial<{
-    [M in RpcMethod]: Handler<M>;
-  }> = buildRpcHandlers();
+  private readonly rpcHandlers = buildRpcHandlers();
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -231,7 +229,19 @@ export class Gateway extends DurableObject<Env> {
     }
 
     if (this.isTransportMethod(frame.method)) {
-      return this.transportHandlers[frame.method]({ ws, frame });
+      try {
+        const payload = await this.transportHandlers[frame.method]({
+          ws,
+          frame,
+          gateway: this,
+        });
+        if (payload !== DEFER_RESPONSE) {
+          this.sendOk(ws, frame.id, payload);
+        }
+      } catch (error) {
+        this.sendErrorShape(ws, frame.id, toErrorShape(error));
+      }
+      return;
     }
 
     const rpcHandler = this.rpcHandlers[frame.method as RpcMethod] as
@@ -390,19 +400,24 @@ export class Gateway extends DurableObject<Env> {
     }
   }
 
-  // TODO: persist
-  readonly pendingClientCalls = new Map<
-    string,
-    { ws: WebSocket; frameId: string }
-  >();
-
   webSocketClose(ws: WebSocket) {
     const { mode, clientId, nodeId, channelKey } = ws.deserializeAttachment();
     console.log(
       `[Gateway] WebSocket closed: mode=${mode}, clientId=${clientId}, nodeId=${nodeId}, channelKey=${channelKey}`,
     );
-    if (mode === "client") this.clients.delete(clientId);
-    else if (mode === "node") {
+    if (mode === "client") {
+      this.clients.delete(clientId);
+      // Cleanup persisted client-routed tool calls for this disconnected client.
+      for (const [callId, route] of Object.entries(this.pendingToolCalls)) {
+        if (
+          typeof route === "object" &&
+          route.kind === "client" &&
+          route.clientId === clientId
+        ) {
+          delete this.pendingToolCalls[callId];
+        }
+      }
+    } else if (mode === "node") {
       this.nodes.delete(nodeId);
       delete this.toolRegistry[nodeId];
       console.log(`[Gateway] Node ${nodeId} removed from registry`);
@@ -426,7 +441,10 @@ export class Gateway extends DurableObject<Env> {
     }
 
     // Track pending call for routing result back
-    this.pendingToolCalls[params.callId] = params.sessionKey;
+    this.pendingToolCalls[params.callId] = {
+      kind: "session",
+      sessionKey: params.sessionKey,
+    };
 
     // Send tool.invoke event to node (with un-namespaced tool name)
     const evt: EventFrame<ToolInvokePayload> = {
@@ -459,6 +477,7 @@ export class Gateway extends DurableObject<Env> {
       ok: false,
       error,
     };
+
     ws.send(JSON.stringify(res));
   }
 

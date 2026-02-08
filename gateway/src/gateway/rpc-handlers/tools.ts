@@ -22,7 +22,10 @@ export const handleToolRequest: Handler<"tool.request"> = (gw, params) => {
     throw new RpcError(503, "Node not connected");
   }
 
-  gw.pendingToolCalls[params.callId] = params.sessionKey;
+  gw.pendingToolCalls[params.callId] = {
+    kind: "session",
+    sessionKey: params.sessionKey,
+  };
 
   // Send the original (un-namespaced) tool name to the node
   const evt: EventFrame<ToolInvokePayload> = {
