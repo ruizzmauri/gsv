@@ -9,10 +9,8 @@ import {
 } from "./protocol/frames";
 import {
   ToolDefinition,
-  ConnectParams,
   ToolRequestParams,
   ToolInvokePayload,
-  ToolResultParams,
   ChatEventPayload,
   SessionRegistryEntry,
 } from "./types";
@@ -25,7 +23,6 @@ import {
   isWebSocketRequest,
   validateFrame,
   isWsConnected,
-  timingSafeEqualStr,
   toErrorShape,
 } from "./shared/utils";
 import {
@@ -73,7 +70,7 @@ import type {
   ChannelTypingPayload,
 } from "./protocol/channel";
 import { Handler, RpcMethod } from "./protocol/methods";
-import { buildRpcHandlers } from "./gateway/rpc-handlers";
+import { buildRpcHandlers } from "./gateway/rpc-handlers/";
 import {
   buildTransportHandlers,
   type TransportMethod,
@@ -150,7 +147,7 @@ export class Gateway extends DurableObject<Env> {
 
   private readonly rpcHandlers: Partial<{
     [M in RpcMethod]: Handler<M>;
-  }> = buildRpcHandlers(this);
+  }> = buildRpcHandlers();
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -259,119 +256,6 @@ export class Gateway extends DurableObject<Env> {
       method === "tool.invoke" ||
       method === "tool.result"
     );
-  }
-
-  handleConnect(ws: WebSocket, frame: RequestFrame) {
-    const params = frame.params as ConnectParams;
-    if (params?.minProtocol !== 1) {
-      this.sendError(ws, frame.id, 102, "Unsupported protocol version");
-      return;
-    }
-
-    // Check auth token if configured
-    const authToken = this.getConfigPath("auth.token") as string | undefined;
-
-    if (authToken) {
-      const providedToken = params?.auth?.token;
-      if (!providedToken || !timingSafeEqualStr(providedToken, authToken)) {
-        this.sendError(
-          ws,
-          frame.id,
-          401,
-          "Unauthorized: invalid or missing token",
-        );
-        ws.close(4001, "Unauthorized");
-        return;
-      }
-    }
-
-    const mode = params?.client?.mode;
-    if (!mode || !["client", "node", "channel"].includes(mode)) {
-      this.sendError(ws, frame.id, 103, "Invalid client mode");
-      return;
-    }
-
-    let attachments = ws.deserializeAttachment();
-    attachments = { ...attachments, connected: true, mode };
-
-    if (mode === "client") {
-      attachments.clientId = params.client.id;
-      this.clients.set(params.client.id, ws);
-      console.log(`[Gateway] Client connected: ${params.client.id}`);
-    } else if (mode === "node") {
-      const nodeId = params.client.id;
-      attachments.nodeId = nodeId;
-      this.nodes.set(nodeId, ws);
-      // Store tools with their original names (namespacing happens in getAllTools)
-      this.toolRegistry[nodeId] = params.tools ?? [];
-      console.log(
-        `[Gateway] Node connected: ${nodeId}, tools: [${(params.tools ?? []).map((t) => `${nodeId}__${t.name}`).join(", ")}]`,
-      );
-    } else if (mode === "channel") {
-      const channel = params.client.channel;
-      const accountId = params.client.accountId ?? params.client.id;
-      if (!channel) {
-        this.sendError(
-          ws,
-          frame.id,
-          103,
-          "Channel mode requires channel field",
-        );
-        return;
-      }
-      const channelKey = `${channel}:${accountId}`;
-      attachments.channelKey = channelKey;
-      attachments.channel = channel;
-      attachments.accountId = accountId;
-      this.channels.set(channelKey, ws);
-      // Update channel registry
-      this.channelRegistry[channelKey] = {
-        channel,
-        accountId,
-        connectedAt: Date.now(),
-      };
-      console.log(`[Gateway] Channel connected: ${channelKey}`);
-    }
-
-    ws.serializeAttachment(attachments);
-    this.sendOk(ws, frame.id, {
-      type: "hello-ok",
-      protocol: 1,
-      server: { version: "0.0.1", connectionId: attachments.id },
-      features: {
-        methods: [
-          "tools.list",
-          "chat.send",
-          "tool.request",
-          "tool.result",
-          "channel.inbound",
-          "channel.start",
-          "channel.stop",
-          "channel.status",
-          "channel.login",
-          "channel.logout",
-          "channels.list",
-        ],
-        events: ["chat", "tool.invoke", "tool.result", "channel.outbound"],
-      },
-    });
-
-    // Auto-start heartbeat scheduler on first connection (if not already initialized)
-    if (!this.heartbeatScheduler.initialized) {
-      this.scheduleHeartbeat()
-        .then(() => {
-          this.heartbeatScheduler.initialized = true;
-          console.log(
-            `[Gateway] Heartbeat scheduler auto-initialized on first connection`,
-          );
-        })
-        .catch((e) => {
-          console.error(
-            `[Gateway] Failed to auto-initialize heartbeat scheduler:`,
-            e,
-          );
-        });
-    }
   }
 
   /**
@@ -506,91 +390,11 @@ export class Gateway extends DurableObject<Env> {
     }
   }
 
-  async handleToolResult(ws: WebSocket, frame: RequestFrame) {
-    const params = frame.params as ToolResultParams;
-    if (!params?.callId) {
-      this.sendError(ws, frame.id, 400, "callId required");
-      return;
-    }
-
-    const clientCall = this.pendingClientCalls.get(params.callId);
-    if (clientCall) {
-      this.pendingClientCalls.delete(params.callId);
-      if (params.error) {
-        this.sendError(clientCall.ws, clientCall.frameId, 500, params.error);
-      } else {
-        this.sendOk(clientCall.ws, clientCall.frameId, {
-          result: params.result,
-        });
-      }
-      this.sendOk(ws, frame.id, { ok: true });
-      return;
-    }
-
-    const sessionKey = this.pendingToolCalls[params.callId];
-    if (!sessionKey) {
-      this.sendError(ws, frame.id, 404, "Unknown callId");
-      return;
-    }
-
-    delete this.pendingToolCalls[params.callId];
-
-    const sessionStub = this.env.SESSION.get(
-      this.env.SESSION.idFromName(sessionKey),
-    );
-    await sessionStub.toolResult({
-      callId: params.callId,
-      result: params.result,
-      error: params.error,
-    });
-
-    this.sendOk(ws, frame.id, { ok: true });
-  }
-
   // TODO: persist
   readonly pendingClientCalls = new Map<
     string,
     { ws: WebSocket; frameId: string }
   >();
-
-  handleToolInvoke(ws: WebSocket, frame: RequestFrame) {
-    const params = frame.params as {
-      tool: string;
-      args?: Record<string, unknown>;
-    };
-    if (!params?.tool) {
-      this.sendError(ws, frame.id, 400, "tool required");
-      return;
-    }
-
-    const resolved = this.findNodeForTool(params.tool);
-    if (!resolved) {
-      this.sendError(
-        ws,
-        frame.id,
-        404,
-        `No node provides tool: ${params.tool}`,
-      );
-      return;
-    }
-
-    const nodeWs = this.nodes.get(resolved.nodeId);
-    if (!nodeWs) {
-      this.sendError(ws, frame.id, 503, "Node not connected");
-      return;
-    }
-
-    const callId = crypto.randomUUID();
-    this.pendingClientCalls.set(callId, { ws, frameId: frame.id });
-
-    // Send the original (un-namespaced) tool name to the node
-    const evt: EventFrame<ToolInvokePayload> = {
-      type: "evt",
-      event: "tool.invoke",
-      payload: { callId, tool: resolved.toolName, args: params.args ?? {} },
-    };
-    nodeWs.send(JSON.stringify(evt));
-  }
 
   webSocketClose(ws: WebSocket) {
     const { mode, clientId, nodeId, channelKey } = ws.deserializeAttachment();
