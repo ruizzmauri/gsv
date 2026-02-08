@@ -1,5 +1,5 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { isWebSocketRequest } from "./utils";
+import { isWebSocketRequest } from "./shared//utils";
 import type {
   ChannelInboundMessage,
   ChannelAccountStatus,
@@ -15,12 +15,15 @@ export type * from "./channel-interface";
 
 /**
  * Gateway Entrypoint for Service Binding RPC
- * 
+ *
  * Channel workers call these methods via Service Bindings.
  * This provides a secure, type-safe interface for channels to deliver
  * inbound messages to the Gateway.
  */
-export class GatewayEntrypoint extends WorkerEntrypoint<Env> implements GatewayChannelInterface {
+export class GatewayEntrypoint
+  extends WorkerEntrypoint<Env>
+  implements GatewayChannelInterface
+{
   /**
    * Receive an inbound message from a channel.
    * Routes to the appropriate session based on peer info.
@@ -31,8 +34,10 @@ export class GatewayEntrypoint extends WorkerEntrypoint<Env> implements GatewayC
     message: ChannelInboundMessage,
   ): Promise<{ ok: boolean; sessionKey?: string; error?: string }> {
     try {
-      const gateway = this.env.GATEWAY.get(this.env.GATEWAY.idFromName("singleton"));
-      
+      const gateway = this.env.GATEWAY.get(
+        this.env.GATEWAY.idFromName("singleton"),
+      );
+
       // Convert to the format Gateway expects
       const result = await gateway.handleChannelInboundRpc({
         channel: channelId,
@@ -49,7 +54,7 @@ export class GatewayEntrypoint extends WorkerEntrypoint<Env> implements GatewayC
         },
         wasMentioned: message.wasMentioned,
       });
-      
+
       return result;
     } catch (e) {
       console.error(`[GatewayEntrypoint] channelInbound failed:`, e);
@@ -70,7 +75,9 @@ export class GatewayEntrypoint extends WorkerEntrypoint<Env> implements GatewayC
     status: ChannelAccountStatus,
   ): Promise<void> {
     try {
-      const gateway = this.env.GATEWAY.get(this.env.GATEWAY.idFromName("singleton"));
+      const gateway = this.env.GATEWAY.get(
+        this.env.GATEWAY.idFromName("singleton"),
+      );
       await gateway.handleChannelStatusChanged(channelId, accountId, status);
     } catch (e) {
       console.error(`[GatewayEntrypoint] channelStatusChanged failed:`, e);
@@ -93,7 +100,9 @@ export default {
 
     // Serve media files from R2
     // /media/{uuid}.{ext}
-    const mediaMatch = url.pathname.match(/^\/media\/([a-f0-9-]+\.[a-z0-9]+)$/i);
+    const mediaMatch = url.pathname.match(
+      /^\/media\/([a-f0-9-]+\.[a-z0-9]+)$/i,
+    );
     if (mediaMatch && request.method === "GET") {
       const key = `media/${mediaMatch[1]}`;
       const object = await env.STORAGE.get(key);
@@ -111,7 +120,10 @@ export default {
       }
 
       const headers = new Headers();
-      headers.set("Content-Type", object.httpMetadata?.contentType || "application/octet-stream");
+      headers.set(
+        "Content-Type",
+        object.httpMetadata?.contentType || "application/octet-stream",
+      );
       headers.set("Cache-Control", "private, max-age=3600");
       // Allow cross-origin for LLM APIs
       headers.set("Access-Control-Allow-Origin", "*");
@@ -124,7 +136,7 @@ export default {
 
   /**
    * Queue handler: Process inbound messages from channels.
-   * 
+   *
    * Channels send messages to this queue instead of calling Gateway RPC directly.
    * This decouples the channel's DO context from the RPC call, avoiding issues
    * with certain platforms (e.g., WhatsApp/Baileys service binding conflicts).
@@ -132,10 +144,10 @@ export default {
   async queue(batch, env: Env): Promise<void> {
     const messages = batch.messages as Message<ChannelQueueMessage>[];
     const gateway = env.GATEWAY.get(env.GATEWAY.idFromName("singleton"));
-    
+
     for (const msg of messages) {
       const payload = msg.body;
-      
+
       try {
         if (payload.type === "inbound") {
           await gateway.handleChannelInboundRpc({

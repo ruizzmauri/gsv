@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
-import { PersistedObject } from "./stored";
-import type { ToolDefinition, MediaAttachment } from "./types";
+import { PersistedObject } from "./shared/persisted-object";
+import type { ToolDefinition } from "./types";
+import type { MediaAttachment } from "./protocol/channel";
 import type { GsvConfig } from "./config";
 import type {
   Message,
@@ -31,10 +32,7 @@ import {
   isMainSession,
   type AgentWorkspace,
 } from "./workspace";
-import {
-  isWorkspaceTool,
-  executeWorkspaceTool,
-} from "./workspace-tools";
+import { isWorkspaceTool, executeWorkspaceTool } from "./workspace-tools";
 
 type PendingToolCall = {
   id: string;
@@ -135,20 +133,6 @@ type StoredMessage = {
   timestamp: number;
 };
 
-export type SessionInfo = {
-  sessionId: string;
-  sessionKey: string;
-  createdAt: number;
-  updatedAt: number;
-  messageCount: number;
-  tokens: TokenUsage;
-  settings: SessionSettings;
-  resetPolicy?: ResetPolicy;
-  lastResetAt?: number;
-  previousSessionIds: string[];
-  label?: string;
-};
-
 export type SessionStats = {
   sessionKey: string;
   sessionId: string;
@@ -240,13 +224,13 @@ export class Session extends DurableObject<Env> {
   private getAgentId(): string {
     const sessionKey = this.meta.sessionKey;
     if (!sessionKey) return "main";
-    
+
     const parts = sessionKey.split(":");
     // Format: agent:{agentId}:...
     if (parts[0] === "agent" && parts[1]) {
       return parts[1];
     }
-    
+
     return "main";
   }
 
@@ -290,12 +274,12 @@ export class Session extends DurableObject<Env> {
     this.ctx.storage.kv,
     { prefix: "messageQueue:", defaults: { items: [] } },
   );
-  
+
   // Helper to access queue items
   private get messageQueue(): QueuedMessage[] {
     return this._messageQueue.items;
   }
-  
+
   private set messageQueue(items: QueuedMessage[]) {
     this._messageQueue.items = items;
   }
@@ -331,7 +315,9 @@ export class Session extends DurableObject<Env> {
         this.ctx.storage.sql
           .exec<{
             name: string;
-          }>(`SELECT name FROM sqlite_master WHERE type='table' AND name='messages'`)
+          }>(
+            `SELECT name FROM sqlite_master WHERE type='table' AND name='messages'`,
+          )
           .toArray().length > 0;
 
       if (oldTableExists) {
@@ -528,16 +514,23 @@ export class Session extends DurableObject<Env> {
         messageOverrides,
         queuedAt: Date.now(),
       };
-      
+
       this.messageQueue = [...this.messageQueue, queuedMessage];
-      console.log(`[Session] Queued message ${queuedMessage.id}, queue size: ${this.messageQueue.length}`);
-      
-      return { ok: true, runId, queued: true, queuePosition: this.messageQueue.length };
+      console.log(
+        `[Session] Queued message ${queuedMessage.id}, queue size: ${this.messageQueue.length}`,
+      );
+
+      return {
+        ok: true,
+        runId,
+        queued: true,
+        queuePosition: this.messageQueue.length,
+      };
     }
 
     // Start processing this message (async - don't await!)
     this.startRun(message, runId, tools, messageOverrides, media);
-    
+
     return { ok: true, runId, started: true };
   }
 
@@ -583,7 +576,9 @@ export class Session extends DurableObject<Env> {
     try {
       // Check for auto-reset
       if (this.shouldAutoReset()) {
-        console.log(`[Session] Auto-reset triggered for ${this.meta.sessionKey}`);
+        console.log(
+          `[Session] Auto-reset triggered for ${this.meta.sessionKey}`,
+        );
         await this.doReset();
       }
 
@@ -607,7 +602,9 @@ export class Session extends DurableObject<Env> {
   private async continueAgentLoop(): Promise<void> {
     // Check if run was aborted
     if (this.currentRun?.aborted) {
-      console.log(`[Session] Run ${this.currentRun.runId} was aborted, stopping agent loop`);
+      console.log(
+        `[Session] Run ${this.currentRun.runId} was aborted, stopping agent loop`,
+      );
       return;
     }
 
@@ -652,14 +649,16 @@ export class Session extends DurableObject<Env> {
 
     // Check if run was aborted while waiting for LLM
     if (this.currentRun?.aborted) {
-      console.log(`[Session] Run ${this.currentRun.runId} was aborted during LLM call`);
+      console.log(
+        `[Session] Run ${this.currentRun.runId} was aborted during LLM call`,
+      );
       return;
     }
 
     if (!response.content || response.content.length === 0) {
       // Check if there's an error message from the LLM
-      const errorDetail = response.errorMessage 
-        ? `LLM error: ${response.errorMessage}` 
+      const errorDetail = response.errorMessage
+        ? `LLM error: ${response.errorMessage}`
         : "LLM returned empty response";
       console.error(`[Session] ${errorDetail}`);
       await this.broadcastToClients({
@@ -683,7 +682,8 @@ export class Session extends DurableObject<Env> {
       // Check if response has text content alongside tool calls
       // If so, broadcast it as partial before executing tools (so user sees it immediately)
       const hasTextContent = response.content.some(
-        (block) => block.type === "text" && (block as { text?: string }).text?.trim(),
+        (block) =>
+          block.type === "text" && (block as { text?: string }).text?.trim(),
       );
       if (hasTextContent) {
         await this.broadcastToClients({
@@ -702,20 +702,24 @@ export class Session extends DurableObject<Env> {
           args: toolCall.arguments,
         });
       }
-      
+
       // Check if all tools already resolved (workspace tools complete synchronously)
       if (this.allToolsResolved()) {
-        console.log(`[Session] All ${toolCalls.length} tools already resolved (workspace tools), scheduling immediate continuation`);
+        console.log(
+          `[Session] All ${toolCalls.length} tools already resolved (workspace tools), scheduling immediate continuation`,
+        );
         // Schedule continuation via short alarm to reset DO timeouts/limits
         // This prevents long-running agent loops from hitting Worker limits
         this.ctx.storage.setAlarm(Date.now() + 100);
         return;
       }
-      
+
       // Some tools still pending (node tools) - set alarm and wait
       this.ctx.storage.setAlarm(Date.now() + 60_000);
       // DO can now hibernate - will wake on toolResult() or alarm()
-      console.log(`[Session] Waiting for ${toolCalls.length} tool results, run ${this.currentRun?.runId}`);
+      console.log(
+        `[Session] Waiting for ${toolCalls.length} tool results, run ${this.currentRun?.runId}`,
+      );
       return;
     }
 
@@ -753,14 +757,16 @@ export class Session extends DurableObject<Env> {
 
     const [next, ...remaining] = this.messageQueue;
     this.messageQueue = remaining;
-    
-    console.log(`[Session] Processing queued message ${next.id}, ${remaining.length} remaining`);
-    
+
+    console.log(
+      `[Session] Processing queued message ${next.id}, ${remaining.length} remaining`,
+    );
+
     // Start the next run (this sets currentRun)
     this.startRun(
       next.text,
       next.runId,
-      this.currentRun?.tools ?? next.messageOverrides ? [] : [], // Reuse tools if available
+      (this.currentRun?.tools ?? next.messageOverrides) ? [] : [], // Reuse tools if available
       next.messageOverrides,
       next.media,
     );
@@ -922,7 +928,9 @@ export class Session extends DurableObject<Env> {
       toolCall.result = input.result;
     }
     this.pendingToolCalls[input.callId] = toolCall;
-    console.log(`[Session] Tool result received for ${input.callId} (${toolCall.name})`);
+    console.log(
+      `[Session] Tool result received for ${input.callId} (${toolCall.name})`,
+    );
 
     if (this.allToolsResolved()) {
       this.ctx.storage.deleteAlarm();
@@ -951,10 +959,8 @@ export class Session extends DurableObject<Env> {
     const messageOverrides = this.currentRun?.messageOverrides ?? {};
 
     const effectiveModel =
-      messageOverrides.model ||
-      sessionSettings.model ||
-      config.model;
-    
+      messageOverrides.model || sessionSettings.model || config.model;
+
     // Build system prompt from workspace files + config
     const effectiveSystemPrompt = await this.buildEffectiveSystemPrompt(
       config,
@@ -1047,7 +1053,12 @@ export class Session extends DurableObject<Env> {
     // Map to pi-ai reasoning levels: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
     const reasoningLevel =
       effectiveThinkLevel && effectiveThinkLevel !== "none"
-        ? (effectiveThinkLevel as "minimal" | "low" | "medium" | "high" | "xhigh")
+        ? (effectiveThinkLevel as
+            | "minimal"
+            | "low"
+            | "medium"
+            | "high"
+            | "xhigh")
         : undefined;
 
     console.log(
@@ -1081,7 +1092,7 @@ export class Session extends DurableObject<Env> {
 
   /**
    * Build the effective system prompt by combining workspace files with config
-   * 
+   *
    * Loads agent identity files from R2 and merges with session/config settings
    */
   private async buildEffectiveSystemPrompt(
@@ -1089,15 +1100,21 @@ export class Session extends DurableObject<Env> {
     sessionSettings: SessionSettings,
   ): Promise<string> {
     const agentId = this.getAgentId();
-    
+
     // Check if this is main session (for MEMORY.md security)
     const mainSession = isMainSession(this.meta.sessionKey || "");
-    
-    console.log(`[Session] Loading workspace for agent: ${agentId} (mainSession: ${mainSession})`);
-    
+
+    console.log(
+      `[Session] Loading workspace for agent: ${agentId} (mainSession: ${mainSession})`,
+    );
+
     // Load workspace from R2
-    const workspace = await loadAgentWorkspace(this.env.STORAGE, agentId, mainSession);
-    
+    const workspace = await loadAgentWorkspace(
+      this.env.STORAGE,
+      agentId,
+      mainSession,
+    );
+
     // Log what was loaded
     const loaded = [
       workspace.agents?.exists && "AGENTS.md",
@@ -1110,14 +1127,14 @@ export class Session extends DurableObject<Env> {
       workspace.dailyMemory?.exists && "daily",
       workspace.yesterdayMemory?.exists && "yesterday",
     ].filter(Boolean);
-    
+
     if (loaded.length > 0) {
       console.log(`[Session] Workspace files loaded: ${loaded.join(", ")}`);
     }
-    
+
     // Get base prompt from settings or config
     const basePrompt = sessionSettings.systemPrompt || config.systemPrompt;
-    
+
     // Build combined prompt
     return buildSystemPromptFromWorkspace(basePrompt, workspace);
   }
@@ -1147,16 +1164,18 @@ export class Session extends DurableObject<Env> {
     // Check if this is a workspace tool (gsv__*) - handle locally
     if (isWorkspaceTool(toolCall.name)) {
       const agentId = this.getAgentId();
-      
-      console.log(`[Session] Executing workspace tool ${toolCall.name} for agent ${agentId}`);
-      
+
+      console.log(
+        `[Session] Executing workspace tool ${toolCall.name} for agent ${agentId}`,
+      );
+
       const result = await executeWorkspaceTool(
         this.env.STORAGE,
         agentId,
         toolCall.name,
         toolCall.args,
       );
-      
+
       if (result.ok) {
         toolCall.result = result.result;
       } else {
@@ -1197,13 +1216,15 @@ export class Session extends DurableObject<Env> {
         console.log(`[Session] Tool ${call.name} (${callId}) timed out`);
       }
     }
-    
+
     if (timedOutCount > 0) {
-      console.log(`[Session] Alarm: ${timedOutCount} tools timed out, continuing with errors`);
+      console.log(
+        `[Session] Alarm: ${timedOutCount} tools timed out, continuing with errors`,
+      );
     } else {
       console.log(`[Session] Alarm: all tools resolved, continuing agent loop`);
     }
-    
+
     await this.continueAgentLoop();
   }
 
@@ -1327,7 +1348,9 @@ export class Session extends DurableObject<Env> {
     // Clear any alarm (tool timeout)
     this.ctx.storage.deleteAlarm();
 
-    console.log(`[Session] Aborted run ${runId}, cancelled ${pendingToolsCancelled} pending tools`);
+    console.log(
+      `[Session] Aborted run ${runId}, cancelled ${pendingToolsCancelled} pending tools`,
+    );
 
     // Broadcast abort event
     await this.broadcastToClients({
@@ -1348,7 +1371,7 @@ export class Session extends DurableObject<Env> {
     };
   }
 
-  async get(): Promise<SessionInfo> {
+  async get() {
     return {
       sessionId: this.meta.sessionId,
       sessionKey: this.meta.sessionKey,
@@ -1404,12 +1427,7 @@ export class Session extends DurableObject<Env> {
     return { ok: true };
   }
 
-  async compact(keepMessages: number = 20): Promise<{
-    ok: boolean;
-    trimmedMessages: number;
-    keptMessages: number;
-    archivedTo?: string;
-  }> {
+  async compact(keepMessages: number = 20) {
     const totalMessages = this.getMessageCount();
     if (totalMessages <= keepMessages) {
       return {

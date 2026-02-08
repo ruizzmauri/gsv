@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { PersistedObject } from "./stored";
+import { PersistedObject } from "./persisted-object";
 
 // Mock KV storage that behaves like DO storage.kv
 function createMockKv() {

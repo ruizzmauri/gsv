@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { PersistedObject } from "./stored";
+import { PersistedObject } from "./shared/persisted-object";
 import { DEFAULT_CONFIG, mergeConfig, type GsvConfig, type GsvConfigInput } from "./config";
 
 // Mock KV storage

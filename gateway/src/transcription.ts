@@ -7,7 +7,7 @@
  * - Workers AI: Free, uses Cloudflare AI binding
  */
 
-import type { MediaAttachment } from "./types";
+import type { MediaAttachment } from "./protocol/channel";
 import type { TranscriptionProvider } from "./config";
 
 const OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions";

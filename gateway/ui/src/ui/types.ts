@@ -42,33 +42,6 @@ export type ToolDefinition = {
   inputSchema: Record<string, unknown>;
 };
 
-// Session types
-export type SessionInfo = {
-  sessionId: string;
-  sessionKey: string;
-  createdAt: number;
-  updatedAt: number;
-  messageCount: number;
-  tokens: TokenUsage;
-  settings: SessionSettings;
-  resetPolicy?: ResetPolicy;
-  lastResetAt?: number;
-  previousSessionIds: string[];
-  label?: string;
-};
-
-export type SessionStats = {
-  sessionKey: string;
-  sessionId: string;
-  messageCount: number;
-  tokens: TokenUsage;
-  createdAt: number;
-  updatedAt: number;
-  uptime: number;
-  isProcessing: boolean;
-  queueSize: number;
-};
-
 export type SessionSettings = {
   model?: { provider: string; id: string };
   thinkingLevel?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";

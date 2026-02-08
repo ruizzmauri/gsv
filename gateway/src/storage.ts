@@ -17,7 +17,7 @@
  */
 
 import type { Message } from "@mariozechner/pi-ai";
-import type { MediaAttachment } from "./types";
+import type { MediaAttachment } from "./protocol/channel";
 
 // Default agent ID (GSV currently doesn't support multi-agent)
 const DEFAULT_AGENT_ID = "default";

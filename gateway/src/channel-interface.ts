@@ -9,12 +9,6 @@
  * - Channel → Gateway: Channel calls Gateway's `channelInbound()` method via its Service Binding
  */
 
-import { WorkerEntrypoint } from "cloudflare:workers";
-
-// ============================================================================
-// Core Types
-// ============================================================================
-
 /**
  * Conversation target (DM, group, channel, thread, etc.)
  */
