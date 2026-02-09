@@ -33,6 +33,7 @@ Without MESSAGE_CONTENT, the bot will receive messages but `content` will be emp
 2. Select scopes: `bot`
 3. Select permissions:
    - Send Messages
+   - Attach Files
    - Read Message History  
    - View Channels
    - Add Reactions (optional)
@@ -40,7 +41,7 @@ Without MESSAGE_CONTENT, the bot will receive messages but `content` will be emp
 
 Or construct manually:
 ```
-https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID&permissions=68608&scope=bot
+https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID&permissions=101376&scope=bot
 ```
 
 ### 5. Configure GSV

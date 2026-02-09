@@ -27,6 +27,8 @@ import { runWizard } from "./wizard/index";
 import { createCliPrompter, isCancelled, handleCancel } from "./wizard/prompter";
 import type { WizardState } from "./wizard/types";
 
+const DISCORD_INVITE_PERMISSIONS = 101376; // View Channels + Send Messages + Attach Files + Read Message History
+
 // ============================================================================
 // State Management
 // ============================================================================
@@ -388,6 +390,12 @@ ${pc.bold("Examples:")}
 ${pc.bold("Environment Variables:")}
   DISCORD_BOT_TOKEN   Discord bot token
   ANTHROPIC_API_KEY   Anthropic API key
+
+${pc.bold("Discord Bot Requirements:")}
+  Enable privileged intent: MESSAGE CONTENT INTENT
+  Bot permissions: View Channels, Send Messages, Attach Files, Read Message History
+  Invite URL:
+  https://discord.com/oauth2/authorize?client_id=<APP_ID>&permissions=${DISCORD_INVITE_PERMISSIONS}&scope=bot
 `);
 }
 

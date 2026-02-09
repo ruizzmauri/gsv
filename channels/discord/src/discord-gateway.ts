@@ -11,6 +11,7 @@ import { DurableObject } from "cloudflare:workers";
 import type {
   ChannelAccountStatus,
   ChannelInboundMessage,
+  ChannelMedia,
   ChannelQueueMessage,
 } from "./types";
 
@@ -40,6 +41,18 @@ const INTENTS = {
   DIRECT_MESSAGE_REACTIONS: 1 << 13,
   MESSAGE_CONTENT: 1 << 15,
 } as const;
+
+const MAX_INLINE_MEDIA_BYTES = 25 * 1024 * 1024; // 25MB
+
+type DiscordAttachment = {
+  id: string;
+  filename: string;
+  size?: number;
+  url?: string;
+  proxyUrl?: string;
+  contentType?: string;
+  duration?: number;
+};
 
 type GatewayState = {
   accountId: string | null;  // The name used to create this DO (e.g., "default")
@@ -330,16 +343,21 @@ export class DiscordGateway extends DurableObject<Env> {
     // Ignore bot messages
     if (author?.bot) return;
 
-    // Ignore messages without content
-    const content = data.content as string;
-    if (!content) return;
+    const content = typeof data.content === "string" ? data.content : "";
+    const media = await this.extractMediaAttachments(data);
+    if (!content && media.length === 0) return;
 
     const guildId = data.guild_id as string | undefined;
     const channelId = data.channel_id as string;
     const messageId = data.id as string;
+    const messageReference = data.message_reference as
+      | { message_id?: string }
+      | undefined;
 
     // Check if bot was mentioned
-    const mentions = data.mentions as Array<{ id: string }> | undefined;
+    const mentions = Array.isArray(data.mentions)
+      ? (data.mentions as Array<{ id?: string }>)
+      : [];
     const botUser = await this.ctx.storage.get<{ id: string }>("botUser");
     const wasMentioned = mentions?.some(m => m.id === botUser?.id) ?? false;
 
@@ -356,10 +374,14 @@ export class DiscordGateway extends DurableObject<Env> {
         name: author.username,
         handle: author.discriminator ? `${author.username}#${author.discriminator}` : author.username,
       } : undefined,
-      text: content,
+      text: content || "[Media]",
+      media: media.length > 0 ? media : undefined,
+      replyToId:
+        messageReference && typeof messageReference.message_id === "string"
+          ? messageReference.message_id
+          : undefined,
       timestamp: data.timestamp ? new Date(data.timestamp as string).getTime() : Date.now(),
       wasMentioned,
-      // TODO: Handle attachments, embeds
     };
 
     // Forward to GSV Gateway via queue
@@ -374,6 +396,167 @@ export class DiscordGateway extends DurableObject<Env> {
     } catch (e) {
       console.error("[DiscordGateway] Failed to queue message:", e);
     }
+  }
+
+  private async extractMediaAttachments(
+    data: Record<string, unknown>,
+  ): Promise<ChannelMedia[]> {
+    if (!Array.isArray(data.attachments)) {
+      return [];
+    }
+
+    const media: ChannelMedia[] = [];
+    for (const rawAttachment of data.attachments) {
+      const attachment = this.parseAttachment(rawAttachment);
+      if (!attachment) continue;
+
+      const converted = await this.attachmentToMedia(attachment);
+      if (converted) {
+        media.push(converted);
+      }
+    }
+
+    return media;
+  }
+
+  private parseAttachment(raw: unknown): DiscordAttachment | null {
+    if (!raw || typeof raw !== "object") {
+      return null;
+    }
+
+    const value = raw as Record<string, unknown>;
+    const id = typeof value.id === "string" ? value.id : null;
+    const filename = typeof value.filename === "string" ? value.filename : null;
+    const url = typeof value.url === "string" ? value.url : undefined;
+    const proxyUrl =
+      typeof value.proxy_url === "string" ? value.proxy_url : undefined;
+
+    if (!id || !filename) {
+      return null;
+    }
+
+    return {
+      id,
+      filename,
+      size: typeof value.size === "number" ? value.size : undefined,
+      url,
+      proxyUrl,
+      contentType:
+        typeof value.content_type === "string"
+          ? value.content_type
+          : undefined,
+      duration:
+        typeof value.duration_secs === "number"
+          ? value.duration_secs
+          : undefined,
+    };
+  }
+
+  private async attachmentToMedia(
+    attachment: DiscordAttachment,
+  ): Promise<ChannelMedia | null> {
+    const mimeType =
+      attachment.contentType || this.inferMimeTypeFromFilename(attachment.filename);
+    const type = this.inferMediaTypeFromMime(mimeType);
+    const url = attachment.url || attachment.proxyUrl;
+
+    const base: ChannelMedia = {
+      type,
+      mimeType,
+      url,
+      filename: attachment.filename,
+      size: attachment.size,
+      duration: attachment.duration,
+    };
+
+    if (!url) {
+      return base;
+    }
+
+    if (attachment.size && attachment.size > MAX_INLINE_MEDIA_BYTES) {
+      console.log(
+        `[DiscordGateway] Attachment ${attachment.id} too large for inline data (${attachment.size} bytes)`,
+      );
+      return base;
+    }
+
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        console.warn(
+          `[DiscordGateway] Failed to download attachment ${attachment.id}: HTTP ${response.status}`,
+        );
+        return base;
+      }
+
+      const contentLength = parseInt(
+        response.headers.get("content-length") || "0",
+        10,
+      );
+      if (contentLength > MAX_INLINE_MEDIA_BYTES) {
+        console.log(
+          `[DiscordGateway] Attachment ${attachment.id} content-length exceeds inline limit (${contentLength} bytes)`,
+        );
+        return base;
+      }
+
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (bytes.byteLength > MAX_INLINE_MEDIA_BYTES) {
+        console.log(
+          `[DiscordGateway] Attachment ${attachment.id} body exceeds inline limit (${bytes.byteLength} bytes)`,
+        );
+        return base;
+      }
+
+      return {
+        ...base,
+        data: this.bytesToBase64(bytes),
+        size: attachment.size ?? bytes.byteLength,
+      };
+    } catch (e) {
+      console.warn(
+        `[DiscordGateway] Error downloading attachment ${attachment.id}: ${e}`,
+      );
+      return base;
+    }
+  }
+
+  private inferMediaTypeFromMime(mimeType: string): ChannelMedia["type"] {
+    const normalized = mimeType.split(";")[0].trim().toLowerCase();
+    if (normalized.startsWith("image/")) return "image";
+    if (normalized.startsWith("audio/")) return "audio";
+    if (normalized.startsWith("video/")) return "video";
+    return "document";
+  }
+
+  private inferMimeTypeFromFilename(filename: string): string {
+    const extension = filename.split(".").pop()?.toLowerCase() || "";
+    const map: Record<string, string> = {
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      png: "image/png",
+      gif: "image/gif",
+      webp: "image/webp",
+      mp3: "audio/mpeg",
+      ogg: "audio/ogg",
+      opus: "audio/opus",
+      wav: "audio/wav",
+      m4a: "audio/mp4",
+      webm: "audio/webm",
+      mp4: "video/mp4",
+      mov: "video/quicktime",
+      pdf: "application/pdf",
+    };
+    return map[extension] || "application/octet-stream";
+  }
+
+  private bytesToBase64(bytes: Uint8Array): string {
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
   }
 
   private async identify() {

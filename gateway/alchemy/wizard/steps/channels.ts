@@ -8,6 +8,7 @@ import { isCancelled, handleCancel } from "../prompter";
 import pc from "picocolors";
 
 type ChannelId = "whatsapp" | "discord";
+const DISCORD_INVITE_PERMISSIONS = 101376; // View Channels + Send Messages + Attach Files + Read Message History
 
 export async function channelsStep(
   p: Prompter,
@@ -63,7 +64,8 @@ export async function channelsStep(
       `${pc.bold("4. Invite Bot to Server")}\n` +
       `   Go to "OAuth2" → "URL Generator"\n` +
       `   Scopes: ${pc.cyan("bot")}\n` +
-      `   Permissions: ${pc.cyan("Send Messages, Read Message History")}\n` +
+      `   Permissions: ${pc.cyan("View Channels, Send Messages, Attach Files, Read Message History")}\n` +
+      `   Or use: ${pc.cyan(`https://discord.com/oauth2/authorize?client_id=<APP_ID>&permissions=${DISCORD_INVITE_PERMISSIONS}&scope=bot`)}\n` +
       `   Copy URL and open in browser to invite`,
       "Discord Bot Setup"
     );

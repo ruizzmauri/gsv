@@ -10,6 +10,7 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import type {
   ChannelWorkerInterface,
   ChannelCapabilities,
+  ChannelMedia,
   ChannelAccountStatus,
   ChannelOutboundMessage,
   ChannelPeer,
@@ -32,6 +33,7 @@ interface Env {
 }
 
 const DISCORD_API = "https://discord.com/api/v10";
+const DISCORD_INVITE_PERMISSIONS = 101376; // View Channels + Send Messages + Attach Files + Read Message History
 
 /**
  * Discord Channel Entrypoint
@@ -107,9 +109,17 @@ export class DiscordChannel extends WorkerEntrypoint<Env> implements ChannelWork
 
     try {
       const channelId = message.peer.id;
-      const body: Record<string, unknown> = {
-        content: message.text,
-      };
+      const body: Record<string, unknown> = {};
+      const hasText = message.text.trim().length > 0;
+      const media = message.media ?? [];
+
+      if (!hasText && media.length === 0) {
+        return { ok: false, error: "Discord messages require text or media" };
+      }
+
+      if (hasText) {
+        body.content = message.text;
+      }
 
       if (message.replyToId) {
         body.message_reference = {
@@ -117,12 +127,28 @@ export class DiscordChannel extends WorkerEntrypoint<Env> implements ChannelWork
         };
       }
 
-      // TODO: Handle media attachments
+      let requestBody: BodyInit;
+      if (media.length > 0) {
+        const form = new FormData();
+        const attachments: Array<{ id: number; filename: string }> = [];
+
+        for (const [index, attachment] of media.entries()) {
+          const file = await this.prepareUploadFile(attachment, index);
+          form.append(`files[${index}]`, file.blob, file.filename);
+          attachments.push({ id: index, filename: file.filename });
+        }
+
+        body.attachments = attachments;
+        form.append("payload_json", JSON.stringify(body));
+        requestBody = form;
+      } else {
+        requestBody = JSON.stringify(body);
+      }
 
       const response = await this.discordFetch(`/channels/${channelId}/messages`, {
         method: "POST",
         botToken,
-        body: JSON.stringify(body),
+        body: requestBody,
       });
 
       if (!response.ok) {
@@ -167,7 +193,8 @@ export class DiscordChannel extends WorkerEntrypoint<Env> implements ChannelWork
   ): Promise<Response> {
     const headers = new Headers(init.headers || {});
     headers.set("Authorization", `Bot ${init.botToken}`);
-    if (!headers.has("Content-Type") && init.body) {
+    const isFormDataBody = typeof FormData !== "undefined" && init.body instanceof FormData;
+    if (!headers.has("Content-Type") && init.body && !isFormDataBody) {
       headers.set("Content-Type", "application/json; charset=utf-8");
     }
 
@@ -182,6 +209,75 @@ export class DiscordChannel extends WorkerEntrypoint<Env> implements ChannelWork
     }
 
     return response;
+  }
+
+  private async prepareUploadFile(
+    media: ChannelMedia,
+    index: number,
+  ): Promise<{ blob: Blob; filename: string }> {
+    const filename =
+      media.filename ||
+      `attachment-${index + 1}.${this.getExtensionFromMime(media.mimeType, media.type)}`;
+
+    if (media.data) {
+      const bytes = this.decodeBase64(media.data);
+      return {
+        blob: new Blob([bytes], { type: media.mimeType }),
+        filename,
+      };
+    }
+
+    if (media.url) {
+      const response = await fetch(media.url);
+      if (!response.ok) {
+        throw new Error(
+          `Failed to fetch media from url (${response.status} ${response.statusText})`,
+        );
+      }
+      const arrayBuffer = await response.arrayBuffer();
+      return {
+        blob: new Blob([arrayBuffer], { type: media.mimeType }),
+        filename,
+      };
+    }
+
+    throw new Error("Media attachment must include base64 data or url");
+  }
+
+  private decodeBase64(base64: string): Uint8Array {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  }
+
+  private getExtensionFromMime(
+    mimeType: string,
+    mediaType: ChannelMedia["type"],
+  ): string {
+    const normalized = mimeType.split(";")[0].trim().toLowerCase();
+    const mapping: Record<string, string> = {
+      "image/jpeg": "jpg",
+      "image/png": "png",
+      "image/gif": "gif",
+      "image/webp": "webp",
+      "audio/ogg": "ogg",
+      "audio/opus": "opus",
+      "audio/mpeg": "mp3",
+      "audio/mp3": "mp3",
+      "audio/mp4": "m4a",
+      "audio/wav": "wav",
+      "audio/webm": "webm",
+      "video/mp4": "mp4",
+      "video/webm": "webm",
+      "application/pdf": "pdf",
+    };
+
+    const fromMime = mapping[normalized];
+    if (fromMime) return fromMime;
+    return mediaType === "document" ? "bin" : mediaType;
   }
 }
 
@@ -245,7 +341,7 @@ export default {
           appId = app.id;
         }
 
-        const inviteUrl = `https://discord.com/oauth2/authorize?client_id=${appId}&permissions=68608&scope=bot`;
+        const inviteUrl = `https://discord.com/oauth2/authorize?client_id=${appId}&permissions=${DISCORD_INVITE_PERMISSIONS}&scope=bot`;
 
         return Response.json({
           ok: true,
@@ -258,7 +354,7 @@ export default {
           inviteUrl,
           setup: {
             step1: "Ensure MESSAGE_CONTENT intent is enabled in Discord Developer Portal",
-            step2: `Invite bot to server: ${inviteUrl}`,
+            step2: `Invite bot to server (with Attach Files permission): ${inviteUrl}`,
             step3: "Start the bot: POST /start",
           },
         });
