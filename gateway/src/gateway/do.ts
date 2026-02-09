@@ -1349,11 +1349,12 @@ export class Gateway extends DurableObject<Env> {
     } else if (target === "last" && lastActive) {
       // Use last active session and deliver to that channel
       sessionKey = lastActive.sessionKey;
-      deliveryContext = {
+      // Clone to strip Proxy wrappers from PersistedObject before storing in another PersistedObject
+      deliveryContext = JSON.parse(JSON.stringify({
         channel: lastActive.channel,
         accountId: lastActive.accountId,
         peer: lastActive.peer,
-      };
+      }));
       console.log(
         `[Gateway] Heartbeat target=last, delivering to ${lastActive.channel}:${lastActive.peer.id}`,
       );
@@ -1362,11 +1363,12 @@ export class Gateway extends DurableObject<Env> {
       // For now, use last active if channel matches
       if (lastActive && lastActive.channel === target) {
         sessionKey = lastActive.sessionKey;
-        deliveryContext = {
+        // Clone to strip Proxy wrappers from PersistedObject before storing in another PersistedObject
+        deliveryContext = JSON.parse(JSON.stringify({
           channel: lastActive.channel,
           accountId: lastActive.accountId,
           peer: lastActive.peer,
-        };
+        }));
         console.log(
           `[Gateway] Heartbeat target=${target}, matched last active`,
         );
