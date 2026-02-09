@@ -1,7 +1,7 @@
-import { GsvConfig, PendingPair } from "../config";
+import type { GsvConfig, PendingPair } from "../config";
 import type { ChannelAccountStatus } from "../channel-interface";
 import type { Gateway } from "../gateway/do";
-import {
+import type {
   ResetPolicy,
   ResetResult,
   SessionPatchParams,
@@ -9,22 +9,77 @@ import {
   SessionStats,
   TokenUsage,
 } from "../session";
-import { SessionRegistryEntry } from "../types";
 import {
   ChannelInboundParams,
   ChannelRegistryEntry,
   ChannelId,
 } from "./channel";
+import type { RequestFrame } from "./frames";
+import type { SessionRegistryEntry } from "./session";
+import type {
+  ToolDefinition,
+  ToolRequestParams,
+  ToolResultParams,
+} from "./tools";
+
+export const DEFER_RESPONSE = Symbol("defer-response");
+export type DeferredResponse = typeof DEFER_RESPONSE;
+
+export type ConnectParams = {
+  minProtocol: number;
+  maxProtocol: number;
+  client: {
+    id: string;
+    version: string;
+    platform: string;
+    mode: "client" | "node" | "channel";
+    channel?: ChannelId;
+    accountId?: string;
+  };
+  tools?: ToolDefinition[];
+  auth?: {
+    token?: string;
+  };
+};
+
+export type ConnectResult = {
+  type: "hello-ok";
+  protocol: 1;
+  server: {
+    version: string;
+    connectionId: string;
+  };
+  features: {
+    methods: string[];
+    events: string[];
+  };
+};
+
+export type ToolInvokeParams = {
+  tool: string;
+  args?: Record<string, unknown>;
+};
 
 export type RpcMethods = {
+  "connect": {
+    params: ConnectParams;
+    result: ConnectResult;
+  };
+
+  "tool.invoke": {
+    params: ToolInvokeParams;
+    result: never;
+  };
+
+  "tool.result": {
+    params: ToolResultParams;
+    result: { ok: true; dropped?: true };
+  };
+
   "tools.list": {
     params: undefined;
     result: {
-      tools: Array<{
-        name: string;
-        description: string;
-        inputSchema: Record<string, unknown>;
-      }>;
+      tools: ToolDefinition[];
     };
   };
 
@@ -221,12 +276,7 @@ export type RpcMethods = {
   };
 
   "tool.request": {
-    params: {
-      callId: string;
-      tool: string;
-      args: Record<string, unknown>;
-      sessionKey: string;
-    };
+    params: ToolRequestParams;
     result: {
       status: "sent";
     };
@@ -234,10 +284,19 @@ export type RpcMethods = {
 };
 
 export type RpcMethod = keyof RpcMethods;
+export type DeferrableMethod = "tool.invoke";
 export type ParamsOf<M extends RpcMethod> = RpcMethods[M]["params"];
 export type ResultOf<M extends RpcMethod> = RpcMethods[M]["result"];
+export type HandlerResult<M extends RpcMethod> =
+  | ResultOf<M>
+  | (M extends DeferrableMethod ? DeferredResponse : never);
+export type HandlerContext<M extends RpcMethod> = {
+  gw: Gateway;
+  ws: WebSocket;
+  frame: RequestFrame<M, ParamsOf<M>>;
+  params: ParamsOf<M>;
+};
 
 export type Handler<M extends RpcMethod> = (
-  gw: Gateway,
-  params: ParamsOf<M>,
-) => Promise<ResultOf<M>> | ResultOf<M>;
+  ctx: HandlerContext<M>,
+) => Promise<HandlerResult<M>> | HandlerResult<M>;

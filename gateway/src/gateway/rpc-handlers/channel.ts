@@ -1,8 +1,8 @@
 import type { ChannelId } from "../../protocol/channel";
-import { Handler } from "../../protocol/methods";
+import type { Handler } from "../../protocol/methods";
 import { RpcError } from "../../shared/utils";
 
-export const handleChannelsList: Handler<"channels.list"> = (gw) => {
+export const handleChannelsList: Handler<"channels.list"> = ({ gw }) => {
   const channels = Object.values(gw.channelRegistry);
 
   return {
@@ -11,7 +11,10 @@ export const handleChannelsList: Handler<"channels.list"> = (gw) => {
   };
 };
 
-export const handleChannelInbound: Handler<"channel.inbound"> = async (gw, params) => {
+export const handleChannelInbound: Handler<"channel.inbound"> = async ({
+  gw,
+  params,
+}) => {
   const result = await gw.handleChannelInboundRpc(params);
   if (!result.ok) {
     const code = result.error?.includes("required") ? 400 : 500;
@@ -28,7 +31,10 @@ export const handleChannelInbound: Handler<"channel.inbound"> = async (gw, param
   };
 };
 
-export const handleChannelStart: Handler<"channel.start"> = async (gw, params) => {
+export const handleChannelStart: Handler<"channel.start"> = async ({
+  gw,
+  params,
+}) => {
   if (!params?.channel) {
     throw new RpcError(400, "channel required");
   }
@@ -66,7 +72,10 @@ export const handleChannelStart: Handler<"channel.start"> = async (gw, params) =
   return { ok: true, channel, accountId };
 };
 
-export const handleChannelStop: Handler<"channel.stop"> = async (gw, params) => {
+export const handleChannelStop: Handler<"channel.stop"> = async ({
+  gw,
+  params,
+}) => {
   if (!params?.channel) {
     throw new RpcError(400, "channel required");
   }
@@ -99,7 +108,10 @@ export const handleChannelStop: Handler<"channel.stop"> = async (gw, params) => 
   return { ok: true, channel, accountId };
 };
 
-export const handleChannelStatus: Handler<"channel.status"> = async (gw, params) => {
+export const handleChannelStatus: Handler<"channel.status"> = async ({
+  gw,
+  params,
+}) => {
   if (!params?.channel) {
     throw new RpcError(400, "channel required");
   }
@@ -123,7 +135,10 @@ export const handleChannelStatus: Handler<"channel.status"> = async (gw, params)
   }
 };
 
-export const handleChannelLogin: Handler<"channel.login"> = async (gw, params) => {
+export const handleChannelLogin: Handler<"channel.login"> = async ({
+  gw,
+  params,
+}) => {
   if (!params?.channel) {
     throw new RpcError(400, "channel required");
   }
@@ -163,7 +178,10 @@ export const handleChannelLogin: Handler<"channel.login"> = async (gw, params) =
   };
 };
 
-export const handleChannelLogout: Handler<"channel.logout"> = async (gw, params) => {
+export const handleChannelLogout: Handler<"channel.logout"> = async ({
+  gw,
+  params,
+}) => {
   if (!params?.channel) {
     throw new RpcError(400, "channel required");
   }

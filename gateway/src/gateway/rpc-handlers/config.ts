@@ -1,7 +1,7 @@
 import type { Handler } from "../../protocol/methods";
 import { RpcError } from "../../shared/utils";
 
-export const handleConfigGet: Handler<"config.get"> = (gw, params) => {
+export const handleConfigGet: Handler<"config.get"> = ({ gw, params }) => {
   if (params?.path) {
     // Get specific path
     const value = gw.getConfigPath(params.path);
@@ -13,7 +13,7 @@ export const handleConfigGet: Handler<"config.get"> = (gw, params) => {
   }
 };
 
-export const handleConfigSet: Handler<"config.set"> = (gw, params) => {
+export const handleConfigSet: Handler<"config.set"> = ({ gw, params }) => {
   if (!params?.path) {
     throw new RpcError(400, "path required");
   }

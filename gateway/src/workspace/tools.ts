@@ -8,7 +8,7 @@
  * The agent's workspace is scoped to: agents/{agentId}/
  */
 
-import type { ToolDefinition } from "../types";
+import type { ToolDefinition } from "../protocol/tools";
 
 export const WORKSPACE_TOOL_PREFIX = "gsv__";
 export const WORKSPACE_TOOLS = {

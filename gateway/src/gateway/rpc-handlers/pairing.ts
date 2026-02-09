@@ -2,11 +2,11 @@ import { normalizeE164 } from "../../config/parsing";
 import type { Handler } from "../../protocol/methods";
 import { RpcError } from "../../shared/utils";
 
-export const handlePairList: Handler<"pair.list"> = (gw) => ({
+export const handlePairList: Handler<"pair.list"> = ({ gw }) => ({
   pairs: { ...gw.pendingPairs },
 });
 
-export const handlePairApprove: Handler<"pair.approve"> = (gw, params) => {
+export const handlePairApprove: Handler<"pair.approve"> = ({ gw, params }) => {
   if (!params?.channel || !params?.senderId) {
     throw new RpcError(400, "channel and senderId required");
   }
@@ -55,7 +55,7 @@ export const handlePairApprove: Handler<"pair.approve"> = (gw, params) => {
   };
 };
 
-export const handlePairReject: Handler<"pair.reject"> = (gw, params) => {
+export const handlePairReject: Handler<"pair.reject"> = ({ gw, params }) => {
   if (!params?.channel || !params?.senderId) {
     throw new RpcError(400, "channel and senderId required");
   }

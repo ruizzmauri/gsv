@@ -1,8 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
-import { PersistedObject } from "./shared/persisted-object";
-import type { ToolDefinition } from "./types";
-import type { MediaAttachment } from "./protocol/channel";
-import type { GsvConfig } from "./config";
+import { PersistedObject } from "../shared/persisted-object";
+import type { ChatEventPayload } from "../protocol/chat";
+import type { ToolDefinition } from "../protocol/tools";
+import type { MediaAttachment } from "../protocol/channel";
+import type { GsvConfig } from "../config";
 import type {
   Message,
   UserMessage,
@@ -20,11 +21,11 @@ import {
   type Model,
   type Api,
 } from "@mariozechner/pi-ai";
-import { archivePartialMessages, archiveSession } from "./storage/archive";
-import { fetchMediaFromR2, deleteSessionMedia } from "./storage/media";
-import { loadAgentWorkspace, isMainSession } from "./workspace/loader";
-import { buildSystemPromptFromWorkspace } from "./workspace/prompt";
-import { isWorkspaceTool, executeWorkspaceTool } from "./workspace/tools";
+import { archivePartialMessages, archiveSession } from "../storage/archive";
+import { fetchMediaFromR2, deleteSessionMedia } from "../storage/media";
+import { loadAgentWorkspace, isMainSession } from "../workspace/loader";
+import { buildSystemPromptFromWorkspace } from "../workspace/prompt";
+import { isWorkspaceTool, executeWorkspaceTool } from "../workspace/tools";
 
 type PendingToolCall = {
   id: string;
@@ -1131,17 +1132,9 @@ export class Session extends DurableObject<Env> {
     return buildSystemPromptFromWorkspace(basePrompt, workspace);
   }
 
-  private async broadcastToClients(payload: {
-    runId: string | null;
-    sessionKey: string;
-    state: "partial" | "final" | "error";
-    message?: unknown;
-    error?: string;
-  }): Promise<void> {
+  private async broadcastToClients(payload: ChatEventPayload): Promise<void> {
     if (!this.meta.sessionKey) return;
-    const gateway = this.env.GATEWAY.get(
-      this.env.GATEWAY.idFromName("singleton"),
-    );
+    const gateway = this.env.GATEWAY.getByName("singleton");
     gateway.broadcastToSession(this.meta.sessionKey, payload);
   }
 

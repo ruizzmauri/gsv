@@ -8,7 +8,7 @@ import {
 import type { Handler } from "../../protocol/methods";
 import { RpcError } from "../../shared/utils";
 
-export const handleChatSend: Handler<"chat.send"> = async (gw, params) => {
+export const handleChatSend: Handler<"chat.send"> = async ({ gw, params }) => {
   if (!params?.sessionKey || !params?.message) {
     throw new RpcError(400, "sessionKey and message required");
   }

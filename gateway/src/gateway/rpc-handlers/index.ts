@@ -1,4 +1,4 @@
-import { RpcMethod, Handler } from "../../protocol/methods";
+import type { RpcMethod, Handler } from "../../protocol/methods";
 import {
   handleSessionGet,
   handleSessionReset,
@@ -18,7 +18,12 @@ import {
   handleChannelLogin,
   handleChannelLogout,
 } from "./channel";
-import { handleToolsList, handleToolRequest } from "./tools";
+import {
+  handleToolsList,
+  handleToolRequest,
+  handleToolInvoke,
+  handleToolResult,
+} from "./tools";
 import { handlePairList, handlePairApprove, handlePairReject } from "./pairing";
 import { handleChatSend } from "./chat";
 import {
@@ -27,9 +32,13 @@ import {
   handleHeartbeatTrigger,
 } from "./heartbeat";
 import { handleConfigGet, handleConfigSet } from "./config";
+import { handleConnect } from "./connect";
 
 export function buildRpcHandlers(): Partial<{ [M in RpcMethod]: Handler<M> }> {
   return {
+    connect: handleConnect,
+    "tool.invoke": handleToolInvoke,
+    "tool.result": handleToolResult,
     "tools.list": handleToolsList,
     "session.get": handleSessionGet,
     "session.reset": handleSessionReset,

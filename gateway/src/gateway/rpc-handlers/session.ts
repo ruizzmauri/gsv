@@ -1,8 +1,10 @@
 import { env } from "cloudflare:workers";
-import { Handler } from "../../protocol/methods";
+import type { Handler } from "../../protocol/methods";
 import { RpcError } from "../../shared/utils";
 
-export const handleSessionPatch: Handler<"session.patch"> = async (_, params) => {
+export const handleSessionPatch: Handler<"session.patch"> = async ({
+  params,
+}) => {
   if (!params?.sessionKey) {
     throw new RpcError(400, "sessionKey required");
   }
@@ -16,7 +18,7 @@ export const handleSessionPatch: Handler<"session.patch"> = async (_, params) =>
   });
 };
 
-export const handleSessionGet: Handler<"session.get"> = async (_, params) => {
+export const handleSessionGet: Handler<"session.get"> = async ({ params }) => {
   if (!params?.sessionKey) {
     throw new RpcError(400, "sessionKey required");
   }
@@ -26,7 +28,9 @@ export const handleSessionGet: Handler<"session.get"> = async (_, params) => {
   return await sessionStub.get();
 };
 
-export const handleSessionCompact: Handler<"session.compact"> = async (_, params) => {
+export const handleSessionCompact: Handler<"session.compact"> = async ({
+  params,
+}) => {
   if (!params?.sessionKey) {
     throw new RpcError(400, "sessionKey required");
   }
@@ -36,7 +40,9 @@ export const handleSessionCompact: Handler<"session.compact"> = async (_, params
   return await sessionStub.compact(params.keepMessages);
 };
 
-export const handleSessionStats: Handler<"session.stats"> = async (_, params) => {
+export const handleSessionStats: Handler<"session.stats"> = async ({
+  params,
+}) => {
   if (!params?.sessionKey) {
     throw new RpcError(400, "sessionKey required");
   }
@@ -46,7 +52,9 @@ export const handleSessionStats: Handler<"session.stats"> = async (_, params) =>
   return await sessionStub.stats();
 };
 
-export const handleSessionReset: Handler<"session.reset"> = async (_, params) => {
+export const handleSessionReset: Handler<"session.reset"> = async ({
+  params,
+}) => {
   if (!params?.sessionKey) {
     throw new RpcError(400, "sessionKey required");
   }
@@ -56,7 +64,9 @@ export const handleSessionReset: Handler<"session.reset"> = async (_, params) =>
   return await sessionStub.reset();
 };
 
-export const handleSessionHistory: Handler<"session.history"> = async (_, params) => {
+export const handleSessionHistory: Handler<"session.history"> = async ({
+  params,
+}) => {
   if (!params?.sessionKey) {
     throw new RpcError(400, "sessionKey required");
   }
@@ -66,7 +76,9 @@ export const handleSessionHistory: Handler<"session.history"> = async (_, params
   return await sessionStub.history();
 };
 
-export const handleSessionPreview: Handler<"session.preview"> = async (_, params) => {
+export const handleSessionPreview: Handler<"session.preview"> = async ({
+  params,
+}) => {
   if (!params?.sessionKey) {
     throw new RpcError(400, "sessionKey required");
   }
@@ -76,7 +88,10 @@ export const handleSessionPreview: Handler<"session.preview"> = async (_, params
   return await sessionStub.preview(params.limit);
 };
 
-export const handleSessionsList: Handler<"sessions.list"> = (gw, params) => {
+export const handleSessionsList: Handler<"sessions.list"> = ({
+  gw,
+  params,
+}) => {
   const limit = params?.limit ?? 100;
   const offset = params?.offset ?? 0;
 

@@ -1,18 +1,12 @@
 import { DurableObject, env } from "cloudflare:workers";
 import { PersistedObject } from "../shared/persisted-object";
-import {
+import type {
   Frame,
   EventFrame,
   ErrorShape,
+  RequestFrame,
   ResponseFrame,
 } from "../protocol/frames";
-import {
-  ToolDefinition,
-  ToolRequestParams,
-  ToolInvokePayload,
-  ChatEventPayload,
-  SessionRegistryEntry,
-} from "../types";
 import type {
   ChannelWorkerInterface,
   ChannelOutboundMessage,
@@ -62,6 +56,7 @@ import {
 import { processMediaWithTranscription } from "../transcription";
 import { processInboundMedia } from "../storage/media";
 import { getWorkspaceToolDefinitions } from "../workspace/tools";
+import type { ChatEventPayload } from "../protocol/chat";
 import type {
   ChannelRegistryEntry,
   ChannelId,
@@ -70,17 +65,34 @@ import type {
   ChannelOutboundPayload,
   ChannelTypingPayload,
 } from "../protocol/channel";
-import { Handler, RpcMethod } from "../protocol/methods";
-import { buildRpcHandlers } from "./rpc-handlers/";
+import type { SessionRegistryEntry } from "../protocol/session";
+import type {
+  ToolDefinition,
+  ToolInvokePayload,
+  ToolRequestParams,
+} from "../protocol/tools";
 import {
   DEFER_RESPONSE,
-  buildTransportHandlers,
-  type TransportMethod,
-} from "./transport-handlers";
+  type DeferredResponse,
+  type Handler,
+  type RpcMethod,
+} from "../protocol/methods";
+import { buildRpcHandlers } from "./rpc-handlers/";
 
 export type PendingToolRoute =
   | { kind: "session"; sessionKey: string }
   | { kind: "client"; clientId: string; frameId: string; createdAt: number };
+
+type GatewayMethodHandlerContext = {
+  gw: Gateway;
+  ws: WebSocket;
+  frame: RequestFrame;
+  params: unknown;
+};
+
+type GatewayMethodHandler = (
+  ctx: GatewayMethodHandlerContext,
+) => Promise<unknown | DeferredResponse> | unknown | DeferredResponse;
 
 export class Gateway extends DurableObject<Env> {
   clients: Map<string, WebSocket> = new Map();
@@ -143,9 +155,7 @@ export class Gateway extends DurableObject<Env> {
     { prefix: "heartbeatScheduler:", defaults: { initialized: false } },
   );
 
-  private readonly transportHandlers = buildTransportHandlers();
-
-  private readonly rpcHandlers = buildRpcHandlers();
+  private readonly handlers = buildRpcHandlers();
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -228,44 +238,36 @@ export class Gateway extends DurableObject<Env> {
       return;
     }
 
-    if (this.isTransportMethod(frame.method)) {
-      try {
-        const payload = await this.transportHandlers[frame.method]({
-          ws,
-          frame,
-          gateway: this,
-        });
-        if (payload !== DEFER_RESPONSE) {
-          this.sendOk(ws, frame.id, payload);
-        }
-      } catch (error) {
-        this.sendErrorShape(ws, frame.id, toErrorShape(error));
-      }
+    const methodHandler = this.getMethodHandler(frame.method);
+    if (!methodHandler) {
+      this.sendError(ws, frame.id, 404, `Unknown method: ${frame.method}`);
       return;
     }
 
-    const rpcHandler = this.rpcHandlers[frame.method as RpcMethod] as
-      | Handler<RpcMethod>
-      | undefined;
-    if (rpcHandler) {
-      try {
-        const payload = await rpcHandler(this, frame.params as never);
+    try {
+      const payload = await methodHandler({
+        gw: this,
+        ws,
+        frame,
+        params: frame.params,
+      });
+      if (payload !== DEFER_RESPONSE) {
         this.sendOk(ws, frame.id, payload);
-      } catch (error) {
-        this.sendErrorShape(ws, frame.id, toErrorShape(error));
       }
-      return;
+    } catch (error) {
+      this.sendErrorShape(ws, frame.id, toErrorShape(error));
     }
-
-    this.sendError(ws, frame.id, 404, `Unknown method: ${frame.method}`);
   }
 
-  private isTransportMethod(method: string): method is TransportMethod {
-    return (
-      method === "connect" ||
-      method === "tool.invoke" ||
-      method === "tool.result"
-    );
+  private getMethodHandler(method: string): GatewayMethodHandler | undefined {
+    const handler = this.handlers[method as RpcMethod] as
+      | Handler<RpcMethod>
+      | undefined;
+    if (!handler) {
+      return undefined;
+    }
+
+    return handler as unknown as GatewayMethodHandler;
   }
 
   /**
@@ -1546,7 +1548,7 @@ export class Gateway extends DurableObject<Env> {
       };
     }
 
-    const config = await this.getConfig();
+    const config = this.getConfig();
 
     // Check allowlist
     const senderId = params.sender?.id ?? params.peer.id;
