@@ -82,6 +82,22 @@ export interface SessionConfig {
   identityLinks: Record<string, string[]>;
 }
 
+export interface SkillRequirementsConfig {
+  hostRoles?: string[];
+  capabilities?: string[];
+  anyCapabilities?: string[];
+}
+
+export interface SkillEntryConfig {
+  enabled?: boolean;
+  always?: boolean;
+  requires?: SkillRequirementsConfig;
+}
+
+export interface SkillsConfig {
+  entries: Record<string, SkillEntryConfig>;
+}
+
 export interface AgentsConfig {
   // List of agent configurations
   list: AgentConfig[];
@@ -129,6 +145,9 @@ export interface GsvConfig {
   
   // Session configuration (identity links, scoping)
   session: SessionConfig;
+
+  // Skill availability and runtime eligibility overrides
+  skills: SkillsConfig;
   
   // Multi-agent configuration
   agents: AgentsConfig;
@@ -145,6 +164,9 @@ export type GsvConfigInput = {
   systemPrompt?: string;
   session?: {
     identityLinks?: Record<string, string[]>;
+  };
+  skills?: {
+    entries?: Record<string, SkillEntryConfig>;
   };
   agents?: {
     list?: AgentConfig[];

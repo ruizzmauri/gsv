@@ -150,6 +150,111 @@ describe("buildSystemPromptFromWorkspace", () => {
     );
   });
 
+  it("filters skills by config entries policy", () => {
+    const tools: ToolDefinition[] = [
+      {
+        name: "gsv__ReadFile",
+        description: "Read files from workspace",
+        inputSchema: { type: "object" },
+      },
+    ];
+
+    const workspace: AgentWorkspace = {
+      agentId: "main",
+      skills: [
+        {
+          name: "exec-skill",
+          description: "Execution skill",
+          location: "skills/exec-skill/SKILL.md",
+        },
+        {
+          name: "ios-skill",
+          description: "iOS skill",
+          location: "skills/ios-skill/SKILL.md",
+        },
+      ],
+    };
+
+    const prompt = buildSystemPromptFromWorkspace("Base", workspace, {
+      tools,
+      skillEntries: {
+        "ios-skill": { enabled: false },
+      },
+    });
+
+    expect(prompt).toContain('<skill name="exec-skill">');
+    expect(prompt).not.toContain('<skill name="ios-skill">');
+    expect(prompt).toContain(
+      "Config filter: 1 skill(s) hidden by skills.entries policy.",
+    );
+  });
+
+  it("applies config requirement overrides for skill eligibility", () => {
+    const tools: ToolDefinition[] = [
+      {
+        name: "gsv__ReadFile",
+        description: "Read files from workspace",
+        inputSchema: { type: "object" },
+      },
+    ];
+
+    const workspace: AgentWorkspace = {
+      agentId: "main",
+      skills: [
+        {
+          name: "search-skill",
+          description: "Originally requires specialized host",
+          location: "skills/search-skill/SKILL.md",
+          metadata: {
+            gsv: {
+              requires: {
+                hostRoles: ["specialized"],
+                capabilities: ["text.search"],
+              },
+            },
+          },
+        },
+      ],
+    };
+
+    const prompt = buildSystemPromptFromWorkspace("Base", workspace, {
+      tools,
+      skillEntries: {
+        "search-skill": {
+          requires: {
+            hostRoles: ["execution"],
+            capabilities: ["shell.exec"],
+          },
+        },
+      },
+      runtime: {
+        agentId: "main",
+        isMainSession: true,
+        nodes: {
+          executionHostId: "exec-1",
+          specializedHostIds: [],
+          hosts: [
+            {
+              nodeId: "exec-1",
+              hostRole: "execution",
+              hostCapabilities: [
+                "filesystem.list",
+                "filesystem.read",
+                "filesystem.write",
+                "shell.exec",
+              ],
+              toolCapabilities: {},
+              tools: ["Bash"],
+            },
+          ],
+        },
+      },
+    });
+
+    expect(prompt).toContain('<skill name="search-skill">');
+    expect(prompt).not.toContain("Runtime filter:");
+  });
+
   it("includes heartbeat guidance from config and HEARTBEAT.md", () => {
     const nodes: RuntimeNodeInventory = {
       executionHostId: "exec-node-1",

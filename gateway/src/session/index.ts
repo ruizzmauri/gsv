@@ -1204,6 +1204,7 @@ export class Session extends DurableObject<Env> {
     return buildSystemPromptFromWorkspace(basePrompt, workspace, {
       tools: runTools,
       heartbeatPrompt,
+      skillEntries: config.skills.entries,
       runtime: {
         agentId,
         sessionKey: this.meta.sessionKey,

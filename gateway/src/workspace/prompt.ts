@@ -6,6 +6,7 @@ import {
   RuntimeNodeInventory,
   ToolDefinition,
 } from "../protocol/tools";
+import type { SkillEntryConfig } from "../config";
 import type { SkillSummary } from "../skills";
 import { isHeartbeatFileEmpty, type AgentWorkspace } from "./loader";
 
@@ -23,6 +24,7 @@ export type PromptRuntimeInfo = {
 export type BuildPromptOptions = {
   tools?: ToolDefinition[];
   heartbeatPrompt?: string;
+  skillEntries?: Record<string, SkillEntryConfig>;
   runtime?: PromptRuntimeInfo;
 };
 
@@ -168,6 +170,7 @@ export function buildSystemPromptFromWorkspace(
     const skillsSection = buildSkillsSection(workspace.skills, {
       agentId: workspace.agentId,
       readToolName,
+      skillEntries: options?.skillEntries,
       runtimeNodes: options?.runtime?.nodes,
     });
     if (skillsSection) {
@@ -373,6 +376,16 @@ function resolveSkillReadPath(location: string, agentId: string): string | null 
 
 const CAPABILITY_SET = new Set<string>(CAPABILITY_IDS);
 const HOST_ROLE_SET = new Set<string>(HOST_ROLES);
+type SkillRuntimeRequirements = {
+  hostRoles: HostRole[];
+  capabilities: CapabilityId[];
+  anyCapabilities: CapabilityId[];
+};
+
+type EffectiveSkillPolicy = {
+  always: boolean;
+  requires?: SkillRuntimeRequirements;
+};
 
 function normalizeStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) {
@@ -397,34 +410,103 @@ function normalizeHostRoleRequirementList(value: unknown): HostRole[] {
   return Array.from(new Set(roles));
 }
 
-function isSkillEligibleForRuntime(
+function resolveSkillKeyFromLocation(location: string): string | undefined {
+  if (!location.endsWith("/SKILL.md")) {
+    return undefined;
+  }
+
+  const trimmed = location.slice(0, -"/SKILL.md".length);
+  const idx = trimmed.lastIndexOf("/");
+  if (idx < 0) {
+    return undefined;
+  }
+  const key = trimmed.slice(idx + 1).trim();
+  return key.length > 0 ? key : undefined;
+}
+
+function resolveSkillEntryConfig(
   skill: SkillSummary,
-  runtimeNodes: RuntimeNodeInventory | undefined,
-): boolean {
-  if (skill.always) {
-    return true;
+  skillEntries: Record<string, SkillEntryConfig> | undefined,
+): SkillEntryConfig | undefined {
+  if (!skillEntries) {
+    return undefined;
   }
 
-  const requires = skill.metadata?.gsv?.requires;
-  if (!requires) {
-    return true;
+  const locationKey = resolveSkillKeyFromLocation(skill.location);
+  const candidates = [skill.name, locationKey, skill.location].filter(
+    (candidate): candidate is string =>
+      typeof candidate === "string" && candidate.trim().length > 0,
+  );
+  const seen = new Set<string>();
+
+  for (const candidate of candidates) {
+    if (seen.has(candidate)) {
+      continue;
+    }
+    seen.add(candidate);
+    if (Object.prototype.hasOwnProperty.call(skillEntries, candidate)) {
+      return skillEntries[candidate];
+    }
   }
 
+  return undefined;
+}
+
+function resolveEffectiveSkillPolicy(
+  skill: SkillSummary,
+  skillEntries: Record<string, SkillEntryConfig> | undefined,
+): EffectiveSkillPolicy | undefined {
+  const entryConfig = resolveSkillEntryConfig(skill, skillEntries);
+  if (entryConfig?.enabled === false) {
+    return undefined;
+  }
+
+  const rawRequires = skill.metadata?.gsv?.requires as
+    | Record<string, unknown>
+    | undefined;
+  const configRequires = entryConfig?.requires as
+    | Record<string, unknown>
+    | undefined;
   const requiredRoles = normalizeHostRoleRequirementList(
-    (requires as Record<string, unknown>).hostRoles,
+    configRequires?.hostRoles ?? rawRequires?.hostRoles,
   );
   const requiredCapabilities = normalizeCapabilityRequirementList(
-    (requires as Record<string, unknown>).capabilities,
+    configRequires?.capabilities ?? rawRequires?.capabilities,
   );
   const requiredAnyCapabilities = normalizeCapabilityRequirementList(
-    (requires as Record<string, unknown>).anyCapabilities,
+    configRequires?.anyCapabilities ?? rawRequires?.anyCapabilities,
   );
+  const always =
+    typeof entryConfig?.always === "boolean"
+      ? entryConfig.always
+      : skill.always === true;
+  const hasRequirements =
+    requiredRoles.length > 0 ||
+    requiredCapabilities.length > 0 ||
+    requiredAnyCapabilities.length > 0;
 
-  if (
-    requiredRoles.length === 0 &&
-    requiredCapabilities.length === 0 &&
-    requiredAnyCapabilities.length === 0
-  ) {
+  return {
+    always,
+    requires: hasRequirements
+      ? {
+          hostRoles: requiredRoles,
+          capabilities: requiredCapabilities,
+          anyCapabilities: requiredAnyCapabilities,
+        }
+      : undefined,
+  };
+}
+
+function isSkillEligibleForRuntime(
+  policy: EffectiveSkillPolicy,
+  runtimeNodes: RuntimeNodeInventory | undefined,
+): boolean {
+  if (policy.always) {
+    return true;
+  }
+
+  const requires = policy.requires;
+  if (!requires) {
     return true;
   }
 
@@ -433,9 +515,9 @@ function isSkillEligibleForRuntime(
   }
 
   let candidateHosts = runtimeNodes.hosts;
-  if (requiredRoles.length > 0) {
+  if (requires.hostRoles.length > 0) {
     candidateHosts = candidateHosts.filter((host) =>
-      requiredRoles.includes(host.hostRole),
+      requires.hostRoles.includes(host.hostRole),
     );
   }
 
@@ -443,9 +525,9 @@ function isSkillEligibleForRuntime(
     return false;
   }
 
-  if (requiredCapabilities.length > 0) {
+  if (requires.capabilities.length > 0) {
     const hasRequiredCapabilities = candidateHosts.some((host) =>
-      requiredCapabilities.every((capability) =>
+      requires.capabilities.every((capability) =>
         host.hostCapabilities.includes(capability),
       ),
     );
@@ -454,9 +536,9 @@ function isSkillEligibleForRuntime(
     }
   }
 
-  if (requiredAnyCapabilities.length > 0) {
+  if (requires.anyCapabilities.length > 0) {
     const hasAnyCapability = candidateHosts.some((host) =>
-      requiredAnyCapabilities.some((capability) =>
+      requires.anyCapabilities.some((capability) =>
         host.hostCapabilities.includes(capability),
       ),
     );
@@ -477,6 +559,7 @@ function buildSkillsSection(
   options: {
     agentId: string;
     readToolName: string;
+    skillEntries?: Record<string, SkillEntryConfig>;
     runtimeNodes?: RuntimeNodeInventory;
   },
 ): string {
@@ -494,15 +577,31 @@ function buildSkillsSection(
       } => entry.readPath !== null,
     );
 
-  const eligibleSkills = readableSkills.filter((entry) =>
-    isSkillEligibleForRuntime(entry.skill, options.runtimeNodes),
+  const configEligibleSkills = readableSkills
+    .map((entry) => ({
+      ...entry,
+      policy: resolveEffectiveSkillPolicy(entry.skill, options.skillEntries),
+    }))
+    .filter(
+      (
+        entry,
+      ): entry is {
+        skill: SkillSummary;
+        readPath: string;
+        policy: EffectiveSkillPolicy;
+      } => entry.policy !== undefined,
+    );
+
+  const eligibleSkills = configEligibleSkills.filter((entry) =>
+    isSkillEligibleForRuntime(entry.policy, options.runtimeNodes),
   );
 
   if (eligibleSkills.length === 0) {
     return "";
   }
 
-  const filteredCount = readableSkills.length - eligibleSkills.length;
+  const configFilteredCount = readableSkills.length - configEligibleSkills.length;
+  const runtimeFilteredCount = configEligibleSkills.length - eligibleSkills.length;
 
   const lines = [
     "## Skills (Mandatory Scan)",
@@ -512,18 +611,23 @@ function buildSkillsSection(
     "- If multiple skills could apply: choose the single most specific skill first.",
     "- If none clearly apply: do not load a skill.",
     "Constraints: read at most one skill up front; only read after selecting.",
-    ...(filteredCount > 0
+    ...(configFilteredCount > 0
       ? [
-          `Runtime filter: ${filteredCount} skill(s) hidden due unmet runtime capability requirements.`,
+          `Config filter: ${configFilteredCount} skill(s) hidden by skills.entries policy.`,
+        ]
+      : []),
+    ...(runtimeFilteredCount > 0
+      ? [
+          `Runtime filter: ${runtimeFilteredCount} skill(s) hidden due unmet runtime capability requirements.`,
         ]
       : []),
     "",
     "<available_skills>",
   ];
 
-  for (const { skill, readPath } of eligibleSkills) {
+  for (const { skill, readPath, policy } of eligibleSkills) {
     lines.push(
-      `  <skill name="${skill.name}"${skill.always ? ' always="true"' : ""}>`,
+      `  <skill name="${skill.name}"${policy.always ? ' always="true"' : ""}>`,
     );
     lines.push(`    <description>${skill.description}</description>`);
     lines.push(`    <location>${skill.location}</location>`);
