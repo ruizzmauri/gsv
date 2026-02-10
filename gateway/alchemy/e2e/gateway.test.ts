@@ -207,65 +207,44 @@ function waitForRunTerminalState(
   });
 }
 
-function readPathFromToolArguments(value: unknown): string | undefined {
-  if (typeof value === "object" && value !== null) {
-    const path = (value as { path?: unknown }).path;
-    return typeof path === "string" ? path : undefined;
-  }
-
-  if (typeof value !== "string") {
-    return undefined;
-  }
-
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    if (typeof parsed === "object" && parsed !== null) {
-      const path = (parsed as { path?: unknown }).path;
-      return typeof path === "string" ? path : undefined;
-    }
-  } catch {
-    // Ignore parse errors
-  }
-
-  return undefined;
-}
-
-function hasSkillReadToolCall(messages: unknown[], skillReadPath: string): boolean {
-  for (const message of messages) {
+function extractLatestAssistantText(messages: unknown[]): string {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
     if (typeof message !== "object" || message === null) {
       continue;
     }
 
+    const role = (message as { role?: unknown }).role;
+    if (role !== "assistant") {
+      continue;
+    }
+
     const content = (message as { content?: unknown }).content;
+    if (typeof content === "string") {
+      return content;
+    }
     if (!Array.isArray(content)) {
       continue;
     }
 
-    for (const block of content) {
-      if (typeof block !== "object" || block === null) {
-        continue;
-      }
+    const text = content
+      .filter(
+        (block): block is { type: string; text?: string } =>
+          typeof block === "object" &&
+          block !== null &&
+          typeof (block as { type?: unknown }).type === "string",
+      )
+      .filter((block) => block.type === "text")
+      .map((block) => block.text ?? "")
+      .join("")
+      .trim();
 
-      const type = (block as { type?: unknown }).type;
-      if (type !== "toolCall") {
-        continue;
-      }
-
-      const toolName = (block as { name?: unknown }).name;
-      if (typeof toolName !== "string" || toolName.toLowerCase() !== "gsv__readfile") {
-        continue;
-      }
-
-      const readPath = readPathFromToolArguments(
-        (block as { arguments?: unknown }).arguments,
-      );
-      if (readPath === skillReadPath) {
-        return true;
-      }
+    if (text.length > 0) {
+      return text;
     }
   }
 
-  return false;
+  return "";
 }
 
 // ============================================================================
@@ -894,12 +873,12 @@ describe("Skills Config Runtime Visibility", () => {
         value: { provider: "openai", id: "gpt-4o-mini" },
       });
 
+      const proofToken = "gsv-e2e-proof-token-4219";
       const promptMessage =
-        "What command starts the R2 workspace mount in gsv CLI? Keep it short.";
-      const skillPath = "skills/gsv-cli/SKILL.md";
+        "E2E SKILL PROOF: reply with the proof token only. If a matching skill is available, use it.";
 
       await sendRequest(controlWs, "config.set", {
-        path: "skills.entries.gsv-cli",
+        path: "skills.entries.e2e-proof",
         value: { enabled: false },
       });
 
@@ -926,13 +905,11 @@ describe("Skills Config Runtime Visibility", () => {
         sessionKey: disabledSessionKey,
         limit: 40,
       }) as { messages: unknown[] };
-
-      expect(
-        hasSkillReadToolCall(disabledPreview.messages, skillPath),
-      ).toBe(false);
+      const disabledText = extractLatestAssistantText(disabledPreview.messages);
+      expect(disabledText).not.toContain(proofToken);
 
       await sendRequest(controlWs, "config.set", {
-        path: "skills.entries.gsv-cli",
+        path: "skills.entries.e2e-proof",
         value: { enabled: true },
       });
 
@@ -959,12 +936,12 @@ describe("Skills Config Runtime Visibility", () => {
         sessionKey: enabledSessionKey,
         limit: 40,
       }) as { messages: unknown[] };
-
-      expect(hasSkillReadToolCall(enabledPreview.messages, skillPath)).toBe(true);
+      const enabledText = extractLatestAssistantText(enabledPreview.messages);
+      expect(enabledText).toContain(proofToken);
 
       // Restore explicit default for later tests in this process.
       await sendRequest(controlWs, "config.set", {
-        path: "skills.entries.gsv-cli",
+        path: "skills.entries.e2e-proof",
         value: { enabled: true },
       });
 

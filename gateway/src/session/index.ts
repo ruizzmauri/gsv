@@ -1166,12 +1166,9 @@ export class Session extends DurableObject<Env> {
         JSON.stringify(this.currentRun.skillsSnapshot),
       ) as SkillSummary[];
     } else if (workspace.skills && this.currentRun) {
-      this.currentRun = {
-        ...this.currentRun,
-        skillsSnapshot: JSON.parse(
-          JSON.stringify(workspace.skills),
-        ) as SkillSummary[],
-      };
+      this.currentRun.skillsSnapshot = JSON.parse(
+        JSON.stringify(workspace.skills),
+      ) as SkillSummary[];
     }
 
     // Log what was loaded
@@ -1406,10 +1403,7 @@ export class Session extends DurableObject<Env> {
     const pendingToolsCancelled = Object.keys(this.pendingToolCalls).length;
 
     // Mark the run as aborted
-    this.currentRun = {
-      ...this.currentRun,
-      aborted: true,
-    };
+    this.currentRun.aborted = true;
 
     // Clear pending tool calls
     for (const callId of Object.keys(this.pendingToolCalls)) {
