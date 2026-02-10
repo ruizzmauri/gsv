@@ -181,7 +181,7 @@ export async function runWizard(options: WizardOptions = {}): Promise<WizardStat
   // Final summary
   const nextSteps: string[] = [
     `${pc.cyan("gsv client")} - Start chatting`,
-    `${pc.cyan("gsv node --id mypc")} - Connect a tool node`,
+    `${pc.cyan("gsv node install --id mypc --workspace ~/projects")} - Connect a tool node daemon`,
   ];
   
   if (state.channels.whatsapp) {

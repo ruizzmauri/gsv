@@ -25,6 +25,10 @@ pub struct CliConfig {
     #[serde(default)]
     pub r2: R2Config,
 
+    /// Node defaults (for `gsv node` and daemon service)
+    #[serde(default)]
+    pub node: NodeConfig,
+
     /// Default session settings
     #[serde(default)]
     pub session: SessionConfig,
@@ -81,6 +85,15 @@ pub struct R2Config {
 
     /// R2 bucket name
     pub bucket: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct NodeConfig {
+    /// Node ID (namespace prefix for tools)
+    pub id: Option<String>,
+
+    /// Workspace directory for file tools
+    pub workspace: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -164,6 +177,16 @@ impl CliConfig {
         normalize_session_key(raw)
     }
 
+    /// Get default node ID (if configured)
+    pub fn default_node_id(&self) -> Option<String> {
+        self.node.id.clone()
+    }
+
+    /// Get default node workspace (if configured)
+    pub fn default_node_workspace(&self) -> Option<PathBuf> {
+        self.node.workspace.clone()
+    }
+
     /// Get the GSV home directory (~/.gsv)
     pub fn gsv_home(&self) -> PathBuf {
         dirs::home_dir()
@@ -217,6 +240,11 @@ token = "your-token-here"
 [session]
 # Default session key
 default_key = "agent:main:cli:dm:main"
+
+[node]
+# Optional defaults used by 'gsv node'
+# id = "node-macbook"
+# workspace = "/Users/you/projects"
 
 [channels.whatsapp]
 # WhatsApp channel worker URL

@@ -38,8 +38,20 @@ gsv client "Hello, what can you help me with?"
 Nodes give GSV tools to interact with your machines:
 
 ```bash
-gsv node --id macbook --workspace ~/projects
+# Recommended: install node as a background service
+gsv node install --id macbook --workspace ~/projects
+
+# Check status/logs
+gsv node status
+gsv node logs --follow
+
+# Foreground mode (manual, useful for debugging)
+gsv node --foreground --id macbook --workspace ~/projects
 ```
+
+Node logs are structured JSON at `~/.gsv/logs/node.log` with app-side rotation
+(default: 10MB, 5 files). Override with `GSV_NODE_LOG_MAX_BYTES` and
+`GSV_NODE_LOG_MAX_FILES`.
 
 Now GSV can run bash commands, read/write files, and search code on your laptop.
 
@@ -144,7 +156,10 @@ vim ~/.gsv/r2/agents/main/SOUL.md
 ```bash
 # Core
 gsv client [MESSAGE]                  # Chat (interactive if no message)
-gsv node --id ID --workspace DIR      # Run as tool-providing node
+gsv node install --id ID --workspace DIR      # Install/start node daemon
+gsv node start|stop|status                    # Manage node daemon
+gsv node logs --follow                        # Service logs
+gsv node --foreground --id ID --workspace DIR # Run node in foreground
 
 # Sessions
 gsv session list                      # List sessions

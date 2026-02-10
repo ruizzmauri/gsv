@@ -24,6 +24,7 @@ import {
   handleToolInvoke,
   handleToolResult,
 } from "./tools";
+import { handleLogsGet, handleLogsResult } from "./logs";
 import { handlePairList, handlePairApprove, handlePairReject } from "./pairing";
 import { handleChatSend } from "./chat";
 import {
@@ -40,6 +41,8 @@ export function buildRpcHandlers(): Partial<{ [M in RpcMethod]: Handler<M> }> {
     "tool.invoke": handleToolInvoke,
     "tool.result": handleToolResult,
     "tools.list": handleToolsList,
+    "logs.get": handleLogsGet,
+    "logs.result": handleLogsResult,
     "session.get": handleSessionGet,
     "session.reset": handleSessionReset,
     "session.stats": handleSessionStats,

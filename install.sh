@@ -421,7 +421,7 @@ main() {
         echo ""
         echo "  Next steps:"
         echo "    gsv client \"Hello!\"     # Start chatting"
-        echo "    gsv node                 # Run tool-providing node"
+        echo "    gsv node install --id mypc --workspace ~/projects   # Run tool node daemon"
         echo ""
     else
         echo "  CLI installed. Configure with:"

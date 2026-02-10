@@ -1,13 +1,16 @@
 use clap::{Parser, Subcommand};
 use gsv::config::{self, CliConfig};
 use gsv::connection::Connection;
-use gsv::protocol::{Frame, ToolInvokePayload, ToolResultParams};
+use gsv::protocol::{Frame, LogsGetPayload, LogsResultParams, ToolInvokePayload, ToolResultParams};
 use gsv::tools::{all_tools_with_workspace, Tool};
 use serde_json::json;
+use std::collections::VecDeque;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 #[derive(Parser)]
 #[command(
@@ -49,13 +52,21 @@ enum Commands {
 
     /// Run as a tool-providing node
     Node {
+        /// Run in foreground (default: managed daemon/service mode)
+        #[arg(long)]
+        foreground: bool,
+
         /// Node ID (default: hostname) - used as namespace prefix for tools
         #[arg(long)]
         id: Option<String>,
 
-        /// Workspace directory for file tools (default: current directory)
+        /// Workspace directory for file tools (default: config, else current directory)
         #[arg(long)]
         workspace: Option<PathBuf>,
+
+        /// Optional daemon management action (install/start/stop/status/logs)
+        #[command(subcommand)]
+        action: Option<NodeAction>,
     },
 
     /// Get or set gateway configuration (remote)
@@ -256,6 +267,43 @@ enum MountAction {
 }
 
 #[derive(Subcommand)]
+enum NodeAction {
+    /// Install and start node daemon service
+    Install {
+        /// Node ID (saved to local config during install)
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Workspace directory (saved to local config during install)
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+
+    /// Uninstall and stop node daemon service
+    Uninstall,
+
+    /// Start node daemon service
+    Start,
+
+    /// Stop node daemon service
+    Stop,
+
+    /// Show node daemon service status
+    Status,
+
+    /// Show node daemon service logs
+    Logs {
+        /// Number of lines to show
+        #[arg(short, long, default_value = "100")]
+        lines: usize,
+
+        /// Follow logs
+        #[arg(long)]
+        follow: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ToolsAction {
     /// List available tools from connected nodes
     List,
@@ -391,9 +439,15 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Load config from file
     let cfg = CliConfig::load();
 
+    // Keep explicit CLI overrides so managed node mode can persist them.
+    let cli_url_override = cli.url.clone();
+    let cli_token_override = cli.token.clone();
+
     // Merge CLI args with config (CLI takes precedence)
-    let url = cli.url.unwrap_or_else(|| cfg.gateway_url());
-    let token = cli.token.or_else(|| cfg.gateway_token());
+    let url = cli_url_override
+        .clone()
+        .unwrap_or_else(|| cfg.gateway_url());
+    let token = cli_token_override.clone().or_else(|| cfg.gateway_token());
 
     match cli.command {
         Commands::Init { force } => run_init(force),
@@ -402,10 +456,37 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             let session = config::normalize_session_key(&session);
             run_client(&url, token, message, &session).await
         }
-        Commands::Node { id, workspace } => {
-            let workspace =
-                workspace.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            run_node(&url, token, id, workspace).await
+        Commands::Node {
+            foreground,
+            id,
+            workspace,
+            action,
+        } => {
+            if let Some(action) = action {
+                if foreground {
+                    return Err(
+                        "--foreground cannot be combined with node management subcommands".into(),
+                    );
+                }
+                run_node_service(
+                    action,
+                    &cfg,
+                    cli_url_override.as_deref(),
+                    cli_token_override.as_deref(),
+                )
+            } else if foreground {
+                let node_id = resolve_node_id(id, &cfg);
+                let workspace = resolve_node_workspace(workspace, &cfg);
+                run_node(&url, token, node_id, workspace).await
+            } else {
+                run_node_default_managed(
+                    &cfg,
+                    id,
+                    workspace,
+                    cli_url_override.as_deref(),
+                    cli_token_override.as_deref(),
+                )
+            }
         }
         Commands::Config { action } => run_config(&url, token, action).await,
         Commands::LocalConfig { action } => run_local_config(action),
@@ -444,6 +525,8 @@ fn run_init(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     println!("\nOr use 'gsv local-config set' to update values:");
     println!("  gsv local-config set gateway.url wss://gateway.example.com/ws");
     println!("  gsv local-config set gateway.token your-secret-token");
+    println!("  gsv local-config set node.id my-node");
+    println!("  gsv local-config set node.workspace /path/to/workspace");
 
     Ok(())
 }
@@ -478,12 +561,15 @@ fn run_local_config(action: LocalConfigAction) -> Result<(), Box<dyn std::error:
                 }),
                 "r2.bucket" => cfg.r2.bucket,
                 "session.default_key" => cfg.session.default_key,
+                "node.id" => cfg.node.id,
+                "node.workspace" => cfg.node.workspace.map(|path| path.display().to_string()),
                 _ => {
                     eprintln!("Unknown config key: {}", key);
                     eprintln!("\nValid keys:");
                     eprintln!("  gateway.url, gateway.token");
                     eprintln!("  r2.account_id, r2.access_key_id, r2.bucket");
                     eprintln!("  session.default_key");
+                    eprintln!("  node.id, node.workspace");
                     return Ok(());
                 }
             };
@@ -507,6 +593,8 @@ fn run_local_config(action: LocalConfigAction) -> Result<(), Box<dyn std::error:
                 "session.default_key" => {
                     cfg.session.default_key = Some(config::normalize_session_key(&value))
                 }
+                "node.id" => cfg.node.id = Some(value.clone()),
+                "node.workspace" => cfg.node.workspace = Some(PathBuf::from(value.clone())),
                 "channels.whatsapp.url" => cfg.channels.whatsapp.url = Some(value.clone()),
                 "channels.whatsapp.token" => cfg.channels.whatsapp.token = Some(value.clone()),
                 _ => {
@@ -546,6 +634,856 @@ fn run_local_config(action: LocalConfigAction) -> Result<(), Box<dyn std::error:
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const NODE_SYSTEMD_UNIT_NAME: &str = "gsv-node.service";
+#[cfg(target_os = "macos")]
+const NODE_LAUNCHD_LABEL: &str = "dev.gsv.node";
+
+const DEFAULT_NODE_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const DEFAULT_NODE_LOG_MAX_FILES: usize = 5;
+
+fn node_log_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    Ok(home.join(".gsv").join("logs").join("node.log"))
+}
+
+fn parse_env_u64(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+}
+
+fn parse_env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+}
+
+fn node_log_max_bytes() -> u64 {
+    parse_env_u64("GSV_NODE_LOG_MAX_BYTES").unwrap_or(DEFAULT_NODE_LOG_MAX_BYTES)
+}
+
+fn node_log_max_files() -> usize {
+    parse_env_usize("GSV_NODE_LOG_MAX_FILES").unwrap_or(DEFAULT_NODE_LOG_MAX_FILES)
+}
+
+fn rotated_log_path(base: &PathBuf, index: usize) -> PathBuf {
+    PathBuf::from(format!("{}.{}", base.to_string_lossy(), index))
+}
+
+#[derive(Clone)]
+struct NodeLogger {
+    inner: Arc<Mutex<NodeLoggerInner>>,
+    node_id: String,
+    workspace: String,
+}
+
+struct NodeLoggerInner {
+    path: PathBuf,
+    file: fs::File,
+    current_size: u64,
+    max_bytes: u64,
+    max_files: usize,
+}
+
+impl NodeLoggerInner {
+    fn open(
+        path: &PathBuf,
+        max_bytes: u64,
+        max_files: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let current_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+        Ok(Self {
+            path: path.clone(),
+            file,
+            current_size,
+            max_bytes,
+            max_files: max_files.max(1),
+        })
+    }
+
+    fn rotate_if_needed(&mut self, incoming: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let incoming = incoming as u64;
+        if self.current_size + incoming <= self.max_bytes {
+            return Ok(());
+        }
+
+        self.file.flush()?;
+
+        let oldest = rotated_log_path(&self.path, self.max_files);
+        if oldest.exists() {
+            let _ = fs::remove_file(&oldest);
+        }
+
+        if self.max_files > 1 {
+            for i in (1..self.max_files).rev() {
+                let src = rotated_log_path(&self.path, i);
+                if src.exists() {
+                    let dst = rotated_log_path(&self.path, i + 1);
+                    let _ = fs::rename(&src, &dst);
+                }
+            }
+        }
+
+        if self.path.exists() {
+            let _ = fs::rename(&self.path, rotated_log_path(&self.path, 1));
+        }
+
+        self.file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)?;
+        self.current_size = 0;
+
+        Ok(())
+    }
+
+    fn write_line(&mut self, line: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let incoming = line.len() + 1;
+        self.rotate_if_needed(incoming)?;
+        self.file.write_all(line.as_bytes())?;
+        self.file.write_all(b"\n")?;
+        self.file.flush()?;
+        self.current_size += incoming as u64;
+        Ok(())
+    }
+}
+
+impl NodeLogger {
+    fn new(node_id: &str, workspace: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        let path = node_log_path()?;
+        let inner = NodeLoggerInner::open(&path, node_log_max_bytes(), node_log_max_files())?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(inner)),
+            node_id: node_id.to_string(),
+            workspace: workspace.display().to_string(),
+        })
+    }
+
+    fn info(&self, event: &str, fields: serde_json::Value) {
+        self.log("INFO", event, fields);
+    }
+
+    fn warn(&self, event: &str, fields: serde_json::Value) {
+        self.log("WARN", event, fields);
+    }
+
+    fn error(&self, event: &str, fields: serde_json::Value) {
+        self.log("ERROR", event, fields);
+    }
+
+    fn log(&self, level: &str, event: &str, fields: serde_json::Value) {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "ts".to_string(),
+            json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+        );
+        obj.insert("level".to_string(), json!(level));
+        obj.insert("component".to_string(), json!("node"));
+        obj.insert("event".to_string(), json!(event));
+        obj.insert("nodeId".to_string(), json!(self.node_id));
+        obj.insert("workspace".to_string(), json!(self.workspace));
+
+        match fields {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    obj.insert(k, v);
+                }
+            }
+            serde_json::Value::Null => {}
+            other => {
+                obj.insert("data".to_string(), other);
+            }
+        }
+
+        let line = serde_json::Value::Object(obj).to_string();
+
+        if level == "ERROR" {
+            eprintln!("{}", line);
+        } else {
+            println!("{}", line);
+        }
+
+        let mut guard = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                eprintln!("Failed to acquire node log writer lock");
+                return;
+            }
+        };
+
+        if let Err(err) = guard.write_line(&line) {
+            eprintln!("Failed to write node log file: {}", err);
+        }
+    }
+}
+
+fn node_logs_file(lines: usize, follow: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let log_path = node_log_path()?;
+    if !log_path.exists() {
+        return Err(format!("Log file not found: {}", log_path.display()).into());
+    }
+
+    let mut cmd = std::process::Command::new("tail");
+    cmd.arg("-n").arg(lines.to_string());
+    if follow {
+        cmd.arg("-f");
+    }
+    cmd.arg(&log_path);
+
+    run_command_passthrough(&mut cmd, "Failed to read node log file")
+}
+
+const DEFAULT_NODE_LOG_GET_LINES: usize = 100;
+const MAX_NODE_LOG_GET_LINES: usize = 5000;
+
+fn resolve_logs_get_line_limit(lines: Option<usize>) -> usize {
+    lines
+        .unwrap_or(DEFAULT_NODE_LOG_GET_LINES)
+        .max(1)
+        .min(MAX_NODE_LOG_GET_LINES)
+}
+
+fn read_recent_node_log_lines(limit: usize) -> Result<(Vec<String>, bool), String> {
+    let path = node_log_path().map_err(|e| format!("Failed to resolve log path: {}", e))?;
+    let file =
+        fs::File::open(&path).map_err(|e| format!("Failed to open '{}': {}", path.display(), e))?;
+    let reader = io::BufReader::new(file);
+
+    let mut total_lines = 0usize;
+    let mut recent = VecDeque::with_capacity(limit.min(1024));
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("Failed to read '{}': {}", path.display(), e))?;
+        total_lines += 1;
+
+        if recent.len() == limit {
+            recent.pop_front();
+        }
+        recent.push_back(line);
+    }
+
+    let truncated = total_lines > limit;
+    Ok((recent.into_iter().collect(), truncated))
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> &'static str {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("Failed to subscribe to SIGTERM");
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = sigterm.recv() => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> &'static str {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to subscribe to Ctrl+C");
+    "SIGINT"
+}
+
+fn resolve_node_id(cli_node_id: Option<String>, cfg: &CliConfig) -> String {
+    cli_node_id
+        .or_else(|| cfg.default_node_id())
+        .unwrap_or_else(|| {
+            let hostname = hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "unknown".to_string());
+            format!("node-{}", hostname)
+        })
+}
+
+fn resolve_node_workspace(cli_workspace: Option<PathBuf>, cfg: &CliConfig) -> PathBuf {
+    cli_workspace
+        .or_else(|| cfg.default_node_workspace())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn persist_node_defaults(
+    cfg: &CliConfig,
+    node_id: Option<String>,
+    workspace: Option<PathBuf>,
+) -> Result<(String, PathBuf, bool), Box<dyn std::error::Error>> {
+    let node_id = resolve_node_id(node_id, cfg);
+    let workspace = resolve_node_workspace(workspace, cfg);
+    let workspace = workspace.canonicalize().unwrap_or(workspace);
+
+    let mut local_cfg = CliConfig::load();
+    let mut changed = false;
+
+    if local_cfg.node.id.as_deref() != Some(node_id.as_str()) {
+        local_cfg.node.id = Some(node_id.clone());
+        changed = true;
+    }
+
+    if local_cfg.node.workspace.as_ref() != Some(&workspace) {
+        local_cfg.node.workspace = Some(workspace.clone());
+        changed = true;
+    }
+
+    if changed {
+        local_cfg.save()?;
+    }
+
+    Ok((node_id, workspace, changed))
+}
+
+fn persist_gateway_overrides(
+    gateway_url_override: Option<&str>,
+    gateway_token_override: Option<&str>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if gateway_url_override.is_none() && gateway_token_override.is_none() {
+        return Ok(false);
+    }
+
+    let mut local_cfg = CliConfig::load();
+    let mut changed = false;
+
+    if let Some(url) = gateway_url_override {
+        if local_cfg.gateway.url.as_deref() != Some(url) {
+            local_cfg.gateway.url = Some(url.to_string());
+            changed = true;
+        }
+    }
+
+    if let Some(token) = gateway_token_override {
+        if local_cfg.gateway.token.as_deref() != Some(token) {
+            local_cfg.gateway.token = Some(token.to_string());
+            changed = true;
+        }
+    }
+
+    if changed {
+        local_cfg.save()?;
+    }
+
+    Ok(changed)
+}
+
+fn node_service_is_installed() -> Result<bool, Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(systemd_user_unit_path()?.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(launchd_plist_path()?.exists());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err("node daemon management is currently supported on macOS and Linux only".into())
+    }
+}
+
+fn restart_node_service() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    {
+        return systemd_restart_service();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return launchd_start_service();
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err("node daemon management is currently supported on macOS and Linux only".into())
+    }
+}
+
+fn run_node_default_managed(
+    cfg: &CliConfig,
+    node_id: Option<String>,
+    workspace: Option<PathBuf>,
+    gateway_url_override: Option<&str>,
+    gateway_token_override: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if node_service_is_installed()? {
+        let gateway_overrides_changed =
+            persist_gateway_overrides(gateway_url_override, gateway_token_override)?;
+        let (node_id, workspace, node_defaults_changed) =
+            persist_node_defaults(cfg, node_id, workspace)?;
+        if gateway_overrides_changed || node_defaults_changed {
+            restart_node_service()?;
+        } else {
+            run_node_service(NodeAction::Start, cfg, None, None)?;
+        }
+        if gateway_overrides_changed {
+            println!("Saved gateway connection overrides to local config.");
+        }
+        println!(
+            "Using defaults: node.id={}, node.workspace={}",
+            node_id,
+            workspace.display()
+        );
+    } else {
+        run_node_service(
+            NodeAction::Install {
+                id: node_id,
+                workspace,
+            },
+            cfg,
+            gateway_url_override,
+            gateway_token_override,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn run_node_service(
+    action: NodeAction,
+    cfg: &CliConfig,
+    gateway_url_override: Option<&str>,
+    gateway_token_override: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        NodeAction::Install { id, workspace } => {
+            let gateway_overrides_changed =
+                persist_gateway_overrides(gateway_url_override, gateway_token_override)?;
+            let (node_id, workspace, node_defaults_changed) =
+                persist_node_defaults(cfg, id, workspace)?;
+
+            let exe_path = std::env::current_exe()?;
+            let exe_path = exe_path.canonicalize().unwrap_or(exe_path);
+
+            #[cfg(target_os = "linux")]
+            install_systemd_user_service(&exe_path)?;
+
+            #[cfg(target_os = "macos")]
+            install_launchd_user_service(&exe_path)?;
+
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                return Err(
+                    "node daemon management is currently supported on macOS and Linux only".into(),
+                );
+            }
+
+            if gateway_overrides_changed || node_defaults_changed {
+                restart_node_service()?;
+            }
+
+            println!("Node daemon installed and started.");
+            if gateway_overrides_changed {
+                println!("Saved gateway connection overrides to local config.");
+            }
+            println!(
+                "Saved defaults: node.id={}, node.workspace={}",
+                node_id,
+                workspace.display()
+            );
+            println!("\nCheck status:");
+            println!("  gsv node status");
+            println!("View logs:");
+            println!("  gsv node logs --follow");
+        }
+        NodeAction::Uninstall => {
+            #[cfg(target_os = "linux")]
+            uninstall_systemd_user_service()?;
+
+            #[cfg(target_os = "macos")]
+            uninstall_launchd_user_service()?;
+
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                return Err(
+                    "node daemon management is currently supported on macOS and Linux only".into(),
+                );
+            }
+
+            println!("Node daemon uninstalled.");
+        }
+        NodeAction::Start => {
+            let gateway_overrides_changed =
+                persist_gateway_overrides(gateway_url_override, gateway_token_override)?;
+
+            if gateway_overrides_changed {
+                restart_node_service()?;
+                println!("Saved gateway connection overrides to local config.");
+                println!("Node daemon restarted.");
+                return Ok(());
+            }
+
+            #[cfg(target_os = "linux")]
+            systemd_start_service()?;
+
+            #[cfg(target_os = "macos")]
+            launchd_start_service()?;
+
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                return Err(
+                    "node daemon management is currently supported on macOS and Linux only".into(),
+                );
+            }
+
+            println!("Node daemon started.");
+        }
+        NodeAction::Stop => {
+            #[cfg(target_os = "linux")]
+            systemd_stop_service()?;
+
+            #[cfg(target_os = "macos")]
+            launchd_stop_service()?;
+
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                return Err(
+                    "node daemon management is currently supported on macOS and Linux only".into(),
+                );
+            }
+
+            println!("Node daemon stopped.");
+        }
+        NodeAction::Status => {
+            #[cfg(target_os = "linux")]
+            systemd_status_service()?;
+
+            #[cfg(target_os = "macos")]
+            launchd_status_service()?;
+
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                return Err(
+                    "node daemon management is currently supported on macOS and Linux only".into(),
+                );
+            }
+        }
+        NodeAction::Logs { lines, follow } => {
+            node_logs_file(lines, follow)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_command_capture(
+    cmd: &mut std::process::Command,
+    context: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = cmd.output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
+    if detail.is_empty() {
+        return Err(format!("{} (exit status: {})", context, output.status).into());
+    }
+
+    Err(format!("{}: {}", context, detail).into())
+}
+
+fn run_command_passthrough(
+    cmd: &mut std::process::Command,
+    context: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status = cmd.status()?;
+    if status.success() {
+        return Ok(());
+    }
+
+    Err(format!("{} (exit status: {})", context, status).into())
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_user_unit_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let config_dir = dirs::config_dir().ok_or("Could not determine config directory")?;
+    Ok(config_dir
+        .join("systemd")
+        .join("user")
+        .join(NODE_SYSTEMD_UNIT_NAME))
+}
+
+#[cfg(target_os = "linux")]
+fn install_systemd_user_service(exe_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let unit_path = systemd_user_unit_path()?;
+    if let Some(parent) = unit_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let exe_path = exe_path.display().to_string().replace('"', "\\\"");
+    let unit = format!(
+        "[Unit]\nDescription=GSV Node daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=\"{}\" node --foreground\nRestart=always\nRestartSec=3\nKillSignal=SIGTERM\n\n[Install]\nWantedBy=default.target\n",
+        exe_path
+    );
+    std::fs::write(&unit_path, unit)?;
+
+    run_command_capture(
+        std::process::Command::new("systemctl")
+            .arg("--user")
+            .arg("daemon-reload"),
+        "Failed to reload systemd user daemon",
+    )?;
+    run_command_capture(
+        std::process::Command::new("systemctl")
+            .arg("--user")
+            .arg("enable")
+            .arg("--now")
+            .arg(NODE_SYSTEMD_UNIT_NAME),
+        "Failed to enable/start node service",
+    )?;
+
+    println!("Installed systemd unit: {}", unit_path.display());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_systemd_user_service() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = run_command_capture(
+        std::process::Command::new("systemctl")
+            .arg("--user")
+            .arg("disable")
+            .arg("--now")
+            .arg(NODE_SYSTEMD_UNIT_NAME),
+        "Failed to disable/stop node service",
+    );
+
+    let unit_path = systemd_user_unit_path()?;
+    if unit_path.exists() {
+        std::fs::remove_file(&unit_path)?;
+    }
+
+    run_command_capture(
+        std::process::Command::new("systemctl")
+            .arg("--user")
+            .arg("daemon-reload"),
+        "Failed to reload systemd user daemon",
+    )?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_start_service() -> Result<(), Box<dyn std::error::Error>> {
+    run_command_capture(
+        std::process::Command::new("systemctl")
+            .arg("--user")
+            .arg("start")
+            .arg(NODE_SYSTEMD_UNIT_NAME),
+        "Failed to start node service",
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_restart_service() -> Result<(), Box<dyn std::error::Error>> {
+    run_command_capture(
+        std::process::Command::new("systemctl")
+            .arg("--user")
+            .arg("restart")
+            .arg(NODE_SYSTEMD_UNIT_NAME),
+        "Failed to restart node service",
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_stop_service() -> Result<(), Box<dyn std::error::Error>> {
+    run_command_capture(
+        std::process::Command::new("systemctl")
+            .arg("--user")
+            .arg("stop")
+            .arg(NODE_SYSTEMD_UNIT_NAME),
+        "Failed to stop node service",
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_status_service() -> Result<(), Box<dyn std::error::Error>> {
+    run_command_passthrough(
+        std::process::Command::new("systemctl")
+            .arg("--user")
+            .arg("status")
+            .arg("--no-pager")
+            .arg(NODE_SYSTEMD_UNIT_NAME),
+        "Failed to read node service status",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_plist_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    Ok(home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{}.plist", NODE_LAUNCHD_LABEL)))
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_log_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    node_log_path()
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_domain() -> Result<String, Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("id").arg("-u").output()?;
+    if !output.status.success() {
+        return Err("Failed to resolve current user id".into());
+    }
+    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if uid.is_empty() {
+        return Err("Failed to resolve current user id".into());
+    }
+    Ok(format!("gui/{}", uid))
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_target() -> Result<String, Box<dyn std::error::Error>> {
+    Ok(format!("{}/{}", launchd_domain()?, NODE_LAUNCHD_LABEL))
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(target_os = "macos")]
+fn install_launchd_user_service(exe_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let plist_path = launchd_plist_path()?;
+    if let Some(parent) = plist_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let log_path = launchd_log_path()?;
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let plist = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{}</string>\n    <string>node</string>\n    <string>--foreground</string>\n  </array>\n  <key>RunAtLoad</key>\n  <true/>\n  <key>KeepAlive</key>\n  <true/>\n</dict>\n</plist>\n",
+        NODE_LAUNCHD_LABEL,
+        xml_escape(&exe_path.display().to_string()),
+    );
+    std::fs::write(&plist_path, plist)?;
+
+    let domain = launchd_domain()?;
+    let _ = std::process::Command::new("launchctl")
+        .arg("bootout")
+        .arg(&domain)
+        .arg(&plist_path)
+        .status();
+
+    run_command_capture(
+        std::process::Command::new("launchctl")
+            .arg("bootstrap")
+            .arg(&domain)
+            .arg(&plist_path),
+        "Failed to bootstrap launchd service",
+    )?;
+    run_command_capture(
+        std::process::Command::new("launchctl")
+            .arg("kickstart")
+            .arg("-k")
+            .arg(launchd_target()?),
+        "Failed to start launchd service",
+    )?;
+
+    println!("Installed launchd agent: {}", plist_path.display());
+    println!("Logs: {}", log_path.display());
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_launchd_user_service() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = run_command_capture(
+        std::process::Command::new("launchctl")
+            .arg("bootout")
+            .arg(launchd_target()?),
+        "Failed to unload launchd service",
+    );
+
+    let plist_path = launchd_plist_path()?;
+    if plist_path.exists() {
+        std::fs::remove_file(&plist_path)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_start_service() -> Result<(), Box<dyn std::error::Error>> {
+    if run_command_capture(
+        std::process::Command::new("launchctl")
+            .arg("kickstart")
+            .arg("-k")
+            .arg(launchd_target()?),
+        "Failed to kickstart launchd service",
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
+
+    let plist_path = launchd_plist_path()?;
+    if !plist_path.exists() {
+        return Err(format!(
+            "Service not installed. Run 'gsv node install' first ({})",
+            plist_path.display()
+        )
+        .into());
+    }
+
+    run_command_capture(
+        std::process::Command::new("launchctl")
+            .arg("bootstrap")
+            .arg(launchd_domain()?)
+            .arg(&plist_path),
+        "Failed to bootstrap launchd service",
+    )?;
+    run_command_capture(
+        std::process::Command::new("launchctl")
+            .arg("kickstart")
+            .arg("-k")
+            .arg(launchd_target()?),
+        "Failed to start launchd service",
+    )?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_stop_service() -> Result<(), Box<dyn std::error::Error>> {
+    run_command_capture(
+        std::process::Command::new("launchctl")
+            .arg("bootout")
+            .arg(launchd_target()?),
+        "Failed to stop launchd service",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_status_service() -> Result<(), Box<dyn std::error::Error>> {
+    run_command_passthrough(
+        std::process::Command::new("launchctl")
+            .arg("print")
+            .arg(launchd_target()?),
+        "Failed to read launchd service status",
+    )
 }
 
 async fn run_client(
@@ -1973,27 +2911,37 @@ async fn run_session(
 async fn run_node(
     url: &str,
     token: Option<String>,
-    node_id: Option<String>,
+    node_id: String,
     workspace: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Resolve node ID: use provided, or fall back to hostname
-    let node_id = node_id.unwrap_or_else(|| {
-        let hostname = hostname::get()
-            .map(|h| h.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
-        format!("node-{}", hostname)
-    });
+    let logger = NodeLogger::new(&node_id, &workspace)?;
+    let log_path = node_log_path()?;
+    logger.info(
+        "node.start",
+        json!({
+            "url": url,
+            "logPath": log_path.display().to_string(),
+            "logMaxBytes": node_log_max_bytes(),
+            "logMaxFiles": node_log_max_files(),
+        }),
+    );
+
+    let shutdown = wait_for_shutdown_signal();
+    tokio::pin!(shutdown);
 
     loop {
-        println!("Connecting as node '{}' to {}...", node_id, url);
-        println!("Workspace: {}", workspace.display());
+        logger.info("connect.attempt", json!({ "url": url }));
 
         let tools = all_tools_with_workspace(workspace.clone());
         let tool_defs: Vec<_> = tools.iter().map(|t| t.definition()).collect();
+        let tool_names: Vec<String> = tool_defs.iter().map(|t| t.name.clone()).collect();
 
-        println!(
-            "Registering tools: {:?}",
-            tool_defs.iter().map(|t| &t.name).collect::<Vec<_>>()
+        logger.info(
+            "tools.register",
+            json!({
+                "toolCount": tool_names.len(),
+                "tools": tool_names,
+            }),
         );
 
         let tools_for_handler: Arc<Vec<Box<dyn Tool>>> =
@@ -2011,7 +2959,13 @@ async fn run_node(
         {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("Failed to connect: {}. Retrying in 3s...", e);
+                logger.error(
+                    "connect.failed",
+                    json!({
+                        "error": e.to_string(),
+                        "retrySeconds": 3,
+                    }),
+                );
                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                 continue;
             }
@@ -2020,50 +2974,177 @@ async fn run_node(
 
         let conn_clone = conn.clone();
         let tools_clone = tools_for_handler.clone();
+        let logger_clone = logger.clone();
 
         conn.set_event_handler(move |frame| {
             let conn = conn_clone.clone();
             let tools = tools_clone.clone();
+            let logger = logger_clone.clone();
 
             tokio::spawn(async move {
                 if let Frame::Evt(evt) = frame {
                     if evt.event == "tool.invoke" {
                         if let Some(payload) = evt.payload {
-                            if let Ok(invoke) = serde_json::from_value::<ToolInvokePayload>(payload)
+                            let invoke = match serde_json::from_value::<ToolInvokePayload>(payload)
                             {
-                                println!("Tool invoke: {} ({})", invoke.tool, invoke.call_id);
+                                Ok(invoke) => invoke,
+                                Err(e) => {
+                                    logger.warn(
+                                        "tool.invoke.parse_failed",
+                                        json!({
+                                            "error": e.to_string(),
+                                        }),
+                                    );
+                                    return;
+                                }
+                            };
 
-                                let result =
-                                    match tools.iter().find(|t| t.definition().name == invoke.tool)
-                                    {
-                                        Some(tool) => tool.execute(invoke.args.clone()).await,
-                                        None => Err(format!("Tool not found: {}", invoke.tool)),
-                                    };
+                            let tool_name = invoke.tool.clone();
+                            let call_id = invoke.call_id.clone();
+                            logger.info(
+                                "tool.invoke",
+                                json!({
+                                    "tool": tool_name.clone(),
+                                    "callId": call_id.clone(),
+                                }),
+                            );
 
-                                let params = match result {
-                                    Ok(res) => ToolResultParams {
-                                        call_id: invoke.call_id,
-                                        result: Some(res),
-                                        error: None,
-                                    },
-                                    Err(e) => ToolResultParams {
-                                        call_id: invoke.call_id,
-                                        result: None,
-                                        error: Some(e),
-                                    },
+                            let result =
+                                match tools.iter().find(|t| t.definition().name == invoke.tool) {
+                                    Some(tool) => tool.execute(invoke.args.clone()).await,
+                                    None => Err(format!("Tool not found: {}", invoke.tool)),
                                 };
 
-                                println!("Tool result: {:?}", params);
-
-                                if let Err(e) = conn
-                                    .request(
-                                        "tool.result",
-                                        Some(serde_json::to_value(&params).unwrap()),
-                                    )
-                                    .await
-                                {
-                                    eprintln!("Failed to send tool result: {}", e);
+                            match &result {
+                                Ok(_) => {
+                                    logger.info(
+                                        "tool.execute.ok",
+                                        json!({
+                                            "tool": tool_name.clone(),
+                                            "callId": call_id.clone(),
+                                        }),
+                                    );
                                 }
+                                Err(err) => {
+                                    logger.warn(
+                                        "tool.execute.error",
+                                        json!({
+                                            "tool": tool_name.clone(),
+                                            "callId": call_id.clone(),
+                                            "error": err,
+                                        }),
+                                    );
+                                }
+                            }
+
+                            let params = match result {
+                                Ok(res) => ToolResultParams {
+                                    call_id: invoke.call_id,
+                                    result: Some(res),
+                                    error: None,
+                                },
+                                Err(e) => ToolResultParams {
+                                    call_id: invoke.call_id,
+                                    result: None,
+                                    error: Some(e),
+                                },
+                            };
+
+                            if let Err(e) = conn
+                                .request(
+                                    "tool.result",
+                                    Some(serde_json::to_value(&params).unwrap()),
+                                )
+                                .await
+                            {
+                                logger.error(
+                                    "tool.result.send_failed",
+                                    json!({
+                                        "tool": tool_name,
+                                        "callId": call_id,
+                                        "error": e.to_string(),
+                                    }),
+                                );
+                            }
+                        }
+                    } else if evt.event == "logs.get" {
+                        if let Some(payload) = evt.payload {
+                            let request = match serde_json::from_value::<LogsGetPayload>(payload) {
+                                Ok(request) => request,
+                                Err(e) => {
+                                    logger.warn(
+                                        "logs.get.parse_failed",
+                                        json!({
+                                            "error": e.to_string(),
+                                        }),
+                                    );
+                                    return;
+                                }
+                            };
+
+                            let requested_lines =
+                                request.lines.unwrap_or(DEFAULT_NODE_LOG_GET_LINES);
+                            let resolved_lines = resolve_logs_get_line_limit(request.lines);
+                            if requested_lines != resolved_lines {
+                                logger.warn(
+                                    "logs.get.limit_clamped",
+                                    json!({
+                                        "callId": request.call_id,
+                                        "requestedLines": requested_lines,
+                                        "resolvedLines": resolved_lines,
+                                        "maxLines": MAX_NODE_LOG_GET_LINES,
+                                    }),
+                                );
+                            }
+
+                            logger.info(
+                                "logs.get",
+                                json!({
+                                    "callId": request.call_id,
+                                    "requestedLines": requested_lines,
+                                    "resolvedLines": resolved_lines,
+                                }),
+                            );
+
+                            let response = match read_recent_node_log_lines(resolved_lines) {
+                                Ok((lines, truncated)) => LogsResultParams {
+                                    call_id: request.call_id.clone(),
+                                    lines: Some(lines),
+                                    truncated: Some(truncated),
+                                    error: None,
+                                },
+                                Err(error) => LogsResultParams {
+                                    call_id: request.call_id.clone(),
+                                    lines: None,
+                                    truncated: None,
+                                    error: Some(error),
+                                },
+                            };
+
+                            if let Some(error) = response.error.clone() {
+                                logger.warn(
+                                    "logs.get.error",
+                                    json!({
+                                        "callId": request.call_id,
+                                        "error": error,
+                                    }),
+                                );
+                            }
+
+                            if let Err(e) = conn
+                                .request(
+                                    "logs.result",
+                                    Some(serde_json::to_value(&response).unwrap()),
+                                )
+                                .await
+                            {
+                                logger.error(
+                                    "logs.result.send_failed",
+                                    json!({
+                                        "callId": response.call_id,
+                                        "error": e.to_string(),
+                                    }),
+                                );
                             }
                         }
                     }
@@ -2072,7 +3153,12 @@ async fn run_node(
         })
         .await;
 
-        println!("Connected as node! Waiting for tool invocations...");
+        logger.info(
+            "connect.ok",
+            json!({
+                "keepaliveSeconds": 300,
+            }),
+        );
         let keepalive_interval = tokio::time::Duration::from_secs(60 * 5);
         let keepalive_timeout = tokio::time::Duration::from_secs(10);
         let mut next_keepalive_at = tokio::time::Instant::now() + keepalive_interval;
@@ -2080,13 +3166,18 @@ async fn run_node(
         // Monitor for disconnection or Ctrl+C
         loop {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    println!("Shutting down...");
+                signal = &mut shutdown => {
+                    logger.info("shutdown", json!({ "signal": signal }));
                     return Ok(());
                 }
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {
                     if conn.is_disconnected() {
-                        eprintln!("Connection lost! Reconnecting in 3s...");
+                        logger.warn(
+                            "connect.lost",
+                            json!({
+                                "retrySeconds": 3,
+                            }),
+                        );
                         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                         break; // Break inner loop to reconnect
                     }
@@ -2107,17 +3198,35 @@ async fn run_node(
                                     .error
                                     .map(|e| e.message)
                                     .unwrap_or_else(|| "unknown response".to_string());
-                                eprintln!("Keepalive failed ({}). Reconnecting in 3s...", message);
+                                logger.warn(
+                                    "keepalive.failed",
+                                    json!({
+                                        "error": message,
+                                        "retrySeconds": 3,
+                                    }),
+                                );
                                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                                 break;
                             }
                             Ok(Err(e)) => {
-                                eprintln!("Keepalive request error ({}). Reconnecting in 3s...", e);
+                                logger.warn(
+                                    "keepalive.request_error",
+                                    json!({
+                                        "error": e.to_string(),
+                                        "retrySeconds": 3,
+                                    }),
+                                );
                                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                                 break;
                             }
                             Err(_) => {
-                                eprintln!("Keepalive timed out. Reconnecting in 3s...");
+                                logger.warn(
+                                    "keepalive.timeout",
+                                    json!({
+                                        "timeoutSeconds": 10,
+                                        "retrySeconds": 3,
+                                    }),
+                                );
                                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                                 break;
                             }

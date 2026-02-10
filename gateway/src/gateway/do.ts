@@ -83,6 +83,13 @@ export type PendingToolRoute =
   | { kind: "session"; sessionKey: string }
   | { kind: "client"; clientId: string; frameId: string; createdAt: number };
 
+export type PendingLogRoute = {
+  clientId: string;
+  frameId: string;
+  nodeId: string;
+  createdAt: number;
+};
+
 type GatewayMethodHandlerContext = {
   gw: Gateway;
   ws: WebSocket;
@@ -107,6 +114,11 @@ export class Gateway extends DurableObject<Env> {
   readonly pendingToolCalls = PersistedObject<Record<string, PendingToolRoute>>(
     this.ctx.storage.kv,
     { prefix: "pendingToolCalls:" },
+  );
+
+  readonly pendingLogCalls = PersistedObject<Record<string, PendingLogRoute>>(
+    this.ctx.storage.kv,
+    { prefix: "pendingLogCalls:" },
   );
 
   readonly configStore = PersistedObject<Record<string, unknown>>(
@@ -421,6 +433,11 @@ export class Gateway extends DurableObject<Env> {
           delete this.pendingToolCalls[callId];
         }
       }
+      for (const [callId, route] of Object.entries(this.pendingLogCalls)) {
+        if (typeof route === "object" && route.clientId === clientId) {
+          delete this.pendingLogCalls[callId];
+        }
+      }
     } else if (mode === "node" && nodeId) {
       // Ignore close events from stale sockets that were replaced by reconnect.
       if (this.nodes.get(nodeId) !== ws) {
@@ -429,6 +446,20 @@ export class Gateway extends DurableObject<Env> {
       }
       this.nodes.delete(nodeId);
       delete this.toolRegistry[nodeId];
+      for (const [callId, route] of Object.entries(this.pendingLogCalls)) {
+        if (typeof route === "object" && route.nodeId === nodeId) {
+          const clientWs = this.clients.get(route.clientId);
+          if (clientWs && clientWs.readyState === WebSocket.OPEN) {
+            this.sendError(
+              clientWs,
+              route.frameId,
+              503,
+              `Node disconnected: ${nodeId}`,
+            );
+          }
+          delete this.pendingLogCalls[callId];
+        }
+      }
       console.log(`[Gateway] Node ${nodeId} removed from registry`);
     } else if (mode === "channel" && channelKey) {
       // Ignore close events from stale sockets that were replaced by reconnect.
