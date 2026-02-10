@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - '**'
     tags:
       - 'v*'
   workflow_dispatch:
@@ -19,6 +21,7 @@ env:
 jobs:
   # Build CLI binaries for multiple platforms
   build-cli:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     strategy:
       matrix:
         include:
@@ -72,9 +75,150 @@ jobs:
           name: ${{ matrix.artifact }}
           path: cli/target/${{ matrix.target }}/release/${{ matrix.artifact }}
 
+  # Build pre-bundled Cloudflare deployment artifacts.
+  # Runs on branch pushes so we can test before merging.
+  build-cloudflare-bundles:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: |
+            gateway/package-lock.json
+            gateway/ui/package-lock.json
+            channels/whatsapp/package-lock.json
+            channels/discord/package-lock.json
+            channels/test/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          npm ci --prefix gateway
+          npm ci --prefix gateway/ui
+          npm ci --prefix channels/whatsapp
+          npm ci --prefix channels/discord
+          npm ci --prefix channels/test
+
+      - name: Build web UI
+        working-directory: gateway/ui
+        run: npm run build
+
+      - name: Build worker bundles
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/dist/cloudflare/gateway/worker"
+          mkdir -p "$GITHUB_WORKSPACE/dist/cloudflare/channel-whatsapp/worker"
+          mkdir -p "$GITHUB_WORKSPACE/dist/cloudflare/channel-discord/worker"
+          mkdir -p "$GITHUB_WORKSPACE/dist/cloudflare/channel-test/worker"
+
+          (
+            cd gateway
+            npx wrangler deploy --dry-run --outdir "$GITHUB_WORKSPACE/dist/cloudflare/gateway/worker"
+          )
+          (
+            cd channels/whatsapp
+            npx wrangler deploy --dry-run --outdir "$GITHUB_WORKSPACE/dist/cloudflare/channel-whatsapp/worker"
+          )
+          (
+            cd channels/discord
+            npx wrangler deploy --dry-run --outdir "$GITHUB_WORKSPACE/dist/cloudflare/channel-discord/worker"
+          )
+          (
+            cd channels/test
+            npx wrangler deploy --dry-run --outdir "$GITHUB_WORKSPACE/dist/cloudflare/channel-test/worker"
+          )
+
+      - name: Assemble deployable bundles
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/release"
+
+          # Gateway bundle (worker + static assets + templates)
+          cp gateway/wrangler.jsonc "$GITHUB_WORKSPACE/dist/cloudflare/gateway/wrangler.jsonc"
+          cp -R gateway/ui/dist "$GITHUB_WORKSPACE/dist/cloudflare/gateway/assets"
+          mkdir -p "$GITHUB_WORKSPACE/dist/cloudflare/gateway/templates"
+          cp -R templates/workspace "$GITHUB_WORKSPACE/dist/cloudflare/gateway/templates/workspace"
+          cp -R templates/skills "$GITHUB_WORKSPACE/dist/cloudflare/gateway/templates/skills"
+          cat > "$GITHUB_WORKSPACE/dist/cloudflare/gateway/manifest.json" <<'EOF'
+          {
+            "component": "gateway",
+            "worker": {
+              "entrypoint": "worker/index.js",
+              "sourceMap": "worker/index.js.map",
+              "wranglerConfig": "wrangler.jsonc"
+            },
+            "assetsDir": "assets",
+            "templatesDir": "templates"
+          }
+          EOF
+
+          # Channel bundles (kept separate so users only download what they need)
+          cp channels/whatsapp/wrangler.jsonc "$GITHUB_WORKSPACE/dist/cloudflare/channel-whatsapp/wrangler.jsonc"
+          cat > "$GITHUB_WORKSPACE/dist/cloudflare/channel-whatsapp/manifest.json" <<'EOF'
+          {
+            "component": "channel-whatsapp",
+            "worker": {
+              "entrypoint": "worker/index.js",
+              "sourceMap": "worker/index.js.map",
+              "wranglerConfig": "wrangler.jsonc"
+            }
+          }
+          EOF
+
+          cp channels/discord/wrangler.jsonc "$GITHUB_WORKSPACE/dist/cloudflare/channel-discord/wrangler.jsonc"
+          cat > "$GITHUB_WORKSPACE/dist/cloudflare/channel-discord/manifest.json" <<'EOF'
+          {
+            "component": "channel-discord",
+            "worker": {
+              "entrypoint": "worker/index.js",
+              "sourceMap": "worker/index.js.map",
+              "wranglerConfig": "wrangler.jsonc"
+            }
+          }
+          EOF
+
+          cp channels/test/wrangler.jsonc "$GITHUB_WORKSPACE/dist/cloudflare/channel-test/wrangler.jsonc"
+          cat > "$GITHUB_WORKSPACE/dist/cloudflare/channel-test/manifest.json" <<'EOF'
+          {
+            "component": "channel-test",
+            "worker": {
+              "entrypoint": "worker/index.js",
+              "sourceMap": "worker/index.js.map",
+              "wranglerConfig": "wrangler.jsonc"
+            }
+          }
+          EOF
+
+          tar -C "$GITHUB_WORKSPACE/dist/cloudflare" -czf "$GITHUB_WORKSPACE/release/gsv-cloudflare-gateway.tar.gz" gateway
+          tar -C "$GITHUB_WORKSPACE/dist/cloudflare" -czf "$GITHUB_WORKSPACE/release/gsv-cloudflare-channel-whatsapp.tar.gz" channel-whatsapp
+          tar -C "$GITHUB_WORKSPACE/dist/cloudflare" -czf "$GITHUB_WORKSPACE/release/gsv-cloudflare-channel-discord.tar.gz" channel-discord
+          tar -C "$GITHUB_WORKSPACE/dist/cloudflare" -czf "$GITHUB_WORKSPACE/release/gsv-cloudflare-channel-test.tar.gz" channel-test
+
+          (
+            cd "$GITHUB_WORKSPACE/release"
+            sha256sum gsv-cloudflare-*.tar.gz > cloudflare-checksums.txt
+          )
+
+      - name: Upload Cloudflare bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: gsv-cloudflare-bundles
+          path: |
+            release/gsv-cloudflare-gateway.tar.gz
+            release/gsv-cloudflare-channel-whatsapp.tar.gz
+            release/gsv-cloudflare-channel-discord.tar.gz
+            release/gsv-cloudflare-channel-test.tar.gz
+            release/cloudflare-checksums.txt
+
   # Create GitHub Release with all artifacts
   release:
-    needs: [build-cli]
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    needs: [build-cli, build-cloudflare-bundles]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -93,6 +237,13 @@ jobs:
           cp artifacts/gsv-linux-arm64/gsv-linux-arm64 release/
           cp artifacts/gsv-darwin-x64/gsv-darwin-x64 release/
           cp artifacts/gsv-darwin-arm64/gsv-darwin-arm64 release/
+
+          # Cloudflare deploy bundles (modular, per component/channel)
+          cp artifacts/gsv-cloudflare-bundles/gsv-cloudflare-gateway.tar.gz release/
+          cp artifacts/gsv-cloudflare-bundles/gsv-cloudflare-channel-whatsapp.tar.gz release/
+          cp artifacts/gsv-cloudflare-bundles/gsv-cloudflare-channel-discord.tar.gz release/
+          cp artifacts/gsv-cloudflare-bundles/gsv-cloudflare-channel-test.tar.gz release/
+          cp artifacts/gsv-cloudflare-bundles/cloudflare-checksums.txt release/
           
           # Make binaries executable
           chmod +x release/gsv-*
@@ -130,6 +281,14 @@ jobs:
             This will:
             - Download and install the CLI binary
             - Optionally deploy GSV to Cloudflare (requires [bun](https://bun.sh))
+
+            ## Cloudflare Bundles
+
+            Cloudflare artifacts are split by component so users can download only what they need:
+            - `gsv-cloudflare-gateway.tar.gz`
+            - `gsv-cloudflare-channel-whatsapp.tar.gz`
+            - `gsv-cloudflare-channel-discord.tar.gz`
+            - `gsv-cloudflare-channel-test.tar.gz`
             
             ## Manual Installation
             
@@ -143,5 +302,10 @@ jobs:
             release/gsv-linux-arm64
             release/gsv-darwin-x64
             release/gsv-darwin-arm64
+            release/gsv-cloudflare-gateway.tar.gz
+            release/gsv-cloudflare-channel-whatsapp.tar.gz
+            release/gsv-cloudflare-channel-discord.tar.gz
+            release/gsv-cloudflare-channel-test.tar.gz
+            release/cloudflare-checksums.txt
             release/install.sh
             release/checksums.txt
