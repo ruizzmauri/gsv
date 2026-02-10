@@ -83,18 +83,25 @@ export interface SessionConfig {
 }
 
 export interface SkillRequirementsConfig {
+  // Restrict to hosts with these roles.
   hostRoles?: string[];
+  // Require all of these capabilities on the same host.
   capabilities?: string[];
+  // Require at least one of these capabilities on the same host.
   anyCapabilities?: string[];
 }
 
 export interface SkillEntryConfig {
+  // Hard toggle for the skill in prompt visibility.
   enabled?: boolean;
+  // Overrides skill frontmatter always=true/false.
   always?: boolean;
+  // Overrides skill frontmatter runtime requirements.
   requires?: SkillRequirementsConfig;
 }
 
 export interface SkillsConfig {
+  // Per-skill policy entries keyed by skill name/path key.
   entries: Record<string, SkillEntryConfig>;
 }
 

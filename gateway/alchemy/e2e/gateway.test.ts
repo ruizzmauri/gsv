@@ -17,6 +17,7 @@ const testId = `gsv-e2e-${crypto.randomBytes(4).toString("hex")}`;
 
 let app: Scope;
 let gatewayUrl: string;
+const OPENAI_API_KEY = process.env.GSV_TEST_OPENAI_KEY;
 
 // Helper to wait for worker to be ready (including WebSocket)
 async function waitForWorker(url: string, maxWaitMs = 60000) {
@@ -163,6 +164,110 @@ function waitForToolInvoke(
   });
 }
 
+function waitForRunTerminalState(
+  ws: WebSocket,
+  runId: string,
+  timeoutMs = 60000,
+): Promise<{ state: "final" | "error"; error?: string }> {
+  return new Promise((resolve, reject) => {
+    const originalHandler = ws.onmessage;
+    const timeout = setTimeout(() => {
+      ws.onmessage = originalHandler;
+      reject(new Error(`Timed out waiting for run ${runId} terminal state`));
+    }, timeoutMs);
+
+    ws.onmessage = (event) => {
+      try {
+        const frame = JSON.parse(event.data as string);
+        if (
+          frame.type === "evt" &&
+          frame.event === "chat" &&
+          frame.payload?.runId === runId &&
+          (frame.payload?.state === "final" || frame.payload?.state === "error")
+        ) {
+          clearTimeout(timeout);
+          ws.onmessage = originalHandler;
+          resolve({
+            state: frame.payload.state,
+            error:
+              typeof frame.payload.error === "string"
+                ? frame.payload.error
+                : undefined,
+          });
+          return;
+        }
+      } catch {
+        // Ignore parse errors
+      }
+
+      if (typeof originalHandler === "function") {
+        originalHandler.call(ws, event);
+      }
+    };
+  });
+}
+
+function readPathFromToolArguments(value: unknown): string | undefined {
+  if (typeof value === "object" && value !== null) {
+    const path = (value as { path?: unknown }).path;
+    return typeof path === "string" ? path : undefined;
+  }
+
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (typeof parsed === "object" && parsed !== null) {
+      const path = (parsed as { path?: unknown }).path;
+      return typeof path === "string" ? path : undefined;
+    }
+  } catch {
+    // Ignore parse errors
+  }
+
+  return undefined;
+}
+
+function hasSkillReadToolCall(messages: unknown[], skillReadPath: string): boolean {
+  for (const message of messages) {
+    if (typeof message !== "object" || message === null) {
+      continue;
+    }
+
+    const content = (message as { content?: unknown }).content;
+    if (!Array.isArray(content)) {
+      continue;
+    }
+
+    for (const block of content) {
+      if (typeof block !== "object" || block === null) {
+        continue;
+      }
+
+      const type = (block as { type?: unknown }).type;
+      if (type !== "toolCall") {
+        continue;
+      }
+
+      const toolName = (block as { name?: unknown }).name;
+      if (typeof toolName !== "string" || toolName.toLowerCase() !== "gsv__readfile") {
+        continue;
+      }
+
+      const readPath = readPathFromToolArguments(
+        (block as { arguments?: unknown }).arguments,
+      );
+      if (readPath === skillReadPath) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 // ============================================================================
 // Test Setup/Teardown
 // ============================================================================
@@ -177,6 +282,7 @@ beforeAll(async () => {
       name: testId,
       entrypoint: "src/index.ts",
       url: true,
+      withSkillTemplates: true,
     });
     
     gatewayUrl = gateway.url!;
@@ -771,10 +877,105 @@ describe("Node Runtime Validation & Routing", () => {
   }, 30000);
 });
 
+describe("Skills Config Runtime Visibility", () => {
+  it.skipIf(!OPENAI_API_KEY)(
+    "applies skills.entries toggles on the next run",
+    async () => {
+      const wsUrl = gatewayUrl.replace("https://", "wss://") + "/ws";
+      const controlWs = await connectAndAuth(wsUrl);
+      const monitorWs = await connectAndAuth(wsUrl);
+
+      await sendRequest(controlWs, "config.set", {
+        path: "apiKeys.openai",
+        value: OPENAI_API_KEY,
+      });
+      await sendRequest(controlWs, "config.set", {
+        path: "model",
+        value: { provider: "openai", id: "gpt-4o-mini" },
+      });
+
+      const promptMessage =
+        "What command starts the R2 workspace mount in gsv CLI? Keep it short.";
+      const skillPath = "skills/gsv-cli/SKILL.md";
+
+      await sendRequest(controlWs, "config.set", {
+        path: "skills.entries.gsv-cli",
+        value: { enabled: false },
+      });
+
+      const disabledSessionKey = `skill-toggle-disabled-${crypto.randomUUID().slice(0, 8)}`;
+      const disabledRunId = crypto.randomUUID();
+      const disabledSend = await sendRequest(controlWs, "chat.send", {
+        sessionKey: disabledSessionKey,
+        runId: disabledRunId,
+        message: promptMessage,
+      }) as { status: string };
+      expect(disabledSend.status).toBe("started");
+
+      const disabledTerminal = await waitForRunTerminalState(
+        monitorWs,
+        disabledRunId,
+        90000,
+      );
+      expect(disabledTerminal.state).toBe("final");
+      if (disabledTerminal.error) {
+        console.log(`   Disabled run error: ${disabledTerminal.error}`);
+      }
+
+      const disabledPreview = await sendRequest(controlWs, "session.preview", {
+        sessionKey: disabledSessionKey,
+        limit: 40,
+      }) as { messages: unknown[] };
+
+      expect(
+        hasSkillReadToolCall(disabledPreview.messages, skillPath),
+      ).toBe(false);
+
+      await sendRequest(controlWs, "config.set", {
+        path: "skills.entries.gsv-cli",
+        value: { enabled: true },
+      });
+
+      const enabledSessionKey = `skill-toggle-enabled-${crypto.randomUUID().slice(0, 8)}`;
+      const enabledRunId = crypto.randomUUID();
+      const enabledSend = await sendRequest(controlWs, "chat.send", {
+        sessionKey: enabledSessionKey,
+        runId: enabledRunId,
+        message: promptMessage,
+      }) as { status: string };
+      expect(enabledSend.status).toBe("started");
+
+      const enabledTerminal = await waitForRunTerminalState(
+        monitorWs,
+        enabledRunId,
+        90000,
+      );
+      expect(enabledTerminal.state).toBe("final");
+      if (enabledTerminal.error) {
+        console.log(`   Enabled run error: ${enabledTerminal.error}`);
+      }
+
+      const enabledPreview = await sendRequest(controlWs, "session.preview", {
+        sessionKey: enabledSessionKey,
+        limit: 40,
+      }) as { messages: unknown[] };
+
+      expect(hasSkillReadToolCall(enabledPreview.messages, skillPath)).toBe(true);
+
+      // Restore explicit default for later tests in this process.
+      await sendRequest(controlWs, "config.set", {
+        path: "skills.entries.gsv-cli",
+        value: { enabled: true },
+      });
+
+      controlWs.close();
+      monitorWs.close();
+    },
+    180000,
+  );
+});
+
 describe("Multi-Turn Agent Loop", () => {
-  // This test requires an API key to be set
-  const OPENAI_API_KEY = process.env.GSV_TEST_OPENAI_KEY;
-  
   it.skipIf(!OPENAI_API_KEY)("completes multi-turn tool loop", async () => {
     const wsUrl = gatewayUrl.replace("https://", "wss://") + "/ws";
     const nodeId = `test-node-${crypto.randomUUID().slice(0, 8)}`;
