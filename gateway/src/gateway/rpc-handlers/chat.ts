@@ -34,9 +34,31 @@ export const handleChatSend: Handler<"chat.send"> = async ({ gw, params }) => {
   }
 
   const fullConfig = gw.getFullConfig();
+  const sessionStub = env.SESSION.getByName(params.sessionKey);
 
-  // Parse inline directives
-  const directives = parseDirectives(messageText, fullConfig.model.provider);
+  // Parse inline directives. For provider-less model selectors (e.g. /m:o3),
+  // resolve against the session's current provider, not the global default.
+  let directives = parseDirectives(messageText);
+  const needsProviderFallback =
+    directives.hasModelDirective &&
+    !directives.model &&
+    !!directives.rawModelDirective &&
+    !directives.rawModelDirective.includes("/");
+
+  if (needsProviderFallback) {
+    try {
+      const info = await sessionStub.get();
+      const fallbackProvider =
+        info.settings.model?.provider || fullConfig.model.provider;
+      directives = parseDirectives(messageText, fallbackProvider);
+    } catch (e) {
+      console.warn(
+        `[Gateway] Failed to resolve session model provider for ${params.sessionKey}, using global default:`,
+        e,
+      );
+      directives = parseDirectives(messageText, fullConfig.model.provider);
+    }
+  }
 
   // If message is only directives, acknowledge and return
   if (isDirectiveOnly(messageText)) {
@@ -50,8 +72,6 @@ export const handleChatSend: Handler<"chat.send"> = async ({ gw, params }) => {
       },
     };
   }
-
-  const sessionStub = env.SESSION.getByName(params.sessionKey);
 
   const now = Date.now();
   const existing = gw.sessionRegistry[params.sessionKey];

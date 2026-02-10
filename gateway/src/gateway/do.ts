@@ -1735,9 +1735,33 @@ export class Gateway extends DurableObject<Env> {
     }
 
     const fullConfig = this.getFullConfig();
+    const sessionStub = this.env.SESSION.get(
+      this.env.SESSION.idFromName(sessionKey),
+    );
 
-    // Parse directives
-    const directives = parseDirectives(messageText, fullConfig.model.provider);
+    // Parse directives. For provider-less model selectors (e.g. /m:o3),
+    // resolve against the session's current provider, not the global default.
+    let directives = parseDirectives(messageText);
+    const needsProviderFallback =
+      directives.hasModelDirective &&
+      !directives.model &&
+      !!directives.rawModelDirective &&
+      !directives.rawModelDirective.includes("/");
+
+    if (needsProviderFallback) {
+      try {
+        const info = await sessionStub.get();
+        const fallbackProvider =
+          info.settings.model?.provider || fullConfig.model.provider;
+        directives = parseDirectives(messageText, fallbackProvider);
+      } catch (e) {
+        console.warn(
+          `[Gateway] Failed to resolve session model provider for ${sessionKey}, using global default:`,
+          e,
+        );
+        directives = parseDirectives(messageText, fullConfig.model.provider);
+      }
+    }
 
     if (isDirectiveOnly(messageText)) {
       const ack = formatDirectiveAck(directives);
@@ -1770,10 +1794,6 @@ export class Gateway extends DurableObject<Env> {
       lastActiveAt: now,
       label: existingSession?.label ?? params.peer.name,
     };
-
-    const sessionStub = this.env.SESSION.get(
-      this.env.SESSION.idFromName(sessionKey),
-    );
 
     // Generate runId before try block so it's accessible in catch for cleanup
     const runId = crypto.randomUUID();
