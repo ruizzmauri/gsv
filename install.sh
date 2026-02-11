@@ -12,6 +12,8 @@
 #   GSV_VERSION      - CLI version to install (default: latest)
 #   GSV_SKIP_DEPLOY  - Skip deployment prompt (default: false)
 #   GSV_GATEWAY_URL  - Use this gateway URL (skips deployment)
+#   CF_API_TOKEN     - Cloudflare API token (optional; prompted if deploying)
+#   CF_ACCOUNT_ID    - Cloudflare account ID (optional; auto-detected if omitted)
 
 set -e
 
@@ -22,7 +24,6 @@ set -e
 REPO="deathbyknowledge/gsv"
 INSTALL_DIR="${GSV_INSTALL_DIR:-/usr/local/bin}"
 VERSION="${GSV_VERSION:-latest}"
-GSV_SRC_DIR="${HOME}/.gsv/src"
 CONFIG_DIR="${HOME}/.config/gsv"
 
 # Colors
@@ -121,14 +122,6 @@ detect_platform() {
     BINARY_NAME="gsv-${OS}-${ARCH}"
 }
 
-check_bun() {
-    if command -v bun > /dev/null 2>&1; then
-        BUN_VERSION=$(bun --version 2>/dev/null)
-        return 0
-    fi
-    return 1
-}
-
 check_existing_config() {
     [ -f "${CONFIG_DIR}/config.toml" ]
 }
@@ -147,88 +140,37 @@ get_latest_version() {
 }
 
 # ============================================================================
-# Deployment (via Alchemy)
+# Deployment (via gsv CLI)
 # ============================================================================
 
-deploy_gateway() {
-    info "Deploying GSV Gateway to Cloudflare..."
+deploy_with_cli() {
+    info "Deploying GSV to Cloudflare..."
     echo ""
-    
-    # Check for bun
-    if ! check_bun; then
-        error "bun is required for deployment"
-        echo ""
-        echo "  Install bun:"
-        echo "    curl -fsSL https://bun.sh/install | bash"
-        echo ""
-        echo "  Then run this installer again."
-        exit 1
-    fi
-    success "bun ${BUN_VERSION} found"
-    
-    # Check/setup alchemy auth
-    if [ ! -f "${HOME}/.alchemy/config.json" ]; then
-        info "Setting up Cloudflare authentication..."
-        echo ""
-        echo "  Alchemy will open your browser to authenticate with Cloudflare."
-        echo "  This uses OAuth - no API tokens needed."
-        echo ""
-        
-        if ! prompt_yn "Continue with authentication?"; then
-            echo ""
-            warn "Skipping deployment. You can deploy manually later:"
-            echo "    cd ~/.gsv/src/gateway && bunx alchemy deploy alchemy/deploy.ts"
-            return 1
-        fi
-        
-        (cd "${GSV_SRC_DIR}/gateway" && bunx alchemy login cloudflare)
-    fi
-    success "Cloudflare authentication configured"
-    
-    # Run alchemy deploy
-    info "Running alchemy deploy (this may take a minute)..."
-    echo ""
-    
-    DEPLOY_OUTPUT=$(cd "${GSV_SRC_DIR}/gateway" && bunx alchemy deploy alchemy/deploy.ts --adopt 2>&1) || {
-        error "Deployment failed"
-        echo "$DEPLOY_OUTPUT"
-        return 1
-    }
-    
-    # Parse output for URL
-    GATEWAY_URL=$(echo "$DEPLOY_OUTPUT" | grep -o 'https://[^[:space:]]*workers.dev' | head -1)
-    
-    if [ -z "$GATEWAY_URL" ]; then
-        warn "Could not parse gateway URL from output"
-        echo "$DEPLOY_OUTPUT"
-        GATEWAY_URL=$(prompt_input "Enter the gateway URL manually")
-    fi
-    
-    success "Gateway deployed: ${GATEWAY_URL}"
-    echo ""
-}
 
-clone_repository() {
-    if [ -d "${GSV_SRC_DIR}/.git" ]; then
-        info "Updating existing repository..."
-        (cd "${GSV_SRC_DIR}" && git pull --quiet) || warn "Could not update repo"
-    else
-        info "Cloning GSV repository..."
-        mkdir -p "$(dirname "${GSV_SRC_DIR}")"
-        git clone --quiet "https://github.com/${REPO}.git" "${GSV_SRC_DIR}" || {
-            error "Failed to clone repository"
-            exit 1
-        }
+    local cf_token="${CF_API_TOKEN:-}"
+    local cf_account="${CF_ACCOUNT_ID:-}"
+
+    if [ -z "$cf_token" ]; then
+        cf_token=$(prompt_input "Enter Cloudflare API token" "")
     fi
-    success "Repository ready at ${GSV_SRC_DIR}"
-    
-    # Install dependencies
-    info "Installing dependencies..."
-    (cd "${GSV_SRC_DIR}/gateway" && bun install --silent) || {
-        error "Failed to install dependencies"
-        exit 1
-    }
-    success "Dependencies installed"
+
+    if [ -z "$cf_token" ]; then
+        warn "No Cloudflare API token provided. Skipping deployment."
+        return 1
+    fi
+
+    if [ -z "$cf_account" ]; then
+        cf_account=$(prompt_input "Enter Cloudflare account ID (optional)" "")
+    fi
+
+    info "Running deploy wizard (gsv deploy up --wizard --all)..."
+    echo ""
+
+    if [ -n "$cf_account" ]; then
+        gsv deploy up --wizard --all --api-token "$cf_token" --account-id "$cf_account"
+    else
+        gsv deploy up --wizard --all --api-token "$cf_token"
+    fi
 }
 
 # ============================================================================
@@ -280,42 +222,23 @@ download_cli() {
 
 configure_cli() {
     local gateway_url="$1"
-    
-    mkdir -p "${CONFIG_DIR}"
-    
-    # Generate auth token
-    local auth_token="gsv_$(openssl rand -hex 16 2>/dev/null || date +%s | sha256sum | head -c 32)"
-    
-    # Create config
-    cat > "${CONFIG_DIR}/config.toml" << EOF
-# GSV CLI Configuration
-# Generated by install.sh
 
-[gateway]
-url = "${gateway_url}/ws"
-token = "${auth_token}"
+    local auth_token="${2:-}"
+    if [ -z "$auth_token" ]; then
+        auth_token=$(prompt_input "Enter your gateway auth token (optional)" "")
+    fi
 
-[workspace]
-# path = "/path/to/workspace"
+    local gateway_ws="${gateway_url%/}"
+    if [[ "$gateway_ws" != */ws ]]; then
+        gateway_ws="${gateway_ws}/ws"
+    fi
 
-[r2]
-# account_id = ""
-# access_key_id = ""
-# secret_access_key = ""
-# bucket = "gsv-storage"
-EOF
+    gsv local-config set gateway.url "$gateway_ws" >/dev/null
+    if [ -n "$auth_token" ]; then
+        gsv local-config set gateway.token "$auth_token" >/dev/null
+    fi
 
     success "Configuration saved to ${CONFIG_DIR}/config.toml"
-    
-    # Show the token (user needs to set it on the worker)
-    echo ""
-    echo -e "  ${YELLOW}Important:${NC} Set the auth token on your gateway worker:"
-    echo ""
-    echo "    cd ~/.gsv/src/gateway"
-    echo "    echo '${auth_token}' | bunx wrangler secret put AUTH_TOKEN"
-    echo ""
-    echo "  Or via Cloudflare dashboard → Workers → gsv-gateway → Settings → Variables"
-    echo ""
 }
 
 # ============================================================================
@@ -328,6 +251,9 @@ main() {
     
     echo -e "  Platform: ${BOLD}${OS}-${ARCH}${NC}"
     echo ""
+
+    WANT_DEPLOY="false"
+    DEPLOYED_WITH_CLI="false"
     
     # Check for existing deployment via env var
     if [ -n "$GSV_GATEWAY_URL" ]; then
@@ -357,12 +283,12 @@ main() {
             info "Setting up a new GSV deployment..."
             echo ""
             echo "  This will:"
-            echo "    1. Clone the GSV repository"
-            echo "    2. Deploy the gateway to Cloudflare Workers"
-            echo "    3. Install the CLI"
+            echo "    1. Install the GSV CLI"
+            echo "    2. Run 'gsv deploy up --wizard --all'"
+            echo "    3. Configure Gateway and channels on Cloudflare"
             echo ""
             echo "  Requirements:"
-            echo "    - bun (https://bun.sh)"
+            echo "    - Cloudflare API token with Workers/R2/Queues permissions"
             echo "    - Cloudflare account (free tier works!)"
             echo ""
             
@@ -371,9 +297,7 @@ main() {
                 warn "Skipping deployment."
                 echo ""
                 echo "  To deploy manually later:"
-                echo "    git clone https://github.com/${REPO}"
-                echo "    cd gsv/gateway"
-                echo "    bunx alchemy deploy alchemy/deploy.ts"
+                echo "    gsv deploy up --wizard --all"
                 echo ""
                 
                 # Still offer to install CLI
@@ -386,24 +310,32 @@ main() {
                 fi
                 exit 0
             fi
-            
-            echo ""
-            clone_repository
-            echo ""
-            deploy_gateway || {
-                warn "Deployment failed, but you can try again later:"
-                echo "    cd ~/.gsv/src/gateway && bunx alchemy deploy alchemy/deploy.ts"
-                echo ""
-            }
+
+            WANT_DEPLOY="true"
         fi
     fi
     
     # Install CLI
     echo ""
     download_cli
+
+    if [ "$WANT_DEPLOY" = "true" ]; then
+        echo ""
+        if deploy_with_cli; then
+            DEPLOYED_WITH_CLI="true"
+            local_gateway_ws=$(gsv local-config get gateway.url 2>/dev/null | tail -n 1 || true)
+            if [ -n "$local_gateway_ws" ]; then
+                GATEWAY_URL="${local_gateway_ws%/ws}"
+            fi
+        else
+            warn "Deployment failed, but you can try again later:"
+            echo "    gsv deploy up --wizard --all"
+            echo ""
+        fi
+    fi
     
     # Configure if we have a URL
-    if [ -n "$GATEWAY_URL" ]; then
+    if [ -n "$GATEWAY_URL" ] && [ "$DEPLOYED_WITH_CLI" != "true" ]; then
         echo ""
         configure_cli "$GATEWAY_URL"
     fi

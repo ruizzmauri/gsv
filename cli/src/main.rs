@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use gsv::config::{self, CliConfig};
 use gsv::connection::Connection;
+use gsv::deploy;
 use gsv::protocol::{
     Frame, LogsGetPayload, LogsResultParams, NodeRuntimeInfo, ToolDefinition, ToolInvokePayload,
     ToolResultParams,
@@ -9,7 +10,7 @@ use gsv::tools::{all_tools_with_workspace, Tool};
 use serde_json::json;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -82,6 +83,12 @@ enum Commands {
     LocalConfig {
         #[command(subcommand)]
         action: LocalConfigAction,
+    },
+
+    /// Cloudflare deployment commands (up/down/status)
+    Deploy {
+        #[command(subcommand)]
+        action: DeployAction,
     },
 
     /// Manage sessions
@@ -359,6 +366,182 @@ enum LocalConfigAction {
 }
 
 #[derive(Subcommand)]
+enum DeployAction {
+    /// Deploy prebuilt Cloudflare bundles (fetch/install + apply)
+    Up {
+        /// Release tag (e.g., v0.2.0) or "latest"
+        #[arg(long, default_value = "latest")]
+        version: String,
+
+        /// Component to include (repeat for multiple)
+        #[arg(short = 'c', long = "component")]
+        component: Vec<String>,
+
+        /// Include all components
+        #[arg(long)]
+        all: bool,
+
+        /// Overwrite existing extracted bundle directories
+        #[arg(long)]
+        force_fetch: bool,
+
+        /// Use local Cloudflare bundle directory instead of downloading from release assets
+        #[arg(long)]
+        bundle_dir: Option<PathBuf>,
+
+        /// Run interactive setup prompts (first-time guided flow)
+        #[arg(long)]
+        wizard: bool,
+
+        /// Cloudflare API token (falls back to config `cloudflare.api_token`)
+        #[arg(long, env = "CF_API_TOKEN")]
+        api_token: Option<String>,
+
+        /// Cloudflare account ID override (falls back to config `cloudflare.account_id`)
+        #[arg(long, env = "CF_ACCOUNT_ID")]
+        account_id: Option<String>,
+
+        /// Gateway auth token to set in gateway config (`auth.token`)
+        #[arg(long, env = "GSV_GATEWAY_AUTH_TOKEN")]
+        gateway_auth_token: Option<String>,
+
+        /// LLM provider to configure on gateway (`anthropic`, `openai`, `google`, `openrouter`)
+        #[arg(long)]
+        llm_provider: Option<String>,
+
+        /// LLM model ID to configure on gateway
+        #[arg(long)]
+        llm_model: Option<String>,
+
+        /// LLM API key to configure on gateway (`apiKeys.<provider>`)
+        #[arg(long)]
+        llm_api_key: Option<String>,
+
+        /// Discord bot token to upload as worker secret (`DISCORD_BOT_TOKEN`)
+        #[arg(long, env = "DISCORD_BOT_TOKEN")]
+        discord_bot_token: Option<String>,
+    },
+
+    /// Tear down deployed Cloudflare workers for selected components
+    Down {
+        /// Component to remove (repeat for multiple)
+        #[arg(short = 'c', long = "component")]
+        component: Vec<String>,
+
+        /// Remove all components
+        #[arg(long)]
+        all: bool,
+
+        /// Also delete the gateway inbound queue
+        #[arg(long)]
+        delete_queue: bool,
+
+        /// Also delete the shared R2 storage bucket
+        #[arg(long)]
+        delete_bucket: bool,
+
+        /// Purge all objects from the shared R2 bucket before deleting it (requires --delete-bucket)
+        #[arg(long)]
+        purge_bucket: bool,
+
+        /// Cloudflare API token (falls back to config `cloudflare.api_token`)
+        #[arg(long, env = "CF_API_TOKEN")]
+        api_token: Option<String>,
+
+        /// Cloudflare account ID override (falls back to config `cloudflare.account_id`)
+        #[arg(long, env = "CF_ACCOUNT_ID")]
+        account_id: Option<String>,
+    },
+
+    /// Show deployment status for selected components
+    Status {
+        /// Component to inspect (repeat for multiple)
+        #[arg(short = 'c', long = "component")]
+        component: Vec<String>,
+
+        /// Inspect all components
+        #[arg(long)]
+        all: bool,
+
+        /// Cloudflare API token (falls back to config `cloudflare.api_token`)
+        #[arg(long, env = "CF_API_TOKEN")]
+        api_token: Option<String>,
+
+        /// Cloudflare account ID override (falls back to config `cloudflare.account_id`)
+        #[arg(long, env = "CF_ACCOUNT_ID")]
+        account_id: Option<String>,
+    },
+
+    /// Manage prebuilt Cloudflare bundles from GitHub releases
+    #[command(hide = true)]
+    Bundle {
+        #[command(subcommand)]
+        action: DeployBundleAction,
+    },
+
+    /// Cloudflare account helpers used by deploy workflows
+    #[command(hide = true)]
+    Account {
+        #[command(subcommand)]
+        action: DeployAccountAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeployBundleAction {
+    /// Download and verify prebuilt Cloudflare bundles
+    Fetch {
+        /// Release tag (e.g., v0.2.0) or "latest"
+        #[arg(long, default_value = "latest")]
+        version: String,
+
+        /// Component to fetch (repeat for multiple)
+        #[arg(short = 'c', long = "component")]
+        component: Vec<String>,
+
+        /// Fetch all components
+        #[arg(long)]
+        all: bool,
+
+        /// Overwrite existing extracted bundle directories
+        #[arg(long)]
+        force: bool,
+
+        /// Use local Cloudflare bundle directory instead of downloading from release assets
+        #[arg(long)]
+        from_dir: Option<PathBuf>,
+    },
+
+    /// Show bundle manifest details from local extracted bundles
+    Inspect {
+        /// Release tag (e.g., v0.2.0) or "latest"
+        #[arg(long, default_value = "latest")]
+        version: String,
+
+        /// Component to inspect
+        #[arg(short = 'c', long = "component")]
+        component: String,
+    },
+
+    /// List valid component names
+    ListComponents,
+}
+
+#[derive(Subcommand)]
+enum DeployAccountAction {
+    /// Resolve Cloudflare account ID from API token (auto-picks if exactly one account)
+    Resolve {
+        /// Cloudflare API token (falls back to config `cloudflare.api_token`)
+        #[arg(long, env = "CF_API_TOKEN")]
+        api_token: Option<String>,
+
+        /// Cloudflare account ID override (falls back to config `cloudflare.account_id`)
+        #[arg(long, env = "CF_ACCOUNT_ID")]
+        account_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SessionAction {
     /// List all known sessions
     List {
@@ -493,6 +676,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Config { action } => run_config(&url, token, action).await,
         Commands::LocalConfig { action } => run_local_config(action),
+        Commands::Deploy { action } => run_deploy(action, &cfg).await,
         Commands::Session { action } => run_session(&url, token, action).await,
         Commands::Tools { action } => run_tools(&url, token, action).await,
         Commands::Mount { action } => run_mount(action, &cfg).await,
@@ -554,6 +738,14 @@ fn run_local_config(action: LocalConfigAction) -> Result<(), Box<dyn std::error:
                         "****".to_string()
                     }
                 }),
+                "cloudflare.account_id" => cfg.cloudflare.account_id,
+                "cloudflare.api_token" => cfg.cloudflare.api_token.map(|s| {
+                    if s.len() > 8 {
+                        format!("{}...{}", &s[..4], &s[s.len() - 4..])
+                    } else {
+                        "****".to_string()
+                    }
+                }),
                 "r2.account_id" => cfg.r2.account_id,
                 "r2.access_key_id" => cfg.r2.access_key_id.map(|s| {
                     if s.len() > 8 {
@@ -570,6 +762,7 @@ fn run_local_config(action: LocalConfigAction) -> Result<(), Box<dyn std::error:
                     eprintln!("Unknown config key: {}", key);
                     eprintln!("\nValid keys:");
                     eprintln!("  gateway.url, gateway.token");
+                    eprintln!("  cloudflare.account_id, cloudflare.api_token");
                     eprintln!("  r2.account_id, r2.access_key_id, r2.bucket");
                     eprintln!("  session.default_key");
                     eprintln!("  node.id, node.workspace");
@@ -589,6 +782,8 @@ fn run_local_config(action: LocalConfigAction) -> Result<(), Box<dyn std::error:
             match key.as_str() {
                 "gateway.url" => cfg.gateway.url = Some(value.clone()),
                 "gateway.token" => cfg.gateway.token = Some(value.clone()),
+                "cloudflare.account_id" => cfg.cloudflare.account_id = Some(value.clone()),
+                "cloudflare.api_token" => cfg.cloudflare.api_token = Some(value.clone()),
                 "r2.account_id" => cfg.r2.account_id = Some(value.clone()),
                 "r2.access_key_id" => cfg.r2.access_key_id = Some(value.clone()),
                 "r2.secret_access_key" => cfg.r2.secret_access_key = Some(value.clone()),
@@ -637,6 +832,574 @@ fn run_local_config(action: LocalConfigAction) -> Result<(), Box<dyn std::error:
     }
 
     Ok(())
+}
+
+fn normalize_llm_provider(provider: &str) -> Option<String> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "anthropic" => Some("anthropic".to_string()),
+        "openai" => Some("openai".to_string()),
+        "google" => Some("google".to_string()),
+        "openrouter" => Some("openrouter".to_string()),
+        _ => None,
+    }
+}
+
+fn default_llm_model_for_provider(provider: &str) -> Option<&'static str> {
+    match provider {
+        "anthropic" => Some("claude-sonnet-4-20250514"),
+        "openai" => Some("gpt-4.1"),
+        "google" => Some("gemini-2.5-flash"),
+        "openrouter" => Some("anthropic/claude-sonnet-4"),
+        _ => None,
+    }
+}
+
+fn env_api_key_for_provider(provider: &str) -> Option<String> {
+    match provider {
+        "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
+        "openai" => std::env::var("OPENAI_API_KEY").ok(),
+        "google" => std::env::var("GOOGLE_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("GEMINI_API_KEY").ok()),
+        "openrouter" => std::env::var("OPENROUTER_API_KEY").ok(),
+        _ => None,
+    }
+    .filter(|value| !value.trim().is_empty())
+}
+
+fn generate_gateway_auth_token() -> String {
+    format!(
+        "gsv_{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn can_prompt_interactively() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+    print!("{} {}: ", prompt, suffix);
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim().to_ascii_lowercase();
+
+    if trimmed.is_empty() {
+        return Ok(default_yes);
+    }
+    if trimmed == "y" || trimmed == "yes" {
+        return Ok(true);
+    }
+    if trimmed == "n" || trimmed == "no" {
+        return Ok(false);
+    }
+
+    Ok(default_yes)
+}
+
+fn prompt_line(
+    prompt: &str,
+    default: Option<&str>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match default {
+        Some(value) => print!("{} [{}]: ", prompt, value),
+        None => print!("{}: ", prompt),
+    }
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim();
+
+    if trimmed.is_empty() {
+        if let Some(value) = default {
+            return Ok(Some(value.to_string()));
+        }
+        return Ok(None);
+    }
+
+    Ok(Some(trimmed.to_string()))
+}
+
+fn prompt_secret(prompt: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let value = rpassword::prompt_password(format!("{}: ", prompt))?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn gateway_http_url_to_ws_url(gateway_url: &str) -> String {
+    let mut ws_url = if let Some(rest) = gateway_url.strip_prefix("https://") {
+        format!("wss://{}", rest)
+    } else if let Some(rest) = gateway_url.strip_prefix("http://") {
+        format!("ws://{}", rest)
+    } else {
+        gateway_url.to_string()
+    };
+
+    if !ws_url.ends_with("/ws") {
+        ws_url = ws_url.trim_end_matches('/').to_string();
+        ws_url.push_str("/ws");
+    }
+
+    ws_url
+}
+
+fn save_gateway_local_config(
+    gateway_url: &str,
+    auth_token: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut local_cfg = CliConfig::load();
+    local_cfg.gateway.url = Some(gateway_http_url_to_ws_url(gateway_url));
+    if let Some(token) = auth_token {
+        local_cfg.gateway.token = Some(token.to_string());
+    }
+    local_cfg.save()?;
+    Ok(())
+}
+
+async fn run_deploy(
+    action: DeployAction,
+    cfg: &CliConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        DeployAction::Up {
+            version,
+            component,
+            all,
+            force_fetch,
+            bundle_dir,
+            wizard,
+            api_token,
+            account_id,
+            gateway_auth_token,
+            llm_provider,
+            llm_model,
+            llm_api_key,
+            discord_bot_token,
+        } => {
+            if all && !component.is_empty() {
+                return Err("Use either --all or one/more --component values, not both".into());
+            }
+
+            let token = api_token
+                .or_else(|| cfg.cloudflare.api_token.clone())
+                .ok_or("Cloudflare API token missing. Set --api-token or `gsv local-config set cloudflare.api_token ...`")?;
+            let configured_account_id = account_id
+                .or_else(|| cfg.cloudflare.account_id.clone())
+                .filter(|v| !v.trim().is_empty());
+
+            let resolved_account_id =
+                deploy::resolve_cloudflare_account_id(&token, configured_account_id.as_deref())
+                    .await?;
+            println!("Cloudflare account ID: {}", resolved_account_id);
+
+            let components = if all {
+                deploy::available_components()
+                    .iter()
+                    .map(|c| (*c).to_string())
+                    .collect::<Vec<_>>()
+            } else {
+                deploy::normalize_components(&component)?
+            };
+
+            let deploying_gateway = components.iter().any(|c| c == "gateway");
+            let deploying_whatsapp = components.iter().any(|c| c == "channel-whatsapp");
+            let deploying_discord = components.iter().any(|c| c == "channel-discord");
+            let interactive = can_prompt_interactively();
+            let wizard_mode = wizard;
+
+            if wizard_mode && !interactive {
+                return Err("--wizard requires an interactive terminal".into());
+            }
+
+            let mut resolved_provider = match llm_provider {
+                Some(provider) => Some(
+                    normalize_llm_provider(&provider).ok_or_else(|| {
+                        format!(
+                            "Invalid --llm-provider '{}'. Valid values: anthropic, openai, google, openrouter",
+                            provider
+                        )
+                    })?,
+                ),
+                None => None,
+            };
+            let mut resolved_llm_model = llm_model;
+            let mut resolved_llm_api_key = llm_api_key;
+            let mut resolved_discord_bot_token = discord_bot_token;
+            let explicit_gateway_auth_token = gateway_auth_token.clone();
+            let mut desired_gateway_auth_token = explicit_gateway_auth_token.clone();
+            let connect_gateway_auth_token = explicit_gateway_auth_token
+                .clone()
+                .or_else(|| cfg.gateway.token.clone());
+
+            if !deploying_gateway
+                && (explicit_gateway_auth_token.is_some()
+                    || resolved_provider.is_some()
+                    || resolved_llm_model.is_some()
+                    || resolved_llm_api_key.is_some())
+            {
+                return Err(
+                    "Gateway bootstrap options require deploying the `gateway` component.".into(),
+                );
+            }
+
+            if resolved_llm_model.is_some() && resolved_provider.is_none() {
+                return Err("--llm-model requires --llm-provider".into());
+            }
+            if resolved_llm_api_key.is_some() && resolved_provider.is_none() {
+                return Err("--llm-api-key requires --llm-provider".into());
+            }
+
+            if deploying_gateway
+                && resolved_provider.is_none()
+                && resolved_llm_model.is_none()
+                && resolved_llm_api_key.is_none()
+                && wizard_mode
+                && interactive
+                && prompt_yes_no("Configure gateway auth + LLM settings now?", true)?
+            {
+                let provider = prompt_line(
+                    "LLM provider (anthropic/openai/google/openrouter)",
+                    Some("anthropic"),
+                )?
+                .ok_or("Provider is required")?;
+                resolved_provider = Some(
+                    normalize_llm_provider(&provider).ok_or_else(|| {
+                        format!(
+                            "Invalid provider '{}'. Valid values: anthropic, openai, google, openrouter",
+                            provider
+                        )
+                    })?,
+                );
+            }
+
+            if let Some(provider) = resolved_provider.as_deref() {
+                if resolved_llm_model.is_none() {
+                    let default_model = default_llm_model_for_provider(provider)
+                        .ok_or_else(|| format!("No default model for provider {}", provider))?;
+                    if interactive && wizard_mode {
+                        resolved_llm_model = prompt_line("LLM model", Some(default_model))?;
+                    } else {
+                        resolved_llm_model = Some(default_model.to_string());
+                    }
+                }
+
+                if resolved_llm_api_key.is_none() {
+                    resolved_llm_api_key = env_api_key_for_provider(provider);
+                }
+                if resolved_llm_api_key.is_none() && interactive && wizard_mode {
+                    resolved_llm_api_key = prompt_secret(&format!("{} API key", provider))?;
+                }
+                if resolved_llm_api_key.is_none() {
+                    return Err(format!(
+                        "Missing API key for provider '{}'. Use --llm-api-key or set the provider env var.",
+                        provider
+                    )
+                    .into());
+                }
+            }
+
+            if deploying_discord
+                && resolved_discord_bot_token.is_none()
+                && wizard_mode
+                && interactive
+            {
+                if prompt_yes_no(
+                    "Configure Discord bot token on deployed channel worker now?",
+                    true,
+                )? {
+                    resolved_discord_bot_token = prompt_secret("Discord bot token")?;
+                }
+            }
+
+            let bundle_version = if bundle_dir.is_some() {
+                deploy::local_bundle_version_label(&version)
+            } else {
+                deploy::resolve_release_tag(&version).await?
+            };
+            println!("Preparing components: {}", components.join(", "));
+            if let Some(dir) = bundle_dir {
+                println!("Using local bundles from {}", dir.display());
+                deploy::install_bundles_from_dir(cfg, &dir, &version, &components, force_fetch)?;
+            } else {
+                deploy::fetch_bundles(cfg, &version, &components, force_fetch).await?;
+            }
+
+            println!();
+            println!(
+                "Preparation complete. Applying deploy from version {}.",
+                bundle_version
+            );
+            let apply_result = deploy::apply_deploy(
+                cfg,
+                &resolved_account_id,
+                &token,
+                &bundle_version,
+                &components,
+            )
+            .await?;
+
+            if deploying_gateway
+                && desired_gateway_auth_token.is_none()
+                && !apply_result.gateway_existed_before_deploy
+            {
+                desired_gateway_auth_token = cfg
+                    .gateway
+                    .token
+                    .clone()
+                    .or_else(|| Some(generate_gateway_auth_token()));
+            }
+
+            if deploying_gateway {
+                if let Some(gateway_url) = apply_result.gateway_url.as_deref() {
+                    let set_whatsapp_pairing =
+                        deploying_whatsapp && !apply_result.gateway_existed_before_deploy;
+                    let gateway_bootstrap = deploy::GatewayBootstrapConfig {
+                        auth_token: desired_gateway_auth_token.clone(),
+                        llm_provider: resolved_provider.clone(),
+                        llm_model: resolved_llm_model.clone(),
+                        llm_api_key: resolved_llm_api_key.clone(),
+                        set_whatsapp_pairing,
+                    };
+
+                    let should_bootstrap = gateway_bootstrap.auth_token.is_some()
+                        || gateway_bootstrap.llm_provider.is_some()
+                        || gateway_bootstrap.llm_model.is_some()
+                        || gateway_bootstrap.llm_api_key.is_some()
+                        || gateway_bootstrap.set_whatsapp_pairing;
+
+                    let mut bootstrap_applied = false;
+                    if should_bootstrap {
+                        println!();
+                        println!("Applying gateway runtime configuration...");
+                        match deploy::bootstrap_gateway_config(
+                            gateway_url,
+                            connect_gateway_auth_token
+                                .as_deref()
+                                .or(desired_gateway_auth_token.as_deref()),
+                            &gateway_bootstrap,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                bootstrap_applied = true;
+                                if let Some(token_value) = gateway_bootstrap.auth_token.as_deref() {
+                                    if cfg.gateway.token.as_deref() != Some(token_value) {
+                                        println!(
+                                            "Gateway auth token: {}...{}",
+                                            &token_value[..4.min(token_value.len())],
+                                            &token_value[token_value.len().saturating_sub(4)..]
+                                        );
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                println!(
+                                    "Warning: gateway runtime configuration failed: {}",
+                                    error
+                                );
+                                println!("You can apply settings manually with:");
+                                println!("  gsv config set auth.token <token>");
+                                println!("  gsv config set model.provider <provider>");
+                                println!("  gsv config set model.id <model>");
+                                println!("  gsv config set apiKeys.<provider> <api-key>");
+                            }
+                        }
+                    }
+
+                    if bootstrap_applied {
+                        save_gateway_local_config(
+                            gateway_url,
+                            desired_gateway_auth_token.as_deref(),
+                        )?;
+                        println!("Saved gateway URL/token to local config.");
+                    }
+                } else {
+                    println!(
+                        "Warning: gateway URL was unavailable, skipping runtime configuration step."
+                    );
+                }
+            }
+
+            if deploying_discord {
+                if let Some(bot_token) = resolved_discord_bot_token.as_deref() {
+                    println!("Setting DISCORD_BOT_TOKEN secret on Discord channel worker...");
+                    deploy::set_discord_bot_token_secret(&resolved_account_id, &token, bot_token)
+                        .await?;
+                    println!("Configured DISCORD_BOT_TOKEN.");
+                } else {
+                    println!("Note: Discord bot token not configured.");
+                    println!(
+                        "Tip: rerun deploy with --discord-bot-token (or DISCORD_BOT_TOKEN env) before `gsv channel discord start`."
+                    );
+                }
+            }
+
+            Ok(())
+        }
+        DeployAction::Down {
+            component,
+            all,
+            delete_queue,
+            delete_bucket,
+            purge_bucket,
+            api_token,
+            account_id,
+        } => {
+            if all && !component.is_empty() {
+                return Err("Use either --all or one/more --component values, not both".into());
+            }
+            if !all && component.is_empty() {
+                return Err(
+                    "Refusing to tear down without explicit targets. Use --all or at least one --component."
+                        .into(),
+                );
+            }
+            if purge_bucket && !delete_bucket {
+                return Err("--purge-bucket requires --delete-bucket".into());
+            }
+
+            let token = api_token
+                .or_else(|| cfg.cloudflare.api_token.clone())
+                .ok_or("Cloudflare API token missing. Set --api-token or `gsv local-config set cloudflare.api_token ...`")?;
+            let configured_account_id = account_id
+                .or_else(|| cfg.cloudflare.account_id.clone())
+                .filter(|v| !v.trim().is_empty());
+
+            let resolved_account_id =
+                deploy::resolve_cloudflare_account_id(&token, configured_account_id.as_deref())
+                    .await?;
+            println!("Cloudflare account ID: {}", resolved_account_id);
+
+            let components = if all {
+                deploy::available_components()
+                    .iter()
+                    .map(|c| (*c).to_string())
+                    .collect::<Vec<_>>()
+            } else {
+                deploy::normalize_components(&component)?
+            };
+
+            println!("Tearing down components: {}", components.join(", "));
+            deploy::destroy_deploy(
+                &resolved_account_id,
+                &token,
+                &components,
+                delete_queue,
+                delete_bucket,
+                purge_bucket,
+            )
+            .await
+        }
+        DeployAction::Status {
+            component,
+            all,
+            api_token,
+            account_id,
+        } => {
+            if all && !component.is_empty() {
+                return Err("Use either --all or one/more --component values, not both".into());
+            }
+
+            let token = api_token
+                .or_else(|| cfg.cloudflare.api_token.clone())
+                .ok_or("Cloudflare API token missing. Set --api-token or `gsv local-config set cloudflare.api_token ...`")?;
+            let configured_account_id = account_id
+                .or_else(|| cfg.cloudflare.account_id.clone())
+                .filter(|v| !v.trim().is_empty());
+
+            let resolved_account_id =
+                deploy::resolve_cloudflare_account_id(&token, configured_account_id.as_deref())
+                    .await?;
+            println!("Cloudflare account ID: {}", resolved_account_id);
+
+            let components = if all {
+                deploy::available_components()
+                    .iter()
+                    .map(|c| (*c).to_string())
+                    .collect::<Vec<_>>()
+            } else {
+                deploy::normalize_components(&component)?
+            };
+
+            println!("Checking components: {}", components.join(", "));
+            deploy::print_deploy_status(&resolved_account_id, &token, &components).await
+        }
+        DeployAction::Bundle { action } => match action {
+            DeployBundleAction::Fetch {
+                version,
+                component,
+                all,
+                force,
+                from_dir,
+            } => {
+                if all && !component.is_empty() {
+                    return Err("Use either --all or one/more --component values, not both".into());
+                }
+
+                let components = if all {
+                    deploy::available_components()
+                        .iter()
+                        .map(|c| (*c).to_string())
+                        .collect::<Vec<_>>()
+                } else {
+                    deploy::normalize_components(&component)?
+                };
+
+                println!("Fetching components: {}", components.join(", "));
+                if let Some(dir) = from_dir {
+                    println!("Installing bundles from local directory: {}", dir.display());
+                    deploy::install_bundles_from_dir(cfg, &dir, &version, &components, force)
+                } else {
+                    deploy::fetch_bundles(cfg, &version, &components, force).await
+                }
+            }
+            DeployBundleAction::Inspect { version, component } => {
+                deploy::inspect_bundle(cfg, &version, &component).await
+            }
+            DeployBundleAction::ListComponents => {
+                println!("Available components:");
+                for component in deploy::available_components() {
+                    println!("  {}", component);
+                }
+                Ok(())
+            }
+        },
+        DeployAction::Account { action } => match action {
+            DeployAccountAction::Resolve {
+                api_token,
+                account_id,
+            } => {
+                let token = api_token
+                    .or_else(|| cfg.cloudflare.api_token.clone())
+                    .ok_or("Cloudflare API token missing. Set --api-token or `gsv local-config set cloudflare.api_token ...`")?;
+                let configured_account_id = account_id
+                    .or_else(|| cfg.cloudflare.account_id.clone())
+                    .filter(|v| !v.trim().is_empty());
+
+                let resolved =
+                    deploy::resolve_cloudflare_account_id(&token, configured_account_id.as_deref())
+                        .await?;
+                if configured_account_id.is_some() {
+                    println!("Using configured Cloudflare account ID: {}", resolved);
+                } else {
+                    println!("Resolved Cloudflare account ID: {}", resolved);
+                    println!(
+                        "Tip: persist it with `gsv local-config set cloudflare.account_id {}`",
+                        resolved
+                    );
+                }
+                Ok(())
+            }
+        },
+    }
 }
 
 #[cfg(target_os = "linux")]

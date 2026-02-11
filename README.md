@@ -8,7 +8,6 @@
 
 - [Cloudflare account](https://dash.cloudflare.com/sign-up) (free tier works)
 - [Rust](https://rustup.rs) (for CLI)
-- [Bun](https://bun.sh) (for deployment)
 - [Node.js + npm](https://nodejs.org) (for package installation)
 
 ### Deploy
@@ -16,18 +15,23 @@
 ```bash
 git clone https://github.com/deathbyknowledge/gsv
 cd gsv
-./scripts/setup-deps.sh
 
-# Run the deployment wizard (from gateway/)
-cd gateway
-bun alchemy/cli.ts wizard
+# Build and install CLI
+cargo install --path cli --force
+
+# Configure Cloudflare credentials (or pass --api-token/--account-id each time)
+gsv local-config set cloudflare.api_token <your-cloudflare-api-token>
+gsv local-config set cloudflare.account_id <your-cloudflare-account-id>
+
+# First-time guided deploy
+gsv deploy up --wizard --all
 ```
 
 The wizard will:
 1. Ask for your LLM provider and API key
 2. Deploy Gateway and channels to Cloudflare
-3. Configure everything automatically
-4. Install the CLI
+3. Configure Gateway auth/model/API key automatically
+4. Optionally configure Discord bot token secret
 
 If you want to configure a different machine after deployment:
 
@@ -214,8 +218,9 @@ cd gateway && npm run dev
 # CLI
 cd cli && cargo build --release
 
-# Deploy manually
-cd gateway && npm run deploy
+# Build local Cloudflare bundles and deploy via CLI
+./scripts/build-cloudflare-bundles.sh
+gsv deploy up --bundle-dir ./release/local --version local-dev --all --force-fetch
 ```
 
 ## Security
