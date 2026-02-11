@@ -639,6 +639,71 @@ describe("Session State", () => {
     
     ws.close();
   });
+
+  it("auto-resets on idle policy and preserves the triggering message", async () => {
+    const sessionKey = `auto-reset-idle-${crypto.randomUUID()}`;
+    const wsUrl = gatewayUrl.replace("https://", "wss://") + "/ws";
+    const ws = await connectAndAuth(wsUrl);
+
+    // Ensure session exists and capture current sessionId
+    const initial = await sendRequest(ws, "session.get", {
+      sessionKey,
+    }) as { sessionId: string };
+    const oldSessionId = initial.sessionId;
+
+    // Configure idle reset with 0 minutes to trigger immediately on next run.
+    await sendRequest(ws, "session.patch", {
+      sessionKey,
+      resetPolicy: { mode: "idle", idleMinutes: 0 },
+    });
+
+    // Ensure now > updatedAt by at least a few ms before starting run.
+    await Bun.sleep(20);
+
+    const started = await sendRequest(ws, "chat.send", {
+      sessionKey,
+      message: "trigger idle auto reset",
+    }) as { status: string };
+    expect(started.status).toBe("started");
+
+    let after: {
+      sessionId: string;
+      previousSessionIds: string[];
+      lastResetAt?: number;
+      messageCount: number;
+    } | null = null;
+
+    // Poll until reset is observed
+    for (let i = 0; i < 30; i++) {
+      const current = await sendRequest(ws, "session.get", {
+        sessionKey,
+      }) as {
+        sessionId: string;
+        previousSessionIds: string[];
+        lastResetAt?: number;
+        messageCount: number;
+      };
+
+      if (
+        current.sessionId !== oldSessionId &&
+        current.previousSessionIds.includes(oldSessionId)
+      ) {
+        after = current;
+        break;
+      }
+
+      await Bun.sleep(100);
+    }
+
+    expect(after).not.toBeNull();
+    expect(after!.sessionId).not.toBe(oldSessionId);
+    expect(after!.previousSessionIds.includes(oldSessionId)).toBe(true);
+    expect(typeof after!.lastResetAt).toBe("number");
+    // The inbound message should survive reset and be processed in the new session.
+    expect(after!.messageCount).toBeGreaterThanOrEqual(1);
+
+    ws.close();
+  });
 });
 
 // ============================================================================
