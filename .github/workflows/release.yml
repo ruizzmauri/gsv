@@ -96,11 +96,14 @@ jobs:
 
       - name: Install dependencies
         run: |
-          npm ci --prefix gateway
-          npm ci --prefix gateway/ui
-          npm ci --prefix channels/whatsapp
-          npm ci --prefix channels/discord
-          npm ci --prefix channels/test
+          set -euo pipefail
+          for dir in gateway gateway/ui channels/whatsapp channels/discord channels/test; do
+            if [ -f "$dir/package-lock.json" ]; then
+              npm ci --prefix "$dir"
+            else
+              npm install --prefix "$dir" --no-audit --no-fund
+            fi
+          done
 
       - name: Build web UI
         working-directory: gateway/ui
