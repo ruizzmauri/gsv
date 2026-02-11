@@ -23,7 +23,15 @@ qrcode = "0.14"
 # TLS backends - use native-tls by default (respects system certs)
 # CI builds for Linux use rustls feature to avoid OpenSSL dependency
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }
+sha2 = "0.10"
+base64 = "0.22"
+blake3 = "1.5"
+mime_guess = "2.0"
+flate2 = "1.0"
+tar = "0.4"
+json5 = "0.4"
+rpassword = "7"
 
 # Only needed when rustls feature is enabled
 rustls_crate = { package = "rustls", version = "0.23", default-features = false, features = ["ring", "std"], optional = true }

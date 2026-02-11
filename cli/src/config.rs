@@ -21,6 +21,10 @@ pub struct CliConfig {
     #[serde(default)]
     pub gateway: GatewayConfig,
 
+    /// Cloudflare API settings (for deploy commands)
+    #[serde(default)]
+    pub cloudflare: CloudflareConfig,
+
     /// R2 storage settings (for mount command)
     #[serde(default)]
     pub r2: R2Config,
@@ -70,6 +74,15 @@ impl Default for GatewayConfig {
             token: None,
         }
     }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct CloudflareConfig {
+    /// Cloudflare account ID
+    pub account_id: Option<String>,
+
+    /// Cloudflare API token
+    pub api_token: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -229,6 +242,11 @@ url = "wss://gateway.stevej.workers.dev/ws"
 
 # Auth token (keep secret!)
 token = "your-token-here"
+
+[cloudflare]
+# Used by 'gsv deploy' commands
+# account_id = "your-cloudflare-account-id"
+# api_token = "your-cloudflare-api-token"
 
 [r2]
 # Cloudflare R2 credentials (for 'gsv mount' command)
