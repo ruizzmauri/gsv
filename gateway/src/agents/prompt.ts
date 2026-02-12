@@ -9,6 +9,7 @@ import {
 import type { SkillEntryConfig } from "../config";
 import type { SkillSummary } from "../skills";
 import { isHeartbeatFileEmpty, type AgentWorkspace } from "./loader";
+import { NATIVE_TOOL_PREFIX } from "./tools/constants";
 
 export type PromptRuntimeInfo = {
   agentId: string;
@@ -187,7 +188,9 @@ export function buildSystemPromptFromWorkspace(
 }
 
 function joinSections(sections: string[]): string {
-  return sections.filter((section) => section.trim().length > 0).join("\n\n---\n\n");
+  return sections
+    .filter((section) => section.trim().length > 0)
+    .join("\n\n---\n\n");
 }
 
 function summarizeToolDescription(description: string): string {
@@ -199,11 +202,14 @@ function summarizeToolDescription(description: string): string {
 }
 
 function buildToolingSection(tools: ToolDefinition[] | undefined): string {
-  const workspaceToolCount =
-    tools?.filter((tool) => tool.name.startsWith("gsv__")).length ?? 0;
+  const nativeToolCount =
+    tools?.filter((tool) => tool.name.startsWith(NATIVE_TOOL_PREFIX)).length ??
+    0;
   const namespacedNodeToolCount =
-    tools?.filter((tool) => tool.name.includes("__") && !tool.name.startsWith("gsv__"))
-      .length ?? 0;
+    tools?.filter(
+      (tool) =>
+        tool.name.includes("__") && !tool.name.startsWith(NATIVE_TOOL_PREFIX),
+    ).length ?? 0;
   const lines = [
     "## Tooling",
     "Tool availability for this run is defined by the tool list passed at runtime.",
@@ -216,10 +222,10 @@ function buildToolingSection(tools: ToolDefinition[] | undefined): string {
   }
 
   lines.push(
-    `Workspace tools: ${workspaceToolCount}. Node tools: ${namespacedNodeToolCount}.`,
+    `Native tools: ${nativeToolCount}. Node tools: ${namespacedNodeToolCount}.`,
   );
   lines.push(
-    "`gsv__*` tools are native workspace operations. `<nodeId>__<toolName>` tools target a specific connected node.",
+    "`gsv__*` tools are native Gateway tools. `<nodeId>__<toolName>` tools target a specific connected node.",
   );
   lines.push("Available tools:");
   for (const tool of tools) {
@@ -300,7 +306,9 @@ function buildHeartbeatSection(
   return lines.join("\n");
 }
 
-function buildRuntimeSection(runtime: PromptRuntimeInfo | undefined): string | undefined {
+function buildRuntimeSection(
+  runtime: PromptRuntimeInfo | undefined,
+): string | undefined {
   if (!runtime) {
     return undefined;
   }
@@ -352,7 +360,8 @@ function buildRuntimeSection(runtime: PromptRuntimeInfo | undefined): string | u
           host.hostCapabilities.length > 0
             ? host.hostCapabilities.join(", ")
             : "none";
-        const toolNames = host.tools.length > 0 ? host.tools.join(", ") : "none";
+        const toolNames =
+          host.tools.length > 0 ? host.tools.join(", ") : "none";
         lines.push(
           `- ${host.nodeId} (${host.hostRole}) capabilities=[${capabilities}] tools=[${toolNames}]`,
         );
@@ -363,16 +372,23 @@ function buildRuntimeSection(runtime: PromptRuntimeInfo | undefined): string | u
   return lines.join("\n");
 }
 
-function resolveWorkspaceReadToolName(tools: ToolDefinition[] | undefined): string {
+function resolveWorkspaceReadToolName(
+  tools: ToolDefinition[] | undefined,
+): string {
   if (!tools || tools.length === 0) {
     return "gsv__ReadFile";
   }
 
-  const match = tools.find((tool) => tool.name.toLowerCase() === "gsv__readfile");
+  const match = tools.find(
+    (tool) => tool.name.toLowerCase() === "gsv__readfile",
+  );
   return match?.name || "gsv__ReadFile";
 }
 
-function resolveSkillReadPath(location: string, agentId: string): string | null {
+function resolveSkillReadPath(
+  location: string,
+  agentId: string,
+): string | null {
   if (!location.endsWith("/SKILL.md")) {
     return null;
   }
@@ -689,10 +705,12 @@ function buildSkillsSection(
     return "";
   }
 
-  const configFilteredCount = readableSkills.length - configEligibleSkills.length;
+  const configFilteredCount =
+    readableSkills.length - configEligibleSkills.length;
   const invalidRequirementFilteredCount =
     configEligibleSkills.length - validRequirementSkills.length;
-  const runtimeFilteredCount = validRequirementSkills.length - eligibleSkills.length;
+  const runtimeFilteredCount =
+    validRequirementSkills.length - eligibleSkills.length;
 
   const lines = [
     "## Skills (Mandatory Scan)",

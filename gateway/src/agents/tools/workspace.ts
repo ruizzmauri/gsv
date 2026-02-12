@@ -8,143 +8,81 @@
  * The agent's workspace is scoped to: agents/{agentId}/
  */
 
-import type { ToolDefinition } from "../protocol/tools";
+import { NATIVE_TOOLS } from "./constants";
+import type { ToolDefinition } from "../../protocol/tools";
 
-export const WORKSPACE_TOOL_PREFIX = "gsv__";
-export const WORKSPACE_TOOLS = {
-  LIST_FILES: `${WORKSPACE_TOOL_PREFIX}ListFiles`,
-  READ_FILE: `${WORKSPACE_TOOL_PREFIX}ReadFile`,
-  WRITE_FILE: `${WORKSPACE_TOOL_PREFIX}WriteFile`,
-  DELETE_FILE: `${WORKSPACE_TOOL_PREFIX}DeleteFile`,
-};
 const VIRTUAL_SKILLS_ROOT = "skills";
 
-export function getWorkspaceToolDefinitions(): ToolDefinition[] {
-  return [
-    {
-      name: WORKSPACE_TOOLS.LIST_FILES,
-      description:
-        "List files and directories in your workspace. Your workspace persists across sessions and contains your identity files (SOUL.md, IDENTITY.md, etc.), memory files, and any other files you create. You can also list under skills/ to browse skill files (agent overrides + global fallback).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          path: {
-            type: "string",
-            description:
-              "Directory path relative to workspace root (e.g., '/' for root, 'memory/' for memory directory, or 'skills/' for skill files). Defaults to '/'.",
-          },
+export const getWorkspaceToolDefinitions = (): ToolDefinition[] => [
+  {
+    name: NATIVE_TOOLS.LIST_FILES,
+    description:
+      "List files and directories in your workspace. Your workspace persists across sessions and contains your identity files (SOUL.md, IDENTITY.md, etc.), memory files, and any other files you create. You can also list under skills/ to browse skill files (agent overrides + global fallback).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description:
+            "Directory path relative to workspace root (e.g., '/' for root, 'memory/' for memory directory, or 'skills/' for skill files). Defaults to '/'.",
         },
-        required: [],
       },
+      required: [],
     },
-    {
-      name: WORKSPACE_TOOLS.READ_FILE,
-      description:
-        "Read a file from your workspace. Use this to read your identity files, memory files, or any files you've created. Reading skills/* first checks agent overrides under agents/{agentId}/skills/*, then falls back to global skills/*.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          path: {
-            type: "string",
-            description:
-              "File path relative to workspace root (e.g., 'SOUL.md', 'memory/2024-01-15.md', or 'skills/summarize/SKILL.md')",
-          },
+  },
+  {
+    name: NATIVE_TOOLS.READ_FILE,
+    description:
+      "Read a file from your workspace. Use this to read your identity files, memory files, or any files you've created. Reading skills/* first checks agent overrides under agents/{agentId}/skills/*, then falls back to global skills/*.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description:
+            "File path relative to workspace root (e.g., 'SOUL.md', 'memory/2024-01-15.md', or 'skills/summarize/SKILL.md')",
         },
-        required: ["path"],
       },
+      required: ["path"],
     },
-    {
-      name: WORKSPACE_TOOLS.WRITE_FILE,
-      description:
-        "Write or update a file in your workspace. Use this to update your identity (SOUL.md, IDENTITY.md), create memory files, or store any data you need to persist. Creates parent directories automatically.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          path: {
-            type: "string",
-            description:
-              "File path relative to workspace root (e.g., 'SOUL.md', 'memory/2024-01-15.md')",
-          },
-          content: {
-            type: "string",
-            description: "Content to write to the file",
-          },
+  },
+  {
+    name: NATIVE_TOOLS.WRITE_FILE,
+    description:
+      "Write or update a file in your workspace. Use this to update your identity (SOUL.md, IDENTITY.md), create memory files, or store any data you need to persist. Creates parent directories automatically.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description:
+            "File path relative to workspace root (e.g., 'SOUL.md', 'memory/2024-01-15.md')",
         },
-        required: ["path", "content"],
-      },
-    },
-    {
-      name: WORKSPACE_TOOLS.DELETE_FILE,
-      description:
-        "Delete a file from your workspace. Use with caution - deleted files cannot be recovered.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          path: {
-            type: "string",
-            description:
-              "File path relative to workspace root (e.g., 'BOOTSTRAP.md')",
-          },
+        content: {
+          type: "string",
+          description: "Content to write to the file",
         },
-        required: ["path"],
       },
+      required: ["path", "content"],
     },
-  ];
-}
-
-/**
- * Check if a tool name is a workspace tool
- */
-export function isWorkspaceTool(toolName: string): boolean {
-  return toolName.startsWith(WORKSPACE_TOOL_PREFIX);
-}
-
-/**
- * Execute a workspace tool
- * Returns { ok, result?, error? }
- */
-export async function executeWorkspaceTool(
-  bucket: R2Bucket,
-  agentId: string,
-  toolName: string,
-  args: Record<string, unknown>,
-): Promise<{ ok: boolean; result?: unknown; error?: string }> {
-  const basePath = `agents/${agentId}`;
-
-  try {
-    switch (toolName) {
-      case WORKSPACE_TOOLS.LIST_FILES:
-        return await listFiles(
-          bucket,
-          basePath,
-          args.path as string | undefined,
-        );
-
-      case WORKSPACE_TOOLS.READ_FILE:
-        return await readFile(bucket, basePath, args.path as string);
-
-      case WORKSPACE_TOOLS.WRITE_FILE:
-        return await writeFile(
-          bucket,
-          basePath,
-          args.path as string,
-          args.content as string,
-        );
-
-      case WORKSPACE_TOOLS.DELETE_FILE:
-        return await deleteFile(bucket, basePath, args.path as string);
-
-      default:
-        return { ok: false, error: `Unknown workspace tool: ${toolName}` };
-    }
-  } catch (e) {
-    console.error(`[WorkspaceTools] Error executing ${toolName}:`, e);
-    return {
-      ok: false,
-      error: e instanceof Error ? e.message : String(e),
-    };
-  }
-}
+  },
+  {
+    name: NATIVE_TOOLS.DELETE_FILE,
+    description:
+      "Delete a file from your workspace. Use with caution - deleted files cannot be recovered.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description:
+            "File path relative to workspace root (e.g., 'BOOTSTRAP.md')",
+        },
+      },
+      required: ["path"],
+    },
+  },
+];
 
 /**
  * Normalize and validate a path within the workspace
@@ -190,12 +128,16 @@ function normalizeRelativePath(
 }
 
 function isVirtualSkillsPath(path: string): boolean {
-  return path === VIRTUAL_SKILLS_ROOT || path.startsWith(`${VIRTUAL_SKILLS_ROOT}/`);
+  return (
+    path === VIRTUAL_SKILLS_ROOT || path.startsWith(`${VIRTUAL_SKILLS_ROOT}/`)
+  );
 }
 
 function toAgentSkillPath(basePath: string, skillPath: string): string {
   const suffix = skillPath.slice(`${VIRTUAL_SKILLS_ROOT}/`.length);
-  return suffix ? `${basePath}/${VIRTUAL_SKILLS_ROOT}/${suffix}` : `${basePath}/${VIRTUAL_SKILLS_ROOT}`;
+  return suffix
+    ? `${basePath}/${VIRTUAL_SKILLS_ROOT}/${suffix}`
+    : `${basePath}/${VIRTUAL_SKILLS_ROOT}`;
 }
 
 function toGlobalSkillPath(skillPath: string): string {
@@ -207,7 +149,10 @@ type R2Listed = {
   delimitedPrefixes?: string[];
 };
 
-function collectVirtualSkillEntries(listed: R2Listed, prefix: string): {
+function collectVirtualSkillEntries(
+  listed: R2Listed,
+  prefix: string,
+): {
   files: string[];
   directories: string[];
 } {
@@ -261,7 +206,10 @@ async function listVirtualSkills(
   basePath: string,
   virtualPath: string,
 ): Promise<{ files: string[]; directories: string[] }> {
-  const skillSuffix = virtualPath === VIRTUAL_SKILLS_ROOT ? "" : virtualPath.slice(`${VIRTUAL_SKILLS_ROOT}/`.length);
+  const skillSuffix =
+    virtualPath === VIRTUAL_SKILLS_ROOT
+      ? ""
+      : virtualPath.slice(`${VIRTUAL_SKILLS_ROOT}/`.length);
   const agentPrefix = skillSuffix
     ? `${basePath}/${VIRTUAL_SKILLS_ROOT}/${skillSuffix}/`
     : `${basePath}/${VIRTUAL_SKILLS_ROOT}/`;
@@ -290,8 +238,12 @@ async function listVirtualSkills(
   );
 
   // Agent skill files override global files with the same virtual path.
-  const files = Array.from(new Set([...agentEntries.files, ...globalEntries.files]));
-  const directories = Array.from(new Set([...agentEntries.directories, ...globalEntries.directories]));
+  const files = Array.from(
+    new Set([...agentEntries.files, ...globalEntries.files]),
+  );
+  const directories = Array.from(
+    new Set([...agentEntries.directories, ...globalEntries.directories]),
+  );
 
   return { files, directories };
 }
@@ -301,8 +253,20 @@ async function readVirtualSkillFile(
   basePath: string,
   virtualPath: string,
 ): Promise<
-  | { source: "agent"; resolvedPath: string; content: string; size: number; lastModified?: string }
-  | { source: "global"; resolvedPath: string; content: string; size: number; lastModified?: string }
+  | {
+      source: "agent";
+      resolvedPath: string;
+      content: string;
+      size: number;
+      lastModified?: string;
+    }
+  | {
+      source: "global";
+      resolvedPath: string;
+      content: string;
+      size: number;
+      lastModified?: string;
+    }
   | null
 > {
   if (virtualPath === VIRTUAL_SKILLS_ROOT) {
@@ -339,7 +303,7 @@ async function readVirtualSkillFile(
 /**
  * List files in a directory
  */
-async function listFiles(
+export async function listFiles(
   bucket: R2Bucket,
   basePath: string,
   relativePath?: string,
@@ -400,7 +364,7 @@ async function listFiles(
 /**
  * Read a file
  */
-async function readFile(
+export async function readFile(
   bucket: R2Bucket,
   basePath: string,
   relativePath: string,
@@ -415,7 +379,11 @@ async function readFile(
   }
 
   if (isVirtualSkillsPath(normalizedPath)) {
-    const resolved = await readVirtualSkillFile(bucket, basePath, normalizedPath);
+    const resolved = await readVirtualSkillFile(
+      bucket,
+      basePath,
+      normalizedPath,
+    );
     if (!resolved) {
       return { ok: false, error: `File not found: ${relativePath}` };
     }
@@ -456,7 +424,7 @@ async function readFile(
 /**
  * Write a file
  */
-async function writeFile(
+export async function writeFile(
   bucket: R2Bucket,
   basePath: string,
   relativePath: string,
@@ -502,7 +470,7 @@ async function writeFile(
 /**
  * Delete a file
  */
-async function deleteFile(
+export async function deleteFile(
   bucket: R2Bucket,
   basePath: string,
   relativePath: string,

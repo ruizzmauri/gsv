@@ -13,6 +13,8 @@ export const handleChatSend: Handler<"chat.send"> = async ({ gw, params }) => {
     throw new RpcError(400, "sessionKey and message required");
   }
 
+  const canonicalSessionKey = gw.canonicalizeSessionKey(params.sessionKey);
+
   const messageText = params.message;
 
   // Check for slash commands first
@@ -20,7 +22,7 @@ export const handleChatSend: Handler<"chat.send"> = async ({ gw, params }) => {
   if (command) {
     const commandResult = await gw.handleSlashCommandForChat(
       command,
-      params.sessionKey,
+      canonicalSessionKey,
     );
 
     if (commandResult.handled) {
@@ -34,7 +36,7 @@ export const handleChatSend: Handler<"chat.send"> = async ({ gw, params }) => {
   }
 
   const fullConfig = gw.getFullConfig();
-  const sessionStub = env.SESSION.getByName(params.sessionKey);
+  const sessionStub = env.SESSION.getByName(canonicalSessionKey);
 
   // Parse inline directives. For provider-less model selectors (e.g. /m:o3),
   // resolve against the session's current provider, not the global default.
@@ -53,7 +55,7 @@ export const handleChatSend: Handler<"chat.send"> = async ({ gw, params }) => {
       directives = parseDirectives(messageText, fallbackProvider);
     } catch (e) {
       console.warn(
-        `[Gateway] Failed to resolve session model provider for ${params.sessionKey}, using global default:`,
+        `[Gateway] Failed to resolve session model provider for ${canonicalSessionKey}, using global default:`,
         e,
       );
       directives = parseDirectives(messageText, fullConfig.model.provider);
@@ -74,9 +76,9 @@ export const handleChatSend: Handler<"chat.send"> = async ({ gw, params }) => {
   }
 
   const now = Date.now();
-  const existing = gw.sessionRegistry[params.sessionKey];
-  gw.sessionRegistry[params.sessionKey] = {
-    sessionKey: params.sessionKey,
+  const existing = gw.sessionRegistry[canonicalSessionKey];
+  gw.sessionRegistry[canonicalSessionKey] = {
+    sessionKey: canonicalSessionKey,
     createdAt: existing?.createdAt ?? now,
     lastActiveAt: now,
     label: existing?.label,
@@ -100,7 +102,7 @@ export const handleChatSend: Handler<"chat.send"> = async ({ gw, params }) => {
     params.runId ?? crypto.randomUUID(),
     JSON.parse(JSON.stringify(gw.getAllTools())),
     JSON.parse(JSON.stringify(gw.getRuntimeNodeInventory())),
-    params.sessionKey,
+    canonicalSessionKey,
     messageOverrides,
   );
 

@@ -32,6 +32,15 @@ import {
   handleHeartbeatStatus,
   handleHeartbeatTrigger,
 } from "./heartbeat";
+import {
+  handleCronStatus,
+  handleCronList,
+  handleCronAdd,
+  handleCronUpdate,
+  handleCronRemove,
+  handleCronRun,
+  handleCronRuns,
+} from "./cron";
 import { handleConfigGet, handleConfigSet } from "./config";
 import { handleConnect } from "./connect";
 
@@ -63,6 +72,13 @@ export function buildRpcHandlers(): Partial<{ [M in RpcMethod]: Handler<M> }> {
     "heartbeat.trigger": handleHeartbeatTrigger,
     "heartbeat.status": handleHeartbeatStatus,
     "heartbeat.start": handleHeartbeatStart,
+    "cron.status": handleCronStatus,
+    "cron.list": handleCronList,
+    "cron.add": handleCronAdd,
+    "cron.update": handleCronUpdate,
+    "cron.remove": handleCronRemove,
+    "cron.run": handleCronRun,
+    "cron.runs": handleCronRuns,
     "pair.list": handlePairList,
     "pair.approve": handlePairApprove,
     "pair.reject": handlePairReject,

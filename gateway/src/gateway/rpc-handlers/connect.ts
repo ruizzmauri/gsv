@@ -73,6 +73,10 @@ export const handleConnect: Handler<"connect"> = (ctx) => {
           delete gw.pendingLogCalls[callId];
         }
       }
+      gw.cancelInternalNodeLogRequestsForNode(
+        nodeId,
+        `Node replaced during log request: ${nodeId}`,
+      );
       existingWs.close(1000, "Replaced by newer node connection");
     }
 
@@ -119,6 +123,26 @@ export const handleConnect: Handler<"connect"> = (ctx) => {
         "tools.list",
         "logs.get",
         "chat.send",
+        "config.get",
+        "config.set",
+        "session.get",
+        "session.patch",
+        "session.stats",
+        "session.reset",
+        "session.history",
+        "session.preview",
+        "session.compact",
+        "sessions.list",
+        "heartbeat.status",
+        "heartbeat.start",
+        "heartbeat.trigger",
+        "cron.status",
+        "cron.list",
+        "cron.add",
+        "cron.update",
+        "cron.remove",
+        "cron.run",
+        "cron.runs",
         "tool.request",
         "tool.result",
         "logs.result",

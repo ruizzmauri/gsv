@@ -75,6 +75,12 @@ export interface PendingPair {
 
 export type ChannelsConfig = Record<string, ChannelConfig>;
 
+export type DmScope =
+  | "main"
+  | "per-peer"
+  | "per-channel-peer"
+  | "per-account-channel-peer";
+
 export interface SessionConfig {
   // Default auto-reset policy for new sessions.
   defaultResetPolicy: {
@@ -82,6 +88,12 @@ export interface SessionConfig {
     atHour?: number; // For daily mode (0-23)
     idleMinutes?: number; // For idle mode
   };
+
+  // Canonical key used for the per-agent main session.
+  mainKey: string;
+
+  // How direct-message sessions are keyed.
+  dmScope: DmScope;
 
   // Identity links: map multiple channel identities to a single session
   // Key is canonical name, value is array of channel:id strings
@@ -121,6 +133,13 @@ export interface AgentsConfig {
   
   // Default heartbeat config for all agents
   defaultHeartbeat: HeartbeatConfig;
+}
+
+export interface CronConfig {
+  enabled: boolean;
+  maxJobs: number;
+  maxRunsPerJobHistory: number;
+  maxConcurrentRuns: number;
 }
 
 export interface GsvConfig {
@@ -165,6 +184,9 @@ export interface GsvConfig {
   
   // Multi-agent configuration
   agents: AgentsConfig;
+
+  // Cron job scheduler configuration
+  cron: CronConfig;
 }
 
 /** Deep-partial input type for user overrides */
@@ -178,6 +200,8 @@ export type GsvConfigInput = {
   systemPrompt?: string;
   session?: {
     defaultResetPolicy?: Partial<SessionConfig["defaultResetPolicy"]>;
+    mainKey?: string;
+    dmScope?: DmScope;
     identityLinks?: Record<string, string[]>;
   };
   skills?: {
@@ -188,6 +212,7 @@ export type GsvConfigInput = {
     bindings?: AgentBinding[];
     defaultHeartbeat?: Partial<HeartbeatConfig>;
   };
+  cron?: Partial<CronConfig>;
 };
 
 

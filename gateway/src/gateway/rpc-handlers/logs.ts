@@ -74,14 +74,21 @@ export const handleLogsResult: Handler<"logs.result"> = ({ gw, ws, params }) => 
     throw new RpcError(400, "callId required");
   }
 
+  const attachment = ws.deserializeAttachment();
+  const nodeId = attachment.nodeId as string | undefined;
+  if (!nodeId) {
+    throw new RpcError(403, "Node not authorized for this call");
+  }
+
   const route = gw.pendingLogCalls[params.callId];
   if (!route) {
+    if (gw.resolveInternalNodeLogResult(nodeId, params)) {
+      return { ok: true };
+    }
     throw new RpcError(404, "Unknown callId");
   }
 
-  const attachment = ws.deserializeAttachment();
-  const nodeId = attachment.nodeId as string | undefined;
-  if (!nodeId || nodeId !== route.nodeId) {
+  if (nodeId !== route.nodeId) {
     throw new RpcError(403, "Node not authorized for this call");
   }
 

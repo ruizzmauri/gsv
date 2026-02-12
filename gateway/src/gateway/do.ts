@@ -28,6 +28,7 @@ import {
 } from "../config";
 import {
   resolveAgentIdFromBinding,
+  getDefaultAgentId,
   isAllowedSender,
   normalizeE164,
   resolveLinkedIdentity,
@@ -40,7 +41,15 @@ import {
   shouldDeliverResponse,
   HeartbeatResult,
 } from "./heartbeat";
-import { loadHeartbeatFile, isHeartbeatFileEmpty } from "../workspace/loader";
+import { loadHeartbeatFile, isHeartbeatFileEmpty } from "../agents/loader";
+import {
+  buildAgentSessionKey,
+  canonicalizeMainSessionAlias,
+  normalizeAgentId,
+  normalizeMainKey,
+  resolveAgentIdFromSessionKey,
+  resolveAgentMainSessionKey,
+} from "../session/routing";
 import {
   parseCommand,
   HELP_TEXT,
@@ -55,11 +64,17 @@ import {
 } from "./directives";
 import { processMediaWithTranscription } from "../transcription";
 import { processInboundMedia } from "../storage/media";
-import { getWorkspaceToolDefinitions } from "../workspace/tools";
+import { getNativeToolDefinitions } from "../agents/tools";
+import { listHostsByRole, pickExecutionHostId } from "./capabilities";
 import {
-  listHostsByRole,
-  pickExecutionHostId,
-} from "./capabilities";
+  CronService,
+  CronStore,
+  type CronJob,
+  type CronJobCreate,
+  type CronJobPatch,
+  type CronRun,
+  type CronRunResult,
+} from "../cron";
 import type { ChatEventPayload } from "../protocol/chat";
 import type {
   ChannelRegistryEntry,
@@ -69,6 +84,12 @@ import type {
   ChannelOutboundPayload,
   ChannelTypingPayload,
 } from "../protocol/channel";
+import type {
+  LogsGetEventPayload,
+  LogsGetParams,
+  LogsGetResult,
+  LogsResultParams,
+} from "../protocol/logs";
 import type { SessionRegistryEntry } from "../protocol/session";
 import type {
   RuntimeNodeInventory,
@@ -96,6 +117,18 @@ export type PendingLogRoute = {
   createdAt: number;
 };
 
+type PendingInternalLogRequest = {
+  nodeId: string;
+  resolve: (result: LogsGetResult) => void;
+  reject: (error: Error) => void;
+  timeoutHandle: ReturnType<typeof setTimeout>;
+};
+
+const DEFAULT_LOG_LINES = 100;
+const MAX_LOG_LINES = 5000;
+const DEFAULT_INTERNAL_LOG_TIMEOUT_MS = 20_000;
+const MAX_INTERNAL_LOG_TIMEOUT_MS = 120_000;
+
 type GatewayMethodHandlerContext = {
   gw: Gateway;
   ws: WebSocket;
@@ -107,6 +140,35 @@ type GatewayMethodHandler = (
   ctx: GatewayMethodHandlerContext,
 ) => Promise<unknown | DeferredResponse> | unknown | DeferredResponse;
 
+function asObject(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as Record<string, unknown>;
+}
+
+function asString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function asNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  return value;
+}
+
+function asMode(value: unknown): "due" | "force" | undefined {
+  if (value === "due" || value === "force") {
+    return value;
+  }
+  return undefined;
+}
+
 export class Gateway extends DurableObject<Env> {
   clients: Map<string, WebSocket> = new Map();
   nodes: Map<string, WebSocket> = new Map();
@@ -116,10 +178,9 @@ export class Gateway extends DurableObject<Env> {
     this.ctx.storage.kv,
     { prefix: "toolRegistry:" },
   );
-  readonly nodeRuntimeRegistry = PersistedObject<Record<string, NodeRuntimeInfo>>(
-    this.ctx.storage.kv,
-    { prefix: "nodeRuntimeRegistry:" },
-  );
+  readonly nodeRuntimeRegistry = PersistedObject<
+    Record<string, NodeRuntimeInfo>
+  >(this.ctx.storage.kv, { prefix: "nodeRuntimeRegistry:" });
 
   readonly pendingToolCalls = PersistedObject<Record<string, PendingToolRoute>>(
     this.ctx.storage.kv,
@@ -130,6 +191,10 @@ export class Gateway extends DurableObject<Env> {
     this.ctx.storage.kv,
     { prefix: "pendingLogCalls:" },
   );
+  private readonly pendingInternalLogCalls = new Map<
+    string,
+    PendingInternalLogRequest
+  >();
 
   readonly configStore = PersistedObject<Record<string, unknown>>(
     this.ctx.storage.kv,
@@ -176,6 +241,8 @@ export class Gateway extends DurableObject<Env> {
     this.ctx.storage.kv,
     { prefix: "heartbeatScheduler:", defaults: { initialized: false } },
   );
+
+  private readonly cronStore = new CronStore(this.ctx.storage.sql);
 
   private readonly handlers = buildRpcHandlers();
 
@@ -480,6 +547,10 @@ export class Gateway extends DurableObject<Env> {
           delete this.pendingLogCalls[callId];
         }
       }
+      this.cancelInternalNodeLogRequestsForNode(
+        nodeId,
+        `Node disconnected during log request: ${nodeId}`,
+      );
       delete this.nodeRuntimeRegistry[nodeId];
       console.log(`[Gateway] Node ${nodeId} removed from registry`);
     } else if (mode === "channel" && channelKey) {
@@ -547,6 +618,138 @@ export class Gateway extends DurableObject<Env> {
     ws.send(JSON.stringify(res));
   }
 
+  private resolveLogLineLimit(input: number | undefined): number {
+    if (input === undefined) {
+      return DEFAULT_LOG_LINES;
+    }
+    if (!Number.isFinite(input) || input < 1) {
+      throw new Error("lines must be a positive number");
+    }
+    return Math.min(Math.floor(input), MAX_LOG_LINES);
+  }
+
+  private resolveTargetNodeForLogs(nodeId: string | undefined): string {
+    if (nodeId) {
+      if (!this.nodes.has(nodeId)) {
+        throw new Error(`Node not connected: ${nodeId}`);
+      }
+      return nodeId;
+    }
+
+    if (this.nodes.size === 1) {
+      return Array.from(this.nodes.keys())[0];
+    }
+
+    if (this.nodes.size === 0) {
+      throw new Error("No nodes connected");
+    }
+
+    throw new Error("nodeId required when multiple nodes are connected");
+  }
+
+  async getNodeLogs(
+    params?: LogsGetParams & { timeoutMs?: number },
+  ): Promise<LogsGetResult> {
+    const lines = this.resolveLogLineLimit(params?.lines);
+    const nodeId = this.resolveTargetNodeForLogs(params?.nodeId);
+    const nodeWs = this.nodes.get(nodeId);
+    if (!nodeWs || nodeWs.readyState !== WebSocket.OPEN) {
+      throw new Error(`Node not connected: ${nodeId}`);
+    }
+
+    const timeoutInput =
+      typeof params?.timeoutMs === "number" && Number.isFinite(params.timeoutMs)
+        ? Math.floor(params.timeoutMs)
+        : DEFAULT_INTERNAL_LOG_TIMEOUT_MS;
+    const timeoutMs = Math.max(1000, Math.min(timeoutInput, MAX_INTERNAL_LOG_TIMEOUT_MS));
+    const callId = crypto.randomUUID();
+
+    const responsePromise = new Promise<LogsGetResult>((resolve, reject) => {
+      const timeoutHandle = setTimeout(() => {
+        const pending = this.pendingInternalLogCalls.get(callId);
+        if (!pending) {
+          return;
+        }
+        this.pendingInternalLogCalls.delete(callId);
+        pending.reject(
+          new Error(`logs.get timed out for node ${pending.nodeId} after ${timeoutMs}ms`),
+        );
+      }, timeoutMs);
+
+      this.pendingInternalLogCalls.set(callId, {
+        nodeId,
+        resolve,
+        reject,
+        timeoutHandle,
+      });
+    });
+
+    try {
+      const evt: EventFrame<LogsGetEventPayload> = {
+        type: "evt",
+        event: "logs.get",
+        payload: {
+          callId,
+          lines,
+        },
+      };
+      nodeWs.send(JSON.stringify(evt));
+    } catch (error) {
+      const pending = this.pendingInternalLogCalls.get(callId);
+      if (pending) {
+        clearTimeout(pending.timeoutHandle);
+        this.pendingInternalLogCalls.delete(callId);
+      }
+      throw error;
+    }
+
+    return await responsePromise;
+  }
+
+  resolveInternalNodeLogResult(
+    nodeId: string,
+    params: LogsResultParams,
+  ): boolean {
+    const pending = this.pendingInternalLogCalls.get(params.callId);
+    if (!pending) {
+      return false;
+    }
+
+    this.pendingInternalLogCalls.delete(params.callId);
+    clearTimeout(pending.timeoutHandle);
+
+    if (pending.nodeId !== nodeId) {
+      pending.reject(new Error("Node not authorized for this internal logs call"));
+      return true;
+    }
+
+    if (params.error) {
+      pending.reject(new Error(params.error));
+      return true;
+    }
+
+    const lines = params.lines ?? [];
+    pending.resolve({
+      nodeId,
+      lines,
+      count: lines.length,
+      truncated: Boolean(params.truncated),
+    });
+    return true;
+  }
+
+  cancelInternalNodeLogRequestsForNode(nodeId: string, reason: string): void {
+    for (const [callId, pending] of this.pendingInternalLogCalls.entries()) {
+      if (pending.nodeId !== nodeId) {
+        continue;
+      }
+
+      clearTimeout(pending.timeoutHandle);
+      this.pendingInternalLogCalls.delete(callId);
+      pending.reject(new Error(reason));
+    }
+  }
+
   /**
    * Find the node for a namespaced tool name.
    * Tool names are formatted as "{nodeId}__{toolName}"
@@ -597,7 +800,9 @@ export class Gateway extends DurableObject<Env> {
     const nodeIds = Array.from(this.nodes.keys()).sort();
     const hosts = nodeIds.map((nodeId) => {
       const runtime = this.nodeRuntimeRegistry[nodeId];
-      const tools = (this.toolRegistry[nodeId] ?? []).map((tool) => tool.name).sort();
+      const tools = (this.toolRegistry[nodeId] ?? [])
+        .map((tool) => tool.name)
+        .sort();
 
       if (!runtime) {
         return {
@@ -641,8 +846,8 @@ export class Gateway extends DurableObject<Env> {
       `[Gateway]   toolRegistry keys: [${Object.keys(this.toolRegistry).join(", ")}]`,
     );
 
-    // Start with native workspace tools (always available)
-    const workspaceTools = getWorkspaceToolDefinitions();
+    // Start with native tools (always available)
+    const nativeTools = getNativeToolDefinitions();
 
     // Add node tools namespaced as {nodeId}__{toolName}
     const nodeTools = Array.from(this.nodes.keys()).flatMap((nodeId) =>
@@ -652,11 +857,191 @@ export class Gateway extends DurableObject<Env> {
       })),
     );
 
-    const tools = [...workspaceTools, ...nodeTools];
+    const tools = [...nativeTools, ...nodeTools];
     console.log(
-      `[Gateway]   returning ${tools.length} tools (${workspaceTools.length} workspace + ${nodeTools.length} node): [${tools.map((t) => t.name).join(", ")}]`,
+      `[Gateway]   returning ${tools.length} tools (${nativeTools.length} native + ${nodeTools.length} node): [${tools.map((t) => t.name).join(", ")}]`,
     );
     return tools;
+  }
+
+  private getCronService(): CronService {
+    const config = this.getFullConfig();
+    const cronConfig = config.cron;
+    const maxJobs = Math.max(1, Math.floor(cronConfig.maxJobs));
+    const maxRunsPerJobHistory = Math.max(
+      1,
+      Math.floor(cronConfig.maxRunsPerJobHistory),
+    );
+    const maxConcurrentRuns = Math.max(
+      1,
+      Math.floor(cronConfig.maxConcurrentRuns),
+    );
+
+    return new CronService({
+      store: this.cronStore,
+      cronEnabled: cronConfig.enabled,
+      maxJobs,
+      maxRunsPerJobHistory,
+      maxConcurrentRuns,
+      mainKey: config.session.mainKey,
+      executeMainJob: async ({ job, text, sessionKey }) => {
+        return await this.executeCronMainJob({ job, text, sessionKey });
+      },
+      logger: console,
+    });
+  }
+
+  private async executeCronMainJob(params: {
+    job: CronJob;
+    text: string;
+    sessionKey: string;
+  }): Promise<{
+    status: "ok" | "error" | "skipped";
+    error?: string;
+    summary?: string;
+  }> {
+    const runId = crypto.randomUUID();
+    const session = this.env.SESSION.getByName(params.sessionKey);
+
+    try {
+      await session.chatSend(
+        params.text,
+        runId,
+        JSON.parse(JSON.stringify(this.getAllTools())),
+        JSON.parse(JSON.stringify(this.getRuntimeNodeInventory())),
+        params.sessionKey,
+      );
+      return {
+        status: "ok",
+        summary: `queued to ${params.sessionKey}`,
+      };
+    } catch (error) {
+      return {
+        status: "error",
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  async getCronStatus(): Promise<{
+    enabled: boolean;
+    count: number;
+    dueCount: number;
+    runningCount: number;
+    nextRunAtMs?: number;
+    maxJobs: number;
+    maxConcurrentRuns: number;
+  }> {
+    const service = this.getCronService();
+    return service.status();
+  }
+
+  async listCronJobs(opts?: {
+    agentId?: string;
+    includeDisabled?: boolean;
+    limit?: number;
+    offset?: number;
+  }): Promise<{ jobs: CronJob[]; count: number }> {
+    return this.getCronService().list(opts);
+  }
+
+  async addCronJob(input: CronJobCreate): Promise<CronJob> {
+    const job = this.getCronService().add(input);
+    await this.scheduleGatewayAlarm();
+    return job;
+  }
+
+  async updateCronJob(id: string, patch: CronJobPatch): Promise<CronJob> {
+    const job = this.getCronService().update(id, patch);
+    await this.scheduleGatewayAlarm();
+    return job;
+  }
+
+  async removeCronJob(id: string): Promise<{ removed: boolean }> {
+    const result = this.getCronService().remove(id);
+    await this.scheduleGatewayAlarm();
+    return result;
+  }
+
+  async runCronJobs(opts?: {
+    id?: string;
+    mode?: "due" | "force";
+  }): Promise<{ ran: number; results: CronRunResult[] }> {
+    const result = await this.getCronService().run(opts);
+    await this.scheduleGatewayAlarm();
+    return result;
+  }
+
+  async listCronRuns(opts?: {
+    jobId?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<{ runs: CronRun[]; count: number }> {
+    return this.getCronService().runs(opts);
+  }
+
+  async executeCronTool(args: Record<string, unknown>): Promise<unknown> {
+    const actionRaw = typeof args.action === "string" ? args.action : "status";
+    const action = actionRaw.trim().toLowerCase();
+
+    switch (action) {
+      case "status":
+        return await this.getCronStatus();
+      case "list":
+        return await this.listCronJobs({
+          agentId: asString(args.agentId),
+          includeDisabled:
+            typeof args.includeDisabled === "boolean"
+              ? args.includeDisabled
+              : undefined,
+          limit: asNumber(args.limit),
+          offset: asNumber(args.offset),
+        });
+      case "add": {
+        const jobInput = asObject(args.job) ?? args;
+        const job = await this.addCronJob(jobInput as unknown as CronJobCreate);
+        return { ok: true, job };
+      }
+      case "update": {
+        const id = asString(args.id);
+        if (!id) {
+          throw new Error("cron update requires id");
+        }
+        const patch = asObject(args.patch);
+        if (!patch) {
+          throw new Error("cron update requires patch object");
+        }
+        const job = await this.updateCronJob(
+          id,
+          patch as unknown as CronJobPatch,
+        );
+        return { ok: true, job };
+      }
+      case "remove": {
+        const id = asString(args.id);
+        if (!id) {
+          throw new Error("cron remove requires id");
+        }
+        const result = await this.removeCronJob(id);
+        return { ok: true, removed: result.removed };
+      }
+      case "run":
+        return {
+          ok: true,
+          ...(await this.runCronJobs({
+            id: asString(args.id),
+            mode: asMode(args.mode),
+          })),
+        };
+      case "runs":
+        return await this.listCronRuns({
+          jobId: asString(args.jobId),
+          limit: asNumber(args.limit),
+          offset: asNumber(args.offset),
+        });
+      default:
+        throw new Error(`Unknown cron action: ${action}`);
+    }
   }
 
   /**
@@ -954,9 +1339,39 @@ export class Gateway extends DurableObject<Env> {
     >
   >(this.ctx.storage.kv, { prefix: "pendingChannelResponses:" });
 
+  canonicalizeSessionKey(sessionKey: string, agentIdHint?: string): string {
+    const raw = sessionKey.trim();
+    if (!raw) {
+      return raw;
+    }
+
+    const config = this.getFullConfig();
+    const defaultAgentId = agentIdHint?.trim()
+      ? normalizeAgentId(agentIdHint)
+      : normalizeAgentId(getDefaultAgentId(config));
+
+    if (!raw.startsWith("agent:")) {
+      if (raw === "main" || raw === normalizeMainKey(config.session.mainKey)) {
+        return resolveAgentMainSessionKey({
+          agentId: defaultAgentId,
+          mainKey: config.session.mainKey,
+        });
+      }
+      return raw;
+    }
+
+    const agentId = resolveAgentIdFromSessionKey(raw, defaultAgentId);
+    return canonicalizeMainSessionAlias({
+      agentId,
+      sessionKey: raw,
+      mainKey: config.session.mainKey,
+    });
+  }
+
   private buildSessionKeyFromChannel(
     agentId: string,
     channel: ChannelId,
+    accountId: string,
     peer: PeerInfo,
     senderId?: string,
   ): string {
@@ -967,15 +1382,18 @@ export class Gateway extends DurableObject<Env> {
     const linkedIdentity = resolveLinkedIdentity(config, channel, idToCheck);
 
     if (linkedIdentity) {
-      // Identity link found - use canonical name for session key
-      // Format: agent:{agentId}:{canonicalName}
       console.log(`[Gateway] Identity link: ${idToCheck} -> ${linkedIdentity}`);
-      return `agent:${agentId}:${linkedIdentity}`;
     }
 
-    // No identity link - use standard channel:peer format
-    const sanitizedPeerId = peer.id.replace(/[^a-zA-Z0-9+\-_@.]/g, "_");
-    return `agent:${agentId}:${channel}:${peer.kind}:${sanitizedPeerId}`;
+    return buildAgentSessionKey({
+      agentId,
+      channel,
+      accountId,
+      peer,
+      dmScope: config.session.dmScope,
+      mainKey: config.session.mainKey,
+      linkedIdentity,
+    });
   }
 
   /**
@@ -1290,59 +1708,94 @@ export class Gateway extends DurableObject<Env> {
 
   // ---- Heartbeat System ----
 
+  private resolveHeartbeatAgentIds(config: GsvConfig): string[] {
+    const configured = config.agents.list
+      .map((agent) => agent.id)
+      .filter(Boolean);
+    if (configured.length > 0) {
+      return configured;
+    }
+    return [getDefaultAgentId(config)];
+  }
+
+  private nextHeartbeatDueAtMs(): number | undefined {
+    let next: number | undefined;
+    for (const state of Object.values(this.heartbeatState)) {
+      const candidate = state?.nextHeartbeatAt ?? undefined;
+      if (!candidate) {
+        continue;
+      }
+      if (next === undefined || candidate < next) {
+        next = candidate;
+      }
+    }
+    return next;
+  }
+
+  private async scheduleGatewayAlarm(): Promise<void> {
+    const heartbeatNext = this.nextHeartbeatDueAtMs();
+    const cronNext = this.getCronService().nextRunAtMs();
+    let nextAlarm: number | undefined;
+
+    if (heartbeatNext !== undefined && cronNext !== undefined) {
+      nextAlarm = Math.min(heartbeatNext, cronNext);
+    } else {
+      nextAlarm = heartbeatNext ?? cronNext;
+    }
+
+    if (nextAlarm === undefined) {
+      await this.ctx.storage.deleteAlarm();
+      console.log(`[Gateway] Alarm cleared (no heartbeat/cron work scheduled)`);
+      return;
+    }
+
+    await this.ctx.storage.setAlarm(nextAlarm);
+    console.log(
+      `[Gateway] Alarm scheduled for ${new Date(nextAlarm).toISOString()} (heartbeat=${heartbeatNext ?? "none"}, cron=${cronNext ?? "none"})`,
+    );
+  }
+
   /**
    * Schedule the next heartbeat alarm
    */
   async scheduleHeartbeat(): Promise<void> {
-    const config = this.getConfig();
-    const agents =
-      config.agents.list.length > 0
-        ? config.agents.list
-        : [{ id: "main", default: true }];
+    const config = this.getFullConfig();
+    const activeAgentIds = new Set(this.resolveHeartbeatAgentIds(config));
 
-    let nextAlarmTime: number | null = null;
-
-    for (const agent of agents) {
-      const heartbeatConfig = getHeartbeatConfig(config, agent.id);
-      const nextTime = getNextHeartbeatTime(heartbeatConfig);
-
-      if (nextTime !== null) {
-        // Update state
-        const state = this.heartbeatState[agent.id] ?? {
-          agentId: agent.id,
-          nextHeartbeatAt: null,
-          lastHeartbeatAt: null,
-          lastHeartbeatText: null,
-          lastHeartbeatSentAt: null,
-        };
-        state.nextHeartbeatAt = nextTime;
-        this.heartbeatState[agent.id] = state;
-
-        // Track earliest alarm
-        if (nextAlarmTime === null || nextTime < nextAlarmTime) {
-          nextAlarmTime = nextTime;
-        }
+    for (const existingAgentId of Object.keys(this.heartbeatState)) {
+      if (!activeAgentIds.has(existingAgentId)) {
+        delete this.heartbeatState[existingAgentId];
       }
     }
 
-    if (nextAlarmTime !== null) {
-      await this.ctx.storage.setAlarm(nextAlarmTime);
-      console.log(
-        `[Gateway] Heartbeat alarm scheduled for ${new Date(nextAlarmTime).toISOString()}`,
-      );
+    for (const agentId of activeAgentIds) {
+      const heartbeatConfig = getHeartbeatConfig(config, agentId);
+      const nextTime = getNextHeartbeatTime(heartbeatConfig);
+
+      const state = this.heartbeatState[agentId] ?? {
+        agentId,
+        nextHeartbeatAt: null,
+        lastHeartbeatAt: null,
+        lastHeartbeatText: null,
+        lastHeartbeatSentAt: null,
+      };
+      state.nextHeartbeatAt = nextTime;
+      this.heartbeatState[agentId] = state;
     }
+
+    await this.scheduleGatewayAlarm();
   }
 
   /**
-   * Handle alarm (heartbeat trigger)
+   * Handle alarm (heartbeat + cron trigger)
    */
   async alarm(): Promise<void> {
-    console.log(`[Gateway] Heartbeat alarm fired`);
+    console.log(`[Gateway] Alarm fired`);
 
-    const config = this.getConfig();
+    const config = this.getFullConfig();
     const now = Date.now();
 
-    // Find agents whose heartbeat is due
+    // Run due heartbeats.
     for (const agentId of Object.keys(this.heartbeatState)) {
       const state = this.heartbeatState[agentId];
       if (!state.nextHeartbeatAt || state.nextHeartbeatAt > now) continue;
@@ -1368,8 +1821,17 @@ export class Gateway extends DurableObject<Env> {
       this.heartbeatState[agentId] = state;
     }
 
-    // Schedule next alarm
-    await this.scheduleHeartbeat();
+    // Run due cron jobs.
+    try {
+      const cronResult = await this.runCronJobs({ mode: "due" });
+      if (cronResult.ran > 0) {
+        console.log(`[Gateway] Alarm executed ${cronResult.ran} due cron jobs`);
+      }
+    } catch (error) {
+      console.error(`[Gateway] Cron due run failed:`, error);
+    }
+
+    await this.scheduleGatewayAlarm();
   }
 
   /**
@@ -1456,11 +1918,13 @@ export class Gateway extends DurableObject<Env> {
       console.log(`[Gateway] Heartbeat target=none, running silently`);
     } else if (target === "last" && lastActive) {
       // Clone to strip Proxy wrappers from PersistedObject before storing in another PersistedObject
-      deliveryContext = JSON.parse(JSON.stringify({
-        channel: lastActive.channel,
-        accountId: lastActive.accountId,
-        peer: lastActive.peer,
-      }));
+      deliveryContext = JSON.parse(
+        JSON.stringify({
+          channel: lastActive.channel,
+          accountId: lastActive.accountId,
+          peer: lastActive.peer,
+        }),
+      );
       console.log(
         `[Gateway] Heartbeat target=last, delivering to ${lastActive.channel}:${lastActive.peer.id}`,
       );
@@ -1473,11 +1937,13 @@ export class Gateway extends DurableObject<Env> {
       // For now, use last active if channel matches
       if (lastActive && lastActive.channel === target) {
         // Clone to strip Proxy wrappers from PersistedObject before storing in another PersistedObject
-        deliveryContext = JSON.parse(JSON.stringify({
-          channel: lastActive.channel,
-          accountId: lastActive.accountId,
-          peer: lastActive.peer,
-        }));
+        deliveryContext = JSON.parse(
+          JSON.stringify({
+            channel: lastActive.channel,
+            accountId: lastActive.accountId,
+            peer: lastActive.peer,
+          }),
+        );
         console.log(
           `[Gateway] Heartbeat target=${target}, matched last active`,
         );
@@ -1718,6 +2184,7 @@ export class Gateway extends DurableObject<Env> {
     const sessionKey = this.buildSessionKeyFromChannel(
       agentId,
       params.channel,
+      params.accountId,
       params.peer,
       senderId,
     );

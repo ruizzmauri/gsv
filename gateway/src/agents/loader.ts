@@ -1,4 +1,5 @@
 import { listWorkspaceSkills, type SkillSummary } from "../skills";
+import { isMainSessionKey, type DmScope } from "../session/routing";
 
 export type WorkspaceFile = {
   path: string;
@@ -157,20 +158,13 @@ export async function loadAgentWorkspace(
   return workspace;
 }
 
-export function isMainSession(sessionKey: string): boolean {
-  // Parse session key: agent:{agentId}:{channel}:{peerKind}:{peerId}
-  const parts = sessionKey.split(":");
-  if (parts.length < 4) return false;
-
-  const channel = parts[2];
-  const peerKind = parts[3];
-
-  // CLI sessions are always main (direct interaction)
-  if (channel === "cli") return true;
-
-  // DMs are main sessions (for now)
-  // TODO: Make this configurable per-agent
-  if (peerKind === "dm") return true;
-
-  return false;
+export function isMainSession(
+  sessionKey: string,
+  opts?: { mainKey?: string; dmScope?: DmScope },
+): boolean {
+  return isMainSessionKey({
+    sessionKey,
+    mainKey: opts?.mainKey,
+    dmScope: opts?.dmScope,
+  });
 }

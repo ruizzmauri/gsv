@@ -3,7 +3,7 @@ import {
   getDailyResetTime,
   shouldAutoResetByPolicy,
   type ResetPolicy,
-} from "./session/reset";
+} from "./reset";
 
 function localTimeToday(hour: number, minute: number = 0): number {
   const date = new Date();

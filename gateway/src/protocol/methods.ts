@@ -27,6 +27,13 @@ import type {
   ToolRequestParams,
   ToolResultParams,
 } from "./tools";
+import type {
+  CronJob,
+  CronJobCreate,
+  CronJobPatch,
+  CronRun,
+  CronRunResult,
+} from "../cron";
 
 export const DEFER_RESPONSE = Symbol("defer-response");
 export type DeferredResponse = typeof DEFER_RESPONSE;
@@ -275,6 +282,67 @@ export type RpcMethods = {
       skipped?: boolean;
       skipReason?: string;
     };
+  };
+
+  "cron.status": {
+    params: undefined;
+    result: {
+      enabled: boolean;
+      count: number;
+      dueCount: number;
+      runningCount: number;
+      nextRunAtMs?: number;
+      maxJobs: number;
+      maxConcurrentRuns: number;
+    };
+  };
+
+  "cron.list": {
+    params:
+      | {
+          agentId?: string;
+          includeDisabled?: boolean;
+          limit?: number;
+          offset?: number;
+        }
+      | undefined;
+    result: { jobs: CronJob[]; count: number };
+  };
+
+  "cron.add": {
+    params: CronJobCreate;
+    result: { ok: true; job: CronJob };
+  };
+
+  "cron.update": {
+    params: { id: string; patch: CronJobPatch };
+    result: { ok: true; job: CronJob };
+  };
+
+  "cron.remove": {
+    params: { id: string };
+    result: { ok: true; removed: boolean };
+  };
+
+  "cron.run": {
+    params:
+      | {
+          id?: string;
+          mode?: "due" | "force";
+        }
+      | undefined;
+    result: { ok: true; ran: number; results: CronRunResult[] };
+  };
+
+  "cron.runs": {
+    params:
+      | {
+          jobId?: string;
+          limit?: number;
+          offset?: number;
+        }
+      | undefined;
+    result: { runs: CronRun[]; count: number };
   };
 
   "pair.list": {

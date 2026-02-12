@@ -23,6 +23,8 @@ export const DEFAULT_CONFIG: GsvConfig = {
       mode: "daily",
       atHour: 4,
     },
+    mainKey: "main",
+    dmScope: "main",
     identityLinks: {},
   },
   skills: {
@@ -37,5 +39,11 @@ export const DEFAULT_CONFIG: GsvConfig = {
       target: "last",
       activeHours: { start: "08:00", end: "23:00" },
     },
+  },
+  cron: {
+    enabled: true,
+    maxJobs: 200,
+    maxRunsPerJobHistory: 200,
+    maxConcurrentRuns: 4,
   },
 };

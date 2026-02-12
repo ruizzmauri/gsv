@@ -16,15 +16,13 @@ import type {
   ImageContent,
   ToolCall,
 } from "@mariozechner/pi-ai";
-import {
-  completeSimple,
-  getModel,
-} from "@mariozechner/pi-ai";
+import { completeSimple, getModel } from "@mariozechner/pi-ai";
 import { archivePartialMessages, archiveSession } from "../storage/archive";
 import { fetchMediaFromR2, deleteSessionMedia } from "../storage/media";
-import { loadAgentWorkspace, isMainSession } from "../workspace/loader";
-import { buildSystemPromptFromWorkspace } from "../workspace/prompt";
-import { isWorkspaceTool, executeWorkspaceTool } from "../workspace/tools";
+import { loadAgentWorkspace } from "../agents/loader";
+import { isMainSessionKey } from "./routing";
+import { buildSystemPromptFromWorkspace } from "../agents/prompt";
+import { executeNativeTool, isNativeTool } from "../agents/tools";
 import {
   shouldAutoResetByPolicy,
   type ResetPolicy as SessionResetPolicy,
@@ -214,8 +212,7 @@ export class Session extends DurableObject<Env> {
 
   /**
    * Extract agentId from session key.
-   * Session key format: agent:{agentId}:{channel}:{peerKind}:{peerId}
-   * Or with identity link: agent:{agentId}:{canonicalName}
+   * Session key format: agent:{agentId}:{...}
    * Falls back to "main" if not parseable.
    */
   private getAgentId(): string {
@@ -231,7 +228,9 @@ export class Session extends DurableObject<Env> {
     return "main";
   }
 
-  private async loadRuntimeNodeInventory(): Promise<RuntimeNodeInventory | undefined> {
+  private async loadRuntimeNodeInventory(): Promise<
+    RuntimeNodeInventory | undefined
+  > {
     try {
       const gateway = this.env.GATEWAY.getByName("singleton");
       const inventory = await gateway.getRuntimeNodeInventory();
@@ -252,7 +251,9 @@ export class Session extends DurableObject<Env> {
     if (this.meta.resetPolicy) return;
 
     try {
-      const gateway = this.env.GATEWAY.get(this.env.GATEWAY.idFromName("singleton"));
+      const gateway = this.env.GATEWAY.get(
+        this.env.GATEWAY.idFromName("singleton"),
+      );
       const config: GsvConfig = await gateway.getConfig();
       const policy = config.session?.defaultResetPolicy;
       if (!policy?.mode) return;
@@ -634,7 +635,8 @@ export class Session extends DurableObject<Env> {
   }): Promise<void> {
     try {
       // Check for auto-reset
-      const shouldReset = params?.shouldResetBeforeRun ?? this.shouldAutoReset();
+      const shouldReset =
+        params?.shouldResetBeforeRun ?? this.shouldAutoReset();
       if (shouldReset) {
         console.log(
           `[Session] Auto-reset triggered for ${this.meta.sessionKey}`,
@@ -949,8 +951,14 @@ export class Session extends DurableObject<Env> {
     };
   }
 
-  private shouldAutoReset(lastActivityAt: number = this.meta.updatedAt): boolean {
-    return shouldAutoResetByPolicy(this.meta.resetPolicy, lastActivityAt, Date.now());
+  private shouldAutoReset(
+    lastActivityAt: number = this.meta.updatedAt,
+  ): boolean {
+    return shouldAutoResetByPolicy(
+      this.meta.resetPolicy,
+      lastActivityAt,
+      Date.now(),
+    );
   }
 
   /**
@@ -1053,7 +1061,9 @@ export class Session extends DurableObject<Env> {
       throw new Error(`Model not found: ${provider}/${modelId}`);
     }
 
-    const apiKey = (config.apiKeys as Record<string, string | undefined>)[provider];
+    const apiKey = (config.apiKeys as Record<string, string | undefined>)[
+      provider
+    ];
 
     if (!apiKey) {
       throw new Error(`API key not configured for provider: ${provider}`);
@@ -1117,7 +1127,11 @@ export class Session extends DurableObject<Env> {
     const agentId = this.getAgentId();
 
     // Check if this is main session (for MEMORY.md security)
-    const mainSession = isMainSession(this.meta.sessionKey || "");
+    const mainSession = isMainSessionKey({
+      sessionKey: this.meta.sessionKey || "",
+      mainKey: config.session.mainKey,
+      dmScope: config.session.dmScope,
+    });
 
     console.log(
       `[Session] Loading workspace for agent: ${agentId} (mainSession: ${mainSession})`,
@@ -1160,7 +1174,9 @@ export class Session extends DurableObject<Env> {
 
     // Get base prompt from settings or config
     const basePrompt = sessionSettings.systemPrompt || config.systemPrompt;
-    const agentConfig = config.agents.list.find((agent) => agent.id === agentId);
+    const agentConfig = config.agents.list.find(
+      (agent) => agent.id === agentId,
+    );
     const heartbeatPrompt =
       agentConfig?.heartbeat?.prompt || config.agents.defaultHeartbeat.prompt;
     const runtimeNodes =
@@ -1195,28 +1211,57 @@ export class Session extends DurableObject<Env> {
 
     this.pendingToolCalls[toolCall.id] = toolCall;
 
-    // Check if this is a workspace tool (gsv__*) - handle locally
-    if (isWorkspaceTool(toolCall.name)) {
+    // Native tools (gsv__*) are handled locally in Session.
+    if (isNativeTool(toolCall.name)) {
       const agentId = this.getAgentId();
 
       console.log(
-        `[Session] Executing workspace tool ${toolCall.name} for agent ${agentId}`,
+        `[Session] Executing native tool ${toolCall.name} for agent ${agentId}`,
       );
 
-      const result = await executeWorkspaceTool(
+      const gateway = this.env.GATEWAY.getByName("singleton");
+      const result = await executeNativeTool(
         this.env.STORAGE,
         agentId,
         toolCall.name,
         toolCall.args,
+        {
+          executeCronTool: async (args) => {
+            return await gateway.executeCronTool(args);
+          },
+          executeConfigGet: async (args) => {
+            const path =
+              typeof args.path === "string" ? args.path.trim() : undefined;
+            if (path) {
+              const value = await gateway.getConfigPath(path);
+              return { path, value };
+            }
+            return { config: await gateway.getSafeConfig() };
+          },
+          executeLogsGet: async (args) => {
+            const nodeId =
+              typeof args.nodeId === "string"
+                ? args.nodeId.trim() || undefined
+                : undefined;
+            const lines =
+              typeof args.lines === "number" && Number.isFinite(args.lines)
+                ? args.lines
+                : undefined;
+            return await gateway.getNodeLogs({
+              nodeId,
+              lines,
+            });
+          },
+        },
       );
 
       if (result.ok) {
         toolCall.result = result.result;
       } else {
-        toolCall.error = result.error || "Workspace tool failed";
+        toolCall.error = result.error || "Native tool failed";
       }
       this.pendingToolCalls[toolCall.id] = toolCall;
-      console.log(`[Session] Workspace tool ${toolCall.name} completed`);
+      console.log(`[Session] Native tool ${toolCall.name} completed`);
       return;
     }
 
@@ -1262,9 +1307,9 @@ export class Session extends DurableObject<Env> {
     await this.continueAgentLoop();
   }
 
-  private async doReset(
-    options?: { preserveCurrentRun?: boolean },
-  ): Promise<ResetResult> {
+  private async doReset(options?: {
+    preserveCurrentRun?: boolean;
+  }): Promise<ResetResult> {
     const oldSessionId = this.meta.sessionId;
     const sessionKey = this.meta.sessionKey;
     const messageCount = this.getMessageCount();

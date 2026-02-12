@@ -1,0 +1,11 @@
+export const NATIVE_TOOL_PREFIX = "gsv__";
+
+export const NATIVE_TOOLS = {
+  LIST_FILES: `${NATIVE_TOOL_PREFIX}ListFiles`,
+  READ_FILE: `${NATIVE_TOOL_PREFIX}ReadFile`,
+  WRITE_FILE: `${NATIVE_TOOL_PREFIX}WriteFile`,
+  DELETE_FILE: `${NATIVE_TOOL_PREFIX}DeleteFile`,
+  CONFIG_GET: `${NATIVE_TOOL_PREFIX}ConfigGet`,
+  LOGS_GET: `${NATIVE_TOOL_PREFIX}LogsGet`,
+  CRON: `${NATIVE_TOOL_PREFIX}Cron`,
+} as const;

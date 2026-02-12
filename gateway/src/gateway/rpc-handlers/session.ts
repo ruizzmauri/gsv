@@ -3,13 +3,15 @@ import type { Handler } from "../../protocol/methods";
 import { RpcError } from "../../shared/utils";
 
 export const handleSessionPatch: Handler<"session.patch"> = async ({
+  gw,
   params,
 }) => {
   if (!params?.sessionKey) {
     throw new RpcError(400, "sessionKey required");
   }
 
-  const sessionStub = env.SESSION.getByName(params.sessionKey);
+  const sessionKey = gw.canonicalizeSessionKey(params.sessionKey);
+  const sessionStub = env.SESSION.getByName(sessionKey);
 
   return await sessionStub.patch({
     settings: params.settings,
@@ -18,72 +20,86 @@ export const handleSessionPatch: Handler<"session.patch"> = async ({
   });
 };
 
-export const handleSessionGet: Handler<"session.get"> = async ({ params }) => {
+export const handleSessionGet: Handler<"session.get"> = async ({
+  gw,
+  params,
+}) => {
   if (!params?.sessionKey) {
     throw new RpcError(400, "sessionKey required");
   }
 
-  const sessionStub = env.SESSION.getByName(params.sessionKey);
+  const sessionKey = gw.canonicalizeSessionKey(params.sessionKey);
+  const sessionStub = env.SESSION.getByName(sessionKey);
 
   return await sessionStub.get();
 };
 
 export const handleSessionCompact: Handler<"session.compact"> = async ({
+  gw,
   params,
 }) => {
   if (!params?.sessionKey) {
     throw new RpcError(400, "sessionKey required");
   }
 
-  const sessionStub = env.SESSION.getByName(params.sessionKey);
+  const sessionKey = gw.canonicalizeSessionKey(params.sessionKey);
+  const sessionStub = env.SESSION.getByName(sessionKey);
 
   return await sessionStub.compact(params.keepMessages);
 };
 
 export const handleSessionStats: Handler<"session.stats"> = async ({
+  gw,
   params,
 }) => {
   if (!params?.sessionKey) {
     throw new RpcError(400, "sessionKey required");
   }
 
-  const sessionStub = env.SESSION.getByName(params.sessionKey);
+  const sessionKey = gw.canonicalizeSessionKey(params.sessionKey);
+  const sessionStub = env.SESSION.getByName(sessionKey);
 
   return await sessionStub.stats();
 };
 
 export const handleSessionReset: Handler<"session.reset"> = async ({
+  gw,
   params,
 }) => {
   if (!params?.sessionKey) {
     throw new RpcError(400, "sessionKey required");
   }
 
-  const sessionStub = env.SESSION.getByName(params.sessionKey);
+  const sessionKey = gw.canonicalizeSessionKey(params.sessionKey);
+  const sessionStub = env.SESSION.getByName(sessionKey);
 
   return await sessionStub.reset();
 };
 
 export const handleSessionHistory: Handler<"session.history"> = async ({
+  gw,
   params,
 }) => {
   if (!params?.sessionKey) {
     throw new RpcError(400, "sessionKey required");
   }
 
-  const sessionStub = env.SESSION.getByName(params.sessionKey);
+  const sessionKey = gw.canonicalizeSessionKey(params.sessionKey);
+  const sessionStub = env.SESSION.getByName(sessionKey);
 
   return await sessionStub.history();
 };
 
 export const handleSessionPreview: Handler<"session.preview"> = async ({
+  gw,
   params,
 }) => {
   if (!params?.sessionKey) {
     throw new RpcError(400, "sessionKey required");
   }
 
-  const sessionStub = env.SESSION.getByName(params.sessionKey);
+  const sessionKey = gw.canonicalizeSessionKey(params.sessionKey);
+  const sessionStub = env.SESSION.getByName(sessionKey);
 
   return await sessionStub.preview(params.limit);
 };
