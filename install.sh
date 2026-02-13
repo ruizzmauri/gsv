@@ -10,7 +10,6 @@
 # Environment variables:
 #   GSV_INSTALL_DIR  - Where to install CLI (default: /usr/local/bin)
 #   GSV_VERSION      - CLI version to install (default: latest)
-#   GSV_GATEWAY_URL  - Optional gateway URL to configure after install
 
 set -e
 
@@ -66,29 +65,6 @@ warn() {
 
 error() {
     echo -e "  ${RED}✗${NC} $1"
-}
-
-prompt_yn() {
-    local prompt="$1"
-    local default="${2:-n}"
-    local yn_hint="y/N"
-    [ "$default" = "y" ] && yn_hint="Y/n"
-    
-    echo -ne "  ${CYAN}?${NC} ${prompt} (${yn_hint}): "
-    read -r response
-    response="${response:-$default}"
-    [[ "$response" =~ ^[Yy] ]]
-}
-
-prompt_input() {
-    local prompt="$1"
-    local default="$2"
-    local hint=""
-    [ -n "$default" ] && hint=" [${default}]"
-    
-    echo -ne "  ${CYAN}?${NC} ${prompt}${hint}: "
-    read -r response
-    echo "${response:-$default}"
 }
 
 # ============================================================================
@@ -183,25 +159,23 @@ download_cli() {
     success "Installed to ${INSTALL_DIR}/gsv"
 }
 
-configure_cli() {
-    local gateway_url="$1"
+ensure_config_file() {
+    local config_file="${CONFIG_DIR}/config.toml"
+    mkdir -p "${CONFIG_DIR}"
 
-    local auth_token="${2:-}"
-    if [ -z "$auth_token" ]; then
-        auth_token=$(prompt_input "Enter your gateway auth token (optional)" "")
+    if check_existing_config; then
+        info "Found existing config at ${config_file}, leaving unchanged"
+        return
     fi
 
-    local gateway_ws="${gateway_url%/}"
-    if [[ "$gateway_ws" != */ws ]]; then
-        gateway_ws="${gateway_ws}/ws"
-    fi
+    cat > "${config_file}" <<'EOF'
+# GSV CLI configuration
+# Set values explicitly when ready, e.g.:
+#   gsv local-config set gateway.url wss://<your-gateway>.workers.dev/ws
+#   gsv local-config set gateway.token <your-auth-token>
+EOF
 
-    gsv local-config set gateway.url "$gateway_ws" >/dev/null
-    if [ -n "$auth_token" ]; then
-        gsv local-config set gateway.token "$auth_token" >/dev/null
-    fi
-
-    success "Configuration saved to ${CONFIG_DIR}/config.toml"
+    success "Created config file at ${config_file}"
 }
 
 # ============================================================================
@@ -215,38 +189,12 @@ main() {
     echo -e "  Platform: ${BOLD}${OS}-${ARCH}${NC}"
     echo ""
     
-    # Optional preconfigured gateway via env var
-    if [ -n "$GSV_GATEWAY_URL" ]; then
-        GATEWAY_URL="$GSV_GATEWAY_URL"
-        info "Using gateway URL from environment: ${GATEWAY_URL}"
-    elif check_existing_config; then
-        if prompt_yn "Existing config found. Reinstall CLI only?" "y"; then
-            download_cli
-            echo ""
-            success "CLI reinstalled!"
-            echo ""
-            echo "  Run: gsv client \"Hello!\""
-            echo ""
-            exit 0
-        fi
-    fi
-    
     # Install CLI
     echo ""
     download_cli
-    
-    # Configure if we have a URL, or optionally prompt for one
-    if [ -z "$GATEWAY_URL" ]; then
-        echo ""
-        if prompt_yn "Configure an existing gateway URL now?" "n"; then
-            GATEWAY_URL=$(prompt_input "Enter your gateway URL" "https://gsv.xxx.workers.dev")
-        fi
-    fi
 
-    if [ -n "$GATEWAY_URL" ]; then
-        echo ""
-        configure_cli "$GATEWAY_URL"
-    fi
+    echo ""
+    ensure_config_file
     
     # Done!
     echo ""
@@ -255,23 +203,15 @@ main() {
     echo -e "  ${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     
-    if [ -n "$GATEWAY_URL" ]; then
-        echo "  Gateway: ${GATEWAY_URL}"
-        echo "  Config:  ${CONFIG_DIR}/config.toml"
-        echo ""
-        echo "  Next steps:"
-        echo "    gsv client \"Hello!\"     # Start chatting"
-        echo "    gsv deploy up --wizard --all  # Deploy/update Cloudflare resources"
-        echo "    gsv node install --id mypc --workspace ~/projects   # Run tool node daemon"
-        echo ""
-    else
-        echo "  CLI installed."
-        echo "  Deploy and configure when ready:"
-        echo "    gsv deploy up --wizard --all"
-        echo "  Or set an existing gateway:"
-        echo "    gsv local-config set gateway.url wss://<your-gateway>.workers.dev/ws"
-        echo ""
-    fi
+    echo "  CLI installed."
+    echo "  Config:  ${CONFIG_DIR}/config.toml"
+    echo ""
+    echo "  Next steps:"
+    echo "    gsv deploy up --wizard --all  # Deploy/update Cloudflare resources"
+    echo "    gsv local-config set gateway.url wss://<your-gateway>.workers.dev/ws"
+    echo "    gsv local-config set gateway.token <your-auth-token>"
+    echo "    gsv client \"Hello!\"     # Start chatting"
+    echo ""
     
     echo "  For help: gsv --help"
     echo "  Docs: https://github.com/${REPO}"
