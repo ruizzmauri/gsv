@@ -282,6 +282,20 @@ export class Gateway extends DurableObject<Env> {
       `[Gateway] After rehydration: ${this.clients.size} clients, ${this.nodes.size} nodes, ${this.channels.size} channels`,
     );
 
+    // Evict rehydrated nodes that lost their registry data (KV was
+    // deleted but the WebSocket survived hibernation).
+    const orphanedNodeIds = Array.from(this.nodes.keys()).filter(
+      (nodeId) => !this.toolRegistry[nodeId]?.length,
+    );
+    for (const nodeId of orphanedNodeIds) {
+      const ws = this.nodes.get(nodeId)!;
+      this.nodes.delete(nodeId);
+      ws.close(4000, "Missing tool registry after rehydration");
+      console.log(
+        `[Gateway] Evicted orphaned node ${nodeId} (no tools in registry)`,
+      );
+    }
+
     const detachedNodeIds = Object.keys(this.toolRegistry).filter(
       (nodeId) => !this.nodes.has(nodeId),
     );
