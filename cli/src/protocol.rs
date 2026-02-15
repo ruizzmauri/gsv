@@ -133,6 +133,7 @@ pub struct NodeProbeResultParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeExecEventParams {
+    pub event_id: String,
     pub session_id: String,
     pub event: String,
     #[serde(skip_serializing_if = "Option::is_none")]

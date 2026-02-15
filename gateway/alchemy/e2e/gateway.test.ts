@@ -1524,6 +1524,7 @@ describe("Node Exec Event Routing", () => {
 
     try {
       await sendRequest(clientWs, "node.exec.event", {
+        eventId: crypto.randomUUID(),
         sessionId: "bg-123",
         event: "finished",
         exitCode: 0,
@@ -1566,6 +1567,7 @@ describe("Node Exec Event Routing", () => {
       });
 
       const result = await sendRequest(nodeWs, "node.exec.event", {
+        eventId: crypto.randomUUID(),
         sessionId: "missing-bg-session",
         event: "finished",
         exitCode: 0,
@@ -1607,6 +1609,7 @@ describe("Node Exec Event Routing", () => {
       });
 
       const invalidEventResult = await sendRequest(nodeWs, "node.exec.event", {
+        eventId: crypto.randomUUID(),
         sessionId: "bg-321",
         event: "bogus",
       }) as { ok: boolean; dropped?: boolean };
@@ -1614,6 +1617,7 @@ describe("Node Exec Event Routing", () => {
       expect(invalidEventResult.dropped).toBe(true);
 
       const missingSessionResult = await sendRequest(nodeWs, "node.exec.event", {
+        eventId: crypto.randomUUID(),
         sessionId: "   ",
         event: "finished",
       }) as { ok: boolean; dropped?: boolean };

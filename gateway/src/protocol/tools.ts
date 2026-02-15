@@ -90,6 +90,7 @@ export const NODE_EXEC_EVENT_TYPES = [
 export type NodeExecEventType = (typeof NODE_EXEC_EVENT_TYPES)[number];
 
 export type NodeExecEventParams = {
+  eventId: string;
   sessionId: string;
   event: NodeExecEventType;
   callId?: string;

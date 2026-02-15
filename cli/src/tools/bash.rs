@@ -349,6 +349,7 @@ async fn mark_backgrounded(handle: &ProcessHandle, call_id: Option<String>) -> P
     if !state.started_notified {
         state.started_notified = true;
         emit_exec_event(NodeExecEventParams {
+            event_id: Uuid::new_v4().to_string(),
             session_id: state.session_id.clone(),
             event: "started".to_string(),
             call_id,
@@ -505,6 +506,7 @@ async fn launch_managed_process(
             }
 
             emit_exec_event(NodeExecEventParams {
+                event_id: Uuid::new_v4().to_string(),
                 session_id: snapshot.session_id,
                 event: event_name,
                 call_id: None,

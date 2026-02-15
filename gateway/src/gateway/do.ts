@@ -103,6 +103,7 @@ import type { SkillsStatusResult } from "../protocol/skills";
 import type {
   RuntimeNodeInventory,
   NodeExecEventParams,
+  NodeExecEventType,
   NodeRuntimeInfo,
   NodeProbePayload,
   NodeProbeResultParams,
@@ -158,6 +159,31 @@ type PendingAsyncExecSession = {
   expiresAt: number;
 };
 
+type AsyncExecTerminalEventType = Extract<
+  NodeExecEventType,
+  "finished" | "failed" | "timed_out"
+>;
+
+type PendingAsyncExecDelivery = {
+  eventId: string;
+  nodeId: string;
+  sessionId: string;
+  sessionKey: string;
+  callId: string;
+  event: AsyncExecTerminalEventType;
+  exitCode?: number | null;
+  signal?: string;
+  outputTail?: string;
+  startedAt?: number;
+  endedAt?: number;
+  createdAt: number;
+  updatedAt: number;
+  attempts: number;
+  nextAttemptAt: number;
+  expiresAt: number;
+  lastError?: string;
+};
+
 const DEFAULT_LOG_LINES = 100;
 const MAX_LOG_LINES = 5000;
 const DEFAULT_INTERNAL_LOG_TIMEOUT_MS = 20_000;
@@ -170,6 +196,10 @@ const MIN_SKILL_PROBE_MAX_AGE_MS = 1000;
 const MAX_SKILL_PROBE_MAX_AGE_MS = 24 * 60 * 60_000;
 const SKILL_BIN_STATUS_TTL_MS = 5 * 60_000;
 const ASYNC_EXEC_SESSION_TTL_MS = 24 * 60 * 60_000;
+const ASYNC_EXEC_DELIVERY_TTL_MS = 24 * 60 * 60_000;
+const ASYNC_EXEC_DELIVERY_RETRY_BASE_MS = 1000;
+const ASYNC_EXEC_DELIVERY_RETRY_MAX_MS = 60_000;
+const ASYNC_EXEC_EVENT_DEDUPE_TTL_MS = 24 * 60 * 60_000;
 
 type GatewayMethodHandlerContext = {
   gw: Gateway;
@@ -277,6 +307,13 @@ export class Gateway extends DurableObject<Env> {
   readonly pendingAsyncExecSessions = PersistedObject<
     Record<string, PendingAsyncExecSession>
   >(this.ctx.storage.kv, { prefix: "pendingAsyncExecSessions:" });
+  readonly pendingAsyncExecDeliveries = PersistedObject<
+    Record<string, PendingAsyncExecDelivery>
+  >(this.ctx.storage.kv, { prefix: "pendingAsyncExecDeliveries:" });
+  readonly deliveredAsyncExecEvents = PersistedObject<Record<string, number>>(
+    this.ctx.storage.kv,
+    { prefix: "deliveredAsyncExecEvents:" },
+  );
   private readonly pendingInternalLogCalls = new Map<
     string,
     PendingInternalLogRequest
@@ -1066,6 +1103,356 @@ export class Gateway extends DurableObject<Env> {
     });
   }
 
+  private asAsyncExecTerminalEvent(
+    value: string,
+  ): AsyncExecTerminalEventType | undefined {
+    if (value === "finished" || value === "failed" || value === "timed_out") {
+      return value;
+    }
+    return undefined;
+  }
+
+  private resolveAsyncExecEventId(
+    nodeId: string,
+    sessionId: string,
+    params: NodeExecEventParams,
+  ): string {
+    const explicit =
+      typeof params.eventId === "string" ? params.eventId.trim() : "";
+    if (explicit) {
+      return explicit;
+    }
+
+    const parts = [
+      nodeId,
+      sessionId,
+      typeof params.event === "string" ? params.event.trim() : "unknown",
+      typeof params.callId === "string" ? params.callId.trim() : "",
+      typeof params.startedAt === "number" ? String(params.startedAt) : "",
+      typeof params.endedAt === "number" ? String(params.endedAt) : "",
+      typeof params.exitCode === "number" ? String(params.exitCode) : "",
+      typeof params.signal === "string" ? params.signal.trim() : "",
+    ];
+
+    return parts.filter((part) => part.length > 0).join(":");
+  }
+
+  private clonePendingAsyncExecDelivery(
+    value: PendingAsyncExecDelivery,
+    overrides?: Partial<PendingAsyncExecDelivery>,
+  ): PendingAsyncExecDelivery {
+    const plain = snapshot(
+      value as unknown as Proxied<PendingAsyncExecDelivery>,
+    );
+    return {
+      eventId: overrides?.eventId ?? plain.eventId,
+      nodeId: overrides?.nodeId ?? plain.nodeId,
+      sessionId: overrides?.sessionId ?? plain.sessionId,
+      sessionKey: overrides?.sessionKey ?? plain.sessionKey,
+      callId: overrides?.callId ?? plain.callId,
+      event: overrides?.event ?? plain.event,
+      exitCode: overrides?.exitCode ?? plain.exitCode,
+      signal: overrides?.signal ?? plain.signal,
+      outputTail: overrides?.outputTail ?? plain.outputTail,
+      startedAt: overrides?.startedAt ?? plain.startedAt,
+      endedAt: overrides?.endedAt ?? plain.endedAt,
+      createdAt: overrides?.createdAt ?? plain.createdAt,
+      updatedAt: overrides?.updatedAt ?? plain.updatedAt,
+      attempts: overrides?.attempts ?? plain.attempts,
+      nextAttemptAt: overrides?.nextAttemptAt ?? plain.nextAttemptAt,
+      expiresAt: overrides?.expiresAt ?? plain.expiresAt,
+      lastError: overrides?.lastError ?? plain.lastError,
+    };
+  }
+
+  private asPendingAsyncExecDelivery(
+    value: unknown,
+  ): PendingAsyncExecDelivery | undefined {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return undefined;
+    }
+
+    const record = value as Record<string, unknown>;
+    const eventId = asString(record.eventId);
+    const nodeId = asString(record.nodeId);
+    const sessionId = asString(record.sessionId);
+    const sessionKey = asString(record.sessionKey);
+    const callId = asString(record.callId);
+    const event =
+      typeof record.event === "string"
+        ? this.asAsyncExecTerminalEvent(record.event.trim())
+        : undefined;
+    const createdAt = asNumber(record.createdAt);
+    const updatedAt = asNumber(record.updatedAt);
+    const attempts = asNumber(record.attempts);
+    const nextAttemptAt = asNumber(record.nextAttemptAt);
+    const expiresAt = asNumber(record.expiresAt);
+
+    if (
+      !eventId ||
+      !nodeId ||
+      !sessionId ||
+      !sessionKey ||
+      !callId ||
+      !event ||
+      createdAt === undefined ||
+      updatedAt === undefined ||
+      attempts === undefined ||
+      nextAttemptAt === undefined ||
+      expiresAt === undefined
+    ) {
+      return undefined;
+    }
+
+    return {
+      eventId,
+      nodeId,
+      sessionId,
+      sessionKey,
+      callId,
+      event,
+      exitCode:
+        typeof record.exitCode === "number" && Number.isFinite(record.exitCode)
+          ? record.exitCode
+          : record.exitCode === null
+            ? null
+            : undefined,
+      signal: asString(record.signal),
+      outputTail: asString(record.outputTail),
+      startedAt: asNumber(record.startedAt),
+      endedAt: asNumber(record.endedAt),
+      createdAt,
+      updatedAt,
+      attempts: Math.max(0, Math.floor(attempts)),
+      nextAttemptAt: Math.floor(nextAttemptAt),
+      expiresAt: Math.floor(expiresAt),
+      lastError: asString(record.lastError),
+    };
+  }
+
+  private gcPendingAsyncExecDeliveries(now = Date.now(), reason?: string): number {
+    let removed = 0;
+    for (const [eventId, rawValue] of Object.entries(this.pendingAsyncExecDeliveries)) {
+      const value = this.asPendingAsyncExecDelivery(rawValue);
+      if (!value || value.expiresAt <= now) {
+        delete this.pendingAsyncExecDeliveries[eventId];
+        removed += 1;
+      }
+    }
+
+    if (removed > 0) {
+      console.warn(
+        `[Gateway] GC removed ${removed} stale async exec deliveries${reason ? ` (${reason})` : ""}`,
+      );
+    }
+
+    return removed;
+  }
+
+  private nextPendingAsyncExecDeliveryAtMs(now = Date.now()): number | undefined {
+    let next: number | undefined;
+    for (const [eventId, rawValue] of Object.entries(this.pendingAsyncExecDeliveries)) {
+      const value = this.asPendingAsyncExecDelivery(rawValue);
+      if (!value) {
+        delete this.pendingAsyncExecDeliveries[eventId];
+        continue;
+      }
+
+      const candidate = value.expiresAt <= now ? now : Math.max(now, value.nextAttemptAt);
+      if (next === undefined || candidate < next) {
+        next = candidate;
+      }
+    }
+    return next;
+  }
+
+  private gcDeliveredAsyncExecEvents(now = Date.now(), reason?: string): number {
+    let removed = 0;
+    for (const [eventId, expiresAt] of Object.entries(this.deliveredAsyncExecEvents)) {
+      if (
+        typeof expiresAt !== "number" ||
+        !Number.isFinite(expiresAt) ||
+        expiresAt <= now
+      ) {
+        delete this.deliveredAsyncExecEvents[eventId];
+        removed += 1;
+      }
+    }
+
+    if (removed > 0) {
+      console.warn(
+        `[Gateway] GC removed ${removed} delivered async exec event ids${reason ? ` (${reason})` : ""}`,
+      );
+    }
+
+    return removed;
+  }
+
+  private nextDeliveredAsyncExecEventGcAtMs(now = Date.now()): number | undefined {
+    let next: number | undefined;
+    for (const [eventId, expiresAt] of Object.entries(this.deliveredAsyncExecEvents)) {
+      if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt)) {
+        delete this.deliveredAsyncExecEvents[eventId];
+        if (next === undefined || now < next) {
+          next = now;
+        }
+        continue;
+      }
+      const candidate = expiresAt <= now ? now : expiresAt;
+      if (next === undefined || candidate < next) {
+        next = candidate;
+      }
+    }
+    return next;
+  }
+
+  private isAsyncExecEventDelivered(eventId: string, now = Date.now()): boolean {
+    const expiresAt = this.deliveredAsyncExecEvents[eventId];
+    if (typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > now) {
+      return true;
+    }
+
+    if (expiresAt !== undefined) {
+      delete this.deliveredAsyncExecEvents[eventId];
+    }
+
+    return false;
+  }
+
+  private markAsyncExecEventDelivered(eventId: string, now = Date.now()): void {
+    this.deliveredAsyncExecEvents[eventId] = now + ASYNC_EXEC_EVENT_DEDUPE_TTL_MS;
+  }
+
+  private getPendingAsyncExecDelivery(
+    eventId: string,
+  ): PendingAsyncExecDelivery | undefined {
+    const rawValue = this.pendingAsyncExecDeliveries[eventId];
+    const value = this.asPendingAsyncExecDelivery(rawValue);
+    if (!value) {
+      if (rawValue !== undefined) {
+        delete this.pendingAsyncExecDeliveries[eventId];
+      }
+      return undefined;
+    }
+    return this.clonePendingAsyncExecDelivery(value);
+  }
+
+  private asyncExecDeliveryBackoffMs(attempts: number): number {
+    const normalizedAttempts = Math.max(1, Math.floor(attempts));
+    const exponent = Math.min(normalizedAttempts - 1, 8);
+    return Math.min(
+      ASYNC_EXEC_DELIVERY_RETRY_MAX_MS,
+      ASYNC_EXEC_DELIVERY_RETRY_BASE_MS * 2 ** exponent,
+    );
+  }
+
+  private queueAsyncExecDelivery(params: {
+    eventId: string;
+    nodeId: string;
+    sessionId: string;
+    sessionKey: string;
+    callId: string;
+    event: AsyncExecTerminalEventType;
+    exitCode?: number | null;
+    signal?: string;
+    outputTail?: string;
+    startedAt?: number;
+    endedAt?: number;
+  }): PendingAsyncExecDelivery {
+    const existing = this.getPendingAsyncExecDelivery(params.eventId);
+    if (existing) {
+      return existing;
+    }
+
+    const now = Date.now();
+    const delivery: PendingAsyncExecDelivery = {
+      eventId: params.eventId,
+      nodeId: params.nodeId,
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      callId: params.callId,
+      event: params.event,
+      exitCode: params.exitCode,
+      signal: params.signal,
+      outputTail: params.outputTail,
+      startedAt: params.startedAt,
+      endedAt: params.endedAt,
+      createdAt: now,
+      updatedAt: now,
+      attempts: 0,
+      nextAttemptAt: now,
+      expiresAt: now + ASYNC_EXEC_DELIVERY_TTL_MS,
+    };
+    this.pendingAsyncExecDeliveries[params.eventId] = delivery;
+    return delivery;
+  }
+
+  private async deliverPendingAsyncExecDeliveries(now = Date.now()): Promise<number> {
+    this.gcDeliveredAsyncExecEvents(now, "delivery-scan");
+    this.gcPendingAsyncExecDeliveries(now, "delivery-scan");
+
+    const deliveries = Object.entries(this.pendingAsyncExecDeliveries)
+      .map(([eventId, rawValue]) => {
+        const value = this.asPendingAsyncExecDelivery(rawValue);
+        if (!value) {
+          delete this.pendingAsyncExecDeliveries[eventId];
+          return null;
+        }
+        return value;
+      })
+      .filter((entry): entry is PendingAsyncExecDelivery => entry !== null)
+      .sort((left, right) => left.nextAttemptAt - right.nextAttemptAt);
+
+    let delivered = 0;
+    for (const delivery of deliveries) {
+      if (delivery.expiresAt <= now) {
+        delete this.pendingAsyncExecDeliveries[delivery.eventId];
+        continue;
+      }
+
+      if (delivery.nextAttemptAt > now) {
+        continue;
+      }
+
+      if (this.isAsyncExecEventDelivered(delivery.eventId, now)) {
+        delete this.pendingAsyncExecDeliveries[delivery.eventId];
+        continue;
+      }
+
+      try {
+        const session = this.env.SESSION.getByName(delivery.sessionKey);
+        await session.ingestAsyncExecCompletion({
+          eventId: delivery.eventId,
+          nodeId: delivery.nodeId,
+          sessionId: delivery.sessionId,
+          callId: delivery.callId,
+          event: delivery.event,
+          exitCode: delivery.exitCode,
+          signal: delivery.signal,
+          outputTail: delivery.outputTail,
+          startedAt: delivery.startedAt,
+          endedAt: delivery.endedAt,
+          tools: JSON.parse(JSON.stringify(this.getAllTools())),
+          runtimeNodes: JSON.parse(JSON.stringify(this.getRuntimeNodeInventory())),
+        });
+        this.markAsyncExecEventDelivered(delivery.eventId, now);
+        delete this.pendingAsyncExecDeliveries[delivery.eventId];
+        delivered += 1;
+      } catch (error) {
+        const attempts = delivery.attempts + 1;
+        this.pendingAsyncExecDeliveries[delivery.eventId] =
+          this.clonePendingAsyncExecDelivery(delivery, {
+            attempts,
+            updatedAt: now,
+            nextAttemptAt: now + this.asyncExecDeliveryBackoffMs(attempts),
+            lastError: error instanceof Error ? error.message : String(error),
+          });
+      }
+    }
+
+    return delivered;
+  }
+
   private cloneNodeRuntimeInfo(
     runtime: NodeRuntimeInfo,
     overrides?: Partial<NodeRuntimeInfo>,
@@ -1384,64 +1771,77 @@ export class Gateway extends DurableObject<Env> {
       return { ok: true, dropped: true };
     }
 
+    const eventId = this.resolveAsyncExecEventId(nodeId, sessionId, params);
+    if (!eventId) {
+      return { ok: true, dropped: true };
+    }
+
     const now = Date.now();
     this.gcPendingAsyncExecSessions(now, "node.exec.event");
+    this.gcPendingAsyncExecDeliveries(now, "node.exec.event");
+    this.gcDeliveredAsyncExecEvents(now, "node.exec.event");
+
+    if (this.isAsyncExecEventDelivered(eventId, now)) {
+      return { ok: true };
+    }
+
+    if (this.getPendingAsyncExecDelivery(eventId)) {
+      return { ok: true };
+    }
+
+    if (eventType === "started") {
+      const pending = this.getPendingAsyncExecSession(nodeId, sessionId);
+      if (!pending) {
+        return { ok: true, dropped: true };
+      }
+      this.touchPendingAsyncExecSession(nodeId, sessionId);
+      await this.scheduleGatewayAlarm();
+      return { ok: true };
+    }
+
+    const terminalEvent = this.asAsyncExecTerminalEvent(eventType);
+    if (!terminalEvent) {
+      return { ok: true, dropped: true };
+    }
+
     const pending = this.getPendingAsyncExecSession(nodeId, sessionId);
     if (!pending) {
       return { ok: true, dropped: true };
     }
 
-    this.touchPendingAsyncExecSession(nodeId, sessionId);
-
-    if (eventType === "started") {
-      await this.scheduleGatewayAlarm();
-      return { ok: true };
-    }
-
-    const exitLabel =
-      typeof params.exitCode === "number" && Number.isFinite(params.exitCode)
-        ? `exit code ${params.exitCode}`
-        : params.signal
-          ? `signal ${params.signal}`
-          : "unknown exit";
-    const statusLabel =
-      eventType === "finished"
-        ? "completed"
-        : eventType === "timed_out"
-          ? "timed out"
-          : "failed";
     const outputTail =
       typeof params.outputTail === "string" ? params.outputTail.trim() : "";
-    const clippedTail =
-      outputTail.length > 4000
-        ? outputTail.slice(outputTail.length - 4000)
-        : outputTail;
-    const message = [
-      `System event: Background command ${statusLabel} on node ${nodeId} (session ${sessionId.slice(0, 8)}, ${exitLabel}).`,
-      clippedTail ? `Recent output:\n${clippedTail}` : undefined,
-    ]
-      .filter(Boolean)
-      .join("\n\n");
-
-    try {
-      const session = this.env.SESSION.getByName(pending.sessionKey);
-      const runId = crypto.randomUUID();
-      await session.chatSend(
-        message,
-        runId,
-        JSON.parse(JSON.stringify(this.getAllTools())),
-        JSON.parse(JSON.stringify(this.getRuntimeNodeInventory())),
-        pending.sessionKey,
-      );
-    } catch (error) {
-      console.error(
-        `[Gateway] Failed to route node.exec.event to session ${pending.sessionKey}:`,
-        error,
-      );
-    } finally {
-      this.deletePendingAsyncExecSession(nodeId, sessionId);
-      await this.scheduleGatewayAlarm();
-    }
+    this.queueAsyncExecDelivery({
+      eventId,
+      nodeId,
+      sessionId,
+      sessionKey: pending.sessionKey,
+      callId: pending.callId,
+      event: terminalEvent,
+      exitCode:
+        typeof params.exitCode === "number" && Number.isFinite(params.exitCode)
+          ? params.exitCode
+          : params.exitCode === null
+            ? null
+            : undefined,
+      signal:
+        typeof params.signal === "string" ? params.signal.trim() || undefined : undefined,
+      outputTail:
+        outputTail.length > 4000
+          ? outputTail.slice(outputTail.length - 4000)
+          : outputTail || undefined,
+      startedAt:
+        typeof params.startedAt === "number" && Number.isFinite(params.startedAt)
+          ? params.startedAt
+          : undefined,
+      endedAt:
+        typeof params.endedAt === "number" && Number.isFinite(params.endedAt)
+          ? params.endedAt
+          : undefined,
+    });
+    this.deletePendingAsyncExecSession(nodeId, sessionId);
+    await this.deliverPendingAsyncExecDeliveries(now);
+    await this.scheduleGatewayAlarm();
 
     return { ok: true };
   }
@@ -3033,6 +3433,8 @@ export class Gateway extends DurableObject<Env> {
     const probeTimeoutNext = this.nextPendingNodeProbeExpiryAtMs();
     const probeGcNext = this.nextPendingNodeProbeGcAtMs();
     const asyncExecGcNext = this.nextPendingAsyncExecSessionExpiryAtMs();
+    const asyncExecDeliveryNext = this.nextPendingAsyncExecDeliveryAtMs();
+    const asyncExecDeliveredGcNext = this.nextDeliveredAsyncExecEventGcAtMs();
     let nextAlarm: number | undefined;
     const candidates = [
       heartbeatNext,
@@ -3040,6 +3442,8 @@ export class Gateway extends DurableObject<Env> {
       probeTimeoutNext,
       probeGcNext,
       asyncExecGcNext,
+      asyncExecDeliveryNext,
+      asyncExecDeliveredGcNext,
     ].filter(
       (value): value is number => typeof value === "number",
     );
@@ -3055,7 +3459,7 @@ export class Gateway extends DurableObject<Env> {
 
     await this.ctx.storage.setAlarm(nextAlarm);
     console.log(
-      `[Gateway] Alarm scheduled for ${new Date(nextAlarm).toISOString()} (heartbeat=${heartbeatNext ?? "none"}, cron=${cronNext ?? "none"}, probeTimeouts=${probeTimeoutNext ?? "none"}, probeGc=${probeGcNext ?? "none"}, asyncExecGc=${asyncExecGcNext ?? "none"})`,
+      `[Gateway] Alarm scheduled for ${new Date(nextAlarm).toISOString()} (heartbeat=${heartbeatNext ?? "none"}, cron=${cronNext ?? "none"}, probeTimeouts=${probeTimeoutNext ?? "none"}, probeGc=${probeGcNext ?? "none"}, asyncExecGc=${asyncExecGcNext ?? "none"}, asyncExecDelivery=${asyncExecDeliveryNext ?? "none"}, asyncExecDeliveredGc=${asyncExecDeliveredGcNext ?? "none"})`,
     );
   }
 
@@ -3138,6 +3542,9 @@ export class Gateway extends DurableObject<Env> {
     this.gcPendingNodeProbes(now, "alarm");
     await this.handlePendingNodeProbeTimeouts();
     this.gcPendingAsyncExecSessions(now, "alarm");
+    this.gcPendingAsyncExecDeliveries(now, "alarm");
+    this.gcDeliveredAsyncExecEvents(now, "alarm");
+    await this.deliverPendingAsyncExecDeliveries(now);
 
     await this.scheduleGatewayAlarm();
   }
