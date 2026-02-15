@@ -1,5 +1,5 @@
 import { DurableObject, env } from "cloudflare:workers";
-import { PersistedObject, snapshot } from "../shared/persisted-object";
+import { PersistedObject, snapshot, type Proxied } from "../shared/persisted-object";
 import type {
   Frame,
   EventFrame,
@@ -154,7 +154,9 @@ const MAX_INTERNAL_LOG_TIMEOUT_MS = 120_000;
 const DEFAULT_SKILL_PROBE_TIMEOUT_MS = 15_000;
 const MAX_SKILL_PROBE_TIMEOUT_MS = 120_000;
 const MAX_SKILL_PROBE_ATTEMPTS = 2;
-const SKILL_PROBE_MAX_AGE_MS = 10 * 60_000;
+const DEFAULT_SKILL_PROBE_MAX_AGE_MS = 10 * 60_000;
+const MIN_SKILL_PROBE_MAX_AGE_MS = 1000;
+const MAX_SKILL_PROBE_MAX_AGE_MS = 24 * 60 * 60_000;
 const SKILL_BIN_STATUS_TTL_MS = 5 * 60_000;
 
 type GatewayMethodHandlerContext = {
@@ -864,6 +866,19 @@ export class Gateway extends DurableObject<Env> {
     return Math.max(1000, Math.min(timeoutInput, MAX_SKILL_PROBE_TIMEOUT_MS));
   }
 
+  private resolveSkillProbeMaxAgeMs(): number {
+    const configured = this.getFullConfig().timeouts.skillProbeMaxAgeMs;
+    if (typeof configured !== "number" || !Number.isFinite(configured)) {
+      return DEFAULT_SKILL_PROBE_MAX_AGE_MS;
+    }
+
+    const normalized = Math.floor(configured);
+    return Math.max(
+      MIN_SKILL_PROBE_MAX_AGE_MS,
+      Math.min(normalized, MAX_SKILL_PROBE_MAX_AGE_MS),
+    );
+  }
+
   private collectPendingProbeBinsForNode(nodeId: string): Set<string> {
     const bins = new Set<string>();
     for (const probe of Object.values(this.pendingNodeProbes)) {
@@ -875,6 +890,66 @@ export class Gateway extends DurableObject<Env> {
       }
     }
     return bins;
+  }
+
+  private cloneNodeRuntimeInfo(
+    runtime: NodeRuntimeInfo,
+    overrides?: Partial<NodeRuntimeInfo>,
+  ): NodeRuntimeInfo {
+    const plainRuntime = snapshot(
+      runtime as unknown as Proxied<NodeRuntimeInfo>,
+    );
+    const hostCapabilities =
+      overrides?.hostCapabilities ?? plainRuntime.hostCapabilities;
+    const toolCapabilities =
+      overrides?.toolCapabilities ?? plainRuntime.toolCapabilities;
+    const hostEnv = overrides?.hostEnv ?? plainRuntime.hostEnv;
+    const hostBinStatus = overrides?.hostBinStatus ?? plainRuntime.hostBinStatus;
+
+    return {
+      hostRole: overrides?.hostRole ?? plainRuntime.hostRole,
+      hostCapabilities: [...hostCapabilities],
+      toolCapabilities: Object.fromEntries(
+        Object.entries(toolCapabilities).map(([toolName, capabilities]) => [
+          toolName,
+          [...capabilities],
+        ]),
+      ),
+      hostOs: overrides?.hostOs ?? plainRuntime.hostOs,
+      hostEnv: hostEnv ? [...hostEnv] : undefined,
+      hostBinStatus: hostBinStatus
+        ? Object.fromEntries(
+            Object.entries(hostBinStatus).map(([bin, available]) => [
+              bin,
+              available === true,
+            ]),
+          )
+        : undefined,
+      hostBinStatusUpdatedAt:
+        overrides?.hostBinStatusUpdatedAt ??
+        plainRuntime.hostBinStatusUpdatedAt,
+    };
+  }
+
+  private clonePendingNodeProbe(
+    probe: PendingNodeProbe,
+    overrides?: Partial<PendingNodeProbe>,
+  ): PendingNodeProbe {
+    const plainProbe = snapshot(
+      probe as unknown as Proxied<PendingNodeProbe>,
+    );
+    const bins = overrides?.bins ?? plainProbe.bins;
+    return {
+      nodeId: overrides?.nodeId ?? plainProbe.nodeId,
+      agentId: overrides?.agentId ?? plainProbe.agentId,
+      kind: overrides?.kind ?? plainProbe.kind,
+      bins: [...bins],
+      timeoutMs: overrides?.timeoutMs ?? plainProbe.timeoutMs,
+      attempts: overrides?.attempts ?? plainProbe.attempts,
+      createdAt: overrides?.createdAt ?? plainProbe.createdAt,
+      sentAt: overrides?.sentAt ?? plainProbe.sentAt,
+      expiresAt: overrides?.expiresAt ?? plainProbe.expiresAt,
+    };
   }
 
   private dispatchNodeProbe(
@@ -904,12 +979,11 @@ export class Gateway extends DurableObject<Env> {
     }
 
     const sentAt = Date.now();
-    this.pendingNodeProbes[probeId] = {
-      ...probe,
+    this.pendingNodeProbes[probeId] = this.clonePendingNodeProbe(probe, {
       attempts: probe.attempts + 1,
       sentAt,
       expiresAt: sentAt + probe.timeoutMs,
-    };
+    });
     return true;
   }
 
@@ -952,11 +1026,10 @@ export class Gateway extends DurableObject<Env> {
       if (probe.nodeId !== nodeId || !probe.sentAt) {
         continue;
       }
-      this.pendingNodeProbes[probeId] = {
-        ...probe,
+      this.pendingNodeProbes[probeId] = this.clonePendingNodeProbe(probe, {
         sentAt: undefined,
         expiresAt: undefined,
-      };
+      });
     }
     console.warn(`[Gateway] Marked pending node probes for ${nodeId} as queued: ${reason}`);
   }
@@ -990,9 +1063,10 @@ export class Gateway extends DurableObject<Env> {
   }
 
   private nextPendingNodeProbeGcAtMs(now = Date.now()): number | undefined {
+    const maxAgeMs = this.resolveSkillProbeMaxAgeMs();
     let next: number | undefined;
     for (const probe of Object.values(this.pendingNodeProbes)) {
-      const gcAt = probe.createdAt + SKILL_PROBE_MAX_AGE_MS;
+      const gcAt = probe.createdAt + maxAgeMs;
       const candidate = gcAt <= now ? now : gcAt;
       if (next === undefined || candidate < next) {
         next = candidate;
@@ -1002,9 +1076,10 @@ export class Gateway extends DurableObject<Env> {
   }
 
   private gcPendingNodeProbes(now = Date.now(), reason?: string): number {
+    const maxAgeMs = this.resolveSkillProbeMaxAgeMs();
     let removed = 0;
     for (const [probeId, probe] of Object.entries(this.pendingNodeProbes)) {
-      if (probe.createdAt + SKILL_PROBE_MAX_AGE_MS > now) {
+      if (probe.createdAt + maxAgeMs > now) {
         continue;
       }
       delete this.pendingNodeProbes[probeId];
@@ -1028,11 +1103,10 @@ export class Gateway extends DurableObject<Env> {
       }
 
       if (probe.attempts < MAX_SKILL_PROBE_ATTEMPTS) {
-        const queued: PendingNodeProbe = {
-          ...probe,
+        const queued: PendingNodeProbe = this.clonePendingNodeProbe(probe, {
           sentAt: undefined,
           expiresAt: undefined,
-        };
+        });
         this.pendingNodeProbes[probeId] = queued;
         const dispatched = this.dispatchNodeProbe(probeId, queued);
         if (dispatched) {
@@ -1103,8 +1177,7 @@ export class Gateway extends DurableObject<Env> {
       const runtime = this.nodeRuntimeRegistry[nodeId];
       if (runtime) {
         const existingStatus = runtime.hostBinStatus ?? {};
-        this.nodeRuntimeRegistry[nodeId] = {
-          ...runtime,
+        this.nodeRuntimeRegistry[nodeId] = this.cloneNodeRuntimeInfo(runtime, {
           hostBinStatus: Object.fromEntries(
             Object.entries({
               ...existingStatus,
@@ -1112,7 +1185,7 @@ export class Gateway extends DurableObject<Env> {
             }).sort(([left], [right]) => left.localeCompare(right)),
           ),
           hostBinStatusUpdatedAt: Date.now(),
-        };
+        });
       }
     }
 

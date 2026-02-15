@@ -170,6 +170,7 @@ export interface GsvConfig {
   timeouts: {
     llmMs: number;
     toolMs: number;
+    skillProbeMaxAgeMs?: number;
   };
 
   // Auth settings
