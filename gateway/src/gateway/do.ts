@@ -102,6 +102,7 @@ import type { SessionRegistryEntry } from "../protocol/session";
 import type { SkillsStatusResult } from "../protocol/skills";
 import type {
   RuntimeNodeInventory,
+  NodeExecEventParams,
   NodeRuntimeInfo,
   NodeProbePayload,
   NodeProbeResultParams,
@@ -147,6 +148,16 @@ type PendingNodeProbe = {
   expiresAt?: number;
 };
 
+type PendingAsyncExecSession = {
+  nodeId: string;
+  sessionId: string;
+  sessionKey: string;
+  callId: string;
+  createdAt: number;
+  updatedAt: number;
+  expiresAt: number;
+};
+
 const DEFAULT_LOG_LINES = 100;
 const MAX_LOG_LINES = 5000;
 const DEFAULT_INTERNAL_LOG_TIMEOUT_MS = 20_000;
@@ -158,6 +169,7 @@ const DEFAULT_SKILL_PROBE_MAX_AGE_MS = 10 * 60_000;
 const MIN_SKILL_PROBE_MAX_AGE_MS = 1000;
 const MAX_SKILL_PROBE_MAX_AGE_MS = 24 * 60 * 60_000;
 const SKILL_BIN_STATUS_TTL_MS = 5 * 60_000;
+const ASYNC_EXEC_SESSION_TTL_MS = 24 * 60 * 60_000;
 
 type GatewayMethodHandlerContext = {
   gw: Gateway;
@@ -262,6 +274,9 @@ export class Gateway extends DurableObject<Env> {
     this.ctx.storage.kv,
     { prefix: "pendingNodeProbes:" },
   );
+  readonly pendingAsyncExecSessions = PersistedObject<
+    Record<string, PendingAsyncExecSession>
+  >(this.ctx.storage.kv, { prefix: "pendingAsyncExecSessions:" });
   private readonly pendingInternalLogCalls = new Map<
     string,
     PendingInternalLogRequest
@@ -892,6 +907,165 @@ export class Gateway extends DurableObject<Env> {
     return bins;
   }
 
+  private asyncExecSessionKey(nodeId: string, sessionId: string): string {
+    return `${nodeId}:${sessionId}`;
+  }
+
+  private clonePendingAsyncExecSession(
+    value: PendingAsyncExecSession,
+    overrides?: Partial<PendingAsyncExecSession>,
+  ): PendingAsyncExecSession {
+    const plain = snapshot(
+      value as unknown as Proxied<PendingAsyncExecSession>,
+    );
+    return {
+      nodeId: overrides?.nodeId ?? plain.nodeId,
+      sessionId: overrides?.sessionId ?? plain.sessionId,
+      sessionKey: overrides?.sessionKey ?? plain.sessionKey,
+      callId: overrides?.callId ?? plain.callId,
+      createdAt: overrides?.createdAt ?? plain.createdAt,
+      updatedAt: overrides?.updatedAt ?? plain.updatedAt,
+      expiresAt: overrides?.expiresAt ?? plain.expiresAt,
+    };
+  }
+
+  private asPendingAsyncExecSession(
+    value: unknown,
+  ): PendingAsyncExecSession | undefined {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return undefined;
+    }
+    const record = value as Record<string, unknown>;
+    const nodeId = asString(record.nodeId);
+    const sessionId = asString(record.sessionId);
+    const sessionKey = asString(record.sessionKey);
+    const callId = asString(record.callId);
+    const createdAt = asNumber(record.createdAt);
+    const updatedAt = asNumber(record.updatedAt);
+    const expiresAt = asNumber(record.expiresAt);
+    if (
+      !nodeId ||
+      !sessionId ||
+      !sessionKey ||
+      !callId ||
+      createdAt === undefined ||
+      updatedAt === undefined ||
+      expiresAt === undefined
+    ) {
+      return undefined;
+    }
+    return {
+      nodeId,
+      sessionId,
+      sessionKey,
+      callId,
+      createdAt,
+      updatedAt,
+      expiresAt,
+    };
+  }
+
+  private gcPendingAsyncExecSessions(now = Date.now(), reason?: string): number {
+    let removed = 0;
+    for (const [key, rawValue] of Object.entries(this.pendingAsyncExecSessions)) {
+      const value = this.asPendingAsyncExecSession(rawValue);
+      if (!value) {
+        delete this.pendingAsyncExecSessions[key];
+        removed += 1;
+        continue;
+      }
+      if (value.expiresAt > now) {
+        continue;
+      }
+      delete this.pendingAsyncExecSessions[key];
+      removed += 1;
+    }
+    if (removed > 0) {
+      console.warn(
+        `[Gateway] GC removed ${removed} stale async exec sessions${reason ? ` (${reason})` : ""}`,
+      );
+    }
+    return removed;
+  }
+
+  private nextPendingAsyncExecSessionExpiryAtMs(): number | undefined {
+    let next: number | undefined;
+    for (const [key, rawValue] of Object.entries(this.pendingAsyncExecSessions)) {
+      const value = this.asPendingAsyncExecSession(rawValue);
+      if (!value) {
+        delete this.pendingAsyncExecSessions[key];
+        continue;
+      }
+      if (next === undefined || value.expiresAt < next) {
+        next = value.expiresAt;
+      }
+    }
+    return next;
+  }
+
+  registerPendingAsyncExecSession(params: {
+    nodeId: string;
+    sessionId: string;
+    sessionKey: string;
+    callId: string;
+  }): void {
+    const now = Date.now();
+    const normalizedSessionId = params.sessionId.trim();
+    if (!normalizedSessionId) {
+      return;
+    }
+    this.gcPendingAsyncExecSessions(now, "register");
+    const key = this.asyncExecSessionKey(params.nodeId, normalizedSessionId);
+    this.pendingAsyncExecSessions[key] = {
+      nodeId: params.nodeId,
+      sessionId: normalizedSessionId,
+      sessionKey: params.sessionKey,
+      callId: params.callId,
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: now + ASYNC_EXEC_SESSION_TTL_MS,
+    };
+    this.ctx.waitUntil(this.scheduleGatewayAlarm());
+  }
+
+  private getPendingAsyncExecSession(
+    nodeId: string,
+    sessionId: string,
+  ): PendingAsyncExecSession | undefined {
+    const key = this.asyncExecSessionKey(nodeId, sessionId);
+    const rawValue = this.pendingAsyncExecSessions[key];
+    const value = this.asPendingAsyncExecSession(rawValue);
+    if (!value) {
+      if (rawValue !== undefined) {
+        delete this.pendingAsyncExecSessions[key];
+      }
+      return undefined;
+    }
+    return this.clonePendingAsyncExecSession(value);
+  }
+
+  private deletePendingAsyncExecSession(nodeId: string, sessionId: string): void {
+    const key = this.asyncExecSessionKey(nodeId, sessionId);
+    delete this.pendingAsyncExecSessions[key];
+  }
+
+  private touchPendingAsyncExecSession(nodeId: string, sessionId: string): void {
+    const key = this.asyncExecSessionKey(nodeId, sessionId);
+    const rawValue = this.pendingAsyncExecSessions[key];
+    const value = this.asPendingAsyncExecSession(rawValue);
+    if (!value) {
+      if (rawValue !== undefined) {
+        delete this.pendingAsyncExecSessions[key];
+      }
+      return;
+    }
+    const now = Date.now();
+    this.pendingAsyncExecSessions[key] = this.clonePendingAsyncExecSession(value, {
+      updatedAt: now,
+      expiresAt: now + ASYNC_EXEC_SESSION_TTL_MS,
+    });
+  }
+
   private cloneNodeRuntimeInfo(
     runtime: NodeRuntimeInfo,
     overrides?: Partial<NodeRuntimeInfo>,
@@ -1191,6 +1365,84 @@ export class Gateway extends DurableObject<Env> {
 
     delete this.pendingNodeProbes[params.probeId];
     await this.scheduleGatewayAlarm();
+    return { ok: true };
+  }
+
+  async handleNodeExecEvent(
+    nodeId: string,
+    params: NodeExecEventParams,
+  ): Promise<{ ok: true; dropped?: true }> {
+    const sessionId =
+      typeof params.sessionId === "string" ? params.sessionId.trim() : "";
+    if (!sessionId) {
+      return { ok: true, dropped: true };
+    }
+
+    const eventType =
+      typeof params.event === "string" ? params.event.trim() : "";
+    if (!["started", "finished", "failed", "timed_out"].includes(eventType)) {
+      return { ok: true, dropped: true };
+    }
+
+    const now = Date.now();
+    this.gcPendingAsyncExecSessions(now, "node.exec.event");
+    const pending = this.getPendingAsyncExecSession(nodeId, sessionId);
+    if (!pending) {
+      return { ok: true, dropped: true };
+    }
+
+    this.touchPendingAsyncExecSession(nodeId, sessionId);
+
+    if (eventType === "started") {
+      await this.scheduleGatewayAlarm();
+      return { ok: true };
+    }
+
+    const exitLabel =
+      typeof params.exitCode === "number" && Number.isFinite(params.exitCode)
+        ? `exit code ${params.exitCode}`
+        : params.signal
+          ? `signal ${params.signal}`
+          : "unknown exit";
+    const statusLabel =
+      eventType === "finished"
+        ? "completed"
+        : eventType === "timed_out"
+          ? "timed out"
+          : "failed";
+    const outputTail =
+      typeof params.outputTail === "string" ? params.outputTail.trim() : "";
+    const clippedTail =
+      outputTail.length > 4000
+        ? outputTail.slice(outputTail.length - 4000)
+        : outputTail;
+    const message = [
+      `System event: Background command ${statusLabel} on node ${nodeId} (session ${sessionId.slice(0, 8)}, ${exitLabel}).`,
+      clippedTail ? `Recent output:\n${clippedTail}` : undefined,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    try {
+      const session = this.env.SESSION.getByName(pending.sessionKey);
+      const runId = crypto.randomUUID();
+      await session.chatSend(
+        message,
+        runId,
+        JSON.parse(JSON.stringify(this.getAllTools())),
+        JSON.parse(JSON.stringify(this.getRuntimeNodeInventory())),
+        pending.sessionKey,
+      );
+    } catch (error) {
+      console.error(
+        `[Gateway] Failed to route node.exec.event to session ${pending.sessionKey}:`,
+        error,
+      );
+    } finally {
+      this.deletePendingAsyncExecSession(nodeId, sessionId);
+      await this.scheduleGatewayAlarm();
+    }
+
     return { ok: true };
   }
 
@@ -2780,12 +3032,14 @@ export class Gateway extends DurableObject<Env> {
     const cronNext = this.getCronService().nextRunAtMs();
     const probeTimeoutNext = this.nextPendingNodeProbeExpiryAtMs();
     const probeGcNext = this.nextPendingNodeProbeGcAtMs();
+    const asyncExecGcNext = this.nextPendingAsyncExecSessionExpiryAtMs();
     let nextAlarm: number | undefined;
     const candidates = [
       heartbeatNext,
       cronNext,
       probeTimeoutNext,
       probeGcNext,
+      asyncExecGcNext,
     ].filter(
       (value): value is number => typeof value === "number",
     );
@@ -2801,7 +3055,7 @@ export class Gateway extends DurableObject<Env> {
 
     await this.ctx.storage.setAlarm(nextAlarm);
     console.log(
-      `[Gateway] Alarm scheduled for ${new Date(nextAlarm).toISOString()} (heartbeat=${heartbeatNext ?? "none"}, cron=${cronNext ?? "none"}, probeTimeouts=${probeTimeoutNext ?? "none"}, probeGc=${probeGcNext ?? "none"})`,
+      `[Gateway] Alarm scheduled for ${new Date(nextAlarm).toISOString()} (heartbeat=${heartbeatNext ?? "none"}, cron=${cronNext ?? "none"}, probeTimeouts=${probeTimeoutNext ?? "none"}, probeGc=${probeGcNext ?? "none"}, asyncExecGc=${asyncExecGcNext ?? "none"})`,
     );
   }
 
@@ -2883,6 +3137,7 @@ export class Gateway extends DurableObject<Env> {
 
     this.gcPendingNodeProbes(now, "alarm");
     await this.handlePendingNodeProbeTimeouts();
+    this.gcPendingAsyncExecSessions(now, "alarm");
 
     await this.scheduleGatewayAlarm();
   }

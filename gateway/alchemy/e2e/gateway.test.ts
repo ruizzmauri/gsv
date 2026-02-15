@@ -1517,6 +1517,114 @@ describe("Node Probe Lifecycle", () => {
   }, 80000);
 });
 
+describe("Node Exec Event Routing", () => {
+  it("rejects node.exec.event from non-node clients", async () => {
+    const wsUrl = gatewayUrl.replace("https://", "wss://") + "/ws";
+    const clientWs = await connectAndAuth(wsUrl);
+
+    try {
+      await sendRequest(clientWs, "node.exec.event", {
+        sessionId: "bg-123",
+        event: "finished",
+        exitCode: 0,
+      });
+      expect(true).toBe(false);
+    } catch (err) {
+      expect((err as Error).message).toContain(
+        "Only node clients can submit exec events",
+      );
+    } finally {
+      clientWs.close();
+    }
+  });
+
+  it("drops node.exec.event when async session mapping is unknown", async () => {
+    const wsUrl = gatewayUrl.replace("https://", "wss://") + "/ws";
+    const nodeId = `exec-event-node-${crypto.randomUUID().slice(0, 8)}`;
+    const toolName = `exec_event_tool_${crypto.randomUUID().slice(0, 8)}`;
+    const nodeWs = await connectWebSocket(wsUrl);
+
+    try {
+      await sendRequest(nodeWs, "connect", {
+        minProtocol: 1,
+        client: {
+          mode: "node",
+          id: nodeId,
+        },
+        tools: [
+          {
+            name: toolName,
+            description: "Node exec event routing test tool",
+            inputSchema: {
+              type: "object",
+              properties: {},
+              required: [],
+            },
+          },
+        ],
+        nodeRuntime: buildExecutionNodeRuntime([toolName]),
+      });
+
+      const result = await sendRequest(nodeWs, "node.exec.event", {
+        sessionId: "missing-bg-session",
+        event: "finished",
+        exitCode: 0,
+        outputTail: "done",
+      }) as { ok: boolean; dropped?: boolean };
+
+      expect(result.ok).toBe(true);
+      expect(result.dropped).toBe(true);
+    } finally {
+      nodeWs.close();
+    }
+  });
+
+  it("drops node.exec.event when payload is invalid", async () => {
+    const wsUrl = gatewayUrl.replace("https://", "wss://") + "/ws";
+    const nodeId = `exec-event-invalid-${crypto.randomUUID().slice(0, 8)}`;
+    const toolName = `exec_event_invalid_tool_${crypto.randomUUID().slice(0, 8)}`;
+    const nodeWs = await connectWebSocket(wsUrl);
+
+    try {
+      await sendRequest(nodeWs, "connect", {
+        minProtocol: 1,
+        client: {
+          mode: "node",
+          id: nodeId,
+        },
+        tools: [
+          {
+            name: toolName,
+            description: "Node exec event validation test tool",
+            inputSchema: {
+              type: "object",
+              properties: {},
+              required: [],
+            },
+          },
+        ],
+        nodeRuntime: buildExecutionNodeRuntime([toolName]),
+      });
+
+      const invalidEventResult = await sendRequest(nodeWs, "node.exec.event", {
+        sessionId: "bg-321",
+        event: "bogus",
+      }) as { ok: boolean; dropped?: boolean };
+      expect(invalidEventResult.ok).toBe(true);
+      expect(invalidEventResult.dropped).toBe(true);
+
+      const missingSessionResult = await sendRequest(nodeWs, "node.exec.event", {
+        sessionId: "   ",
+        event: "finished",
+      }) as { ok: boolean; dropped?: boolean };
+      expect(missingSessionResult.ok).toBe(true);
+      expect(missingSessionResult.dropped).toBe(true);
+    } finally {
+      nodeWs.close();
+    }
+  });
+});
+
 // ============================================================================
 // Skills Config Runtime Visibility
 // ============================================================================

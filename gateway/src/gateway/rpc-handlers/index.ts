@@ -20,6 +20,7 @@ import {
 } from "./channel";
 import {
   handleToolsList,
+  handleNodeExecEvent,
   handleNodeProbeResult,
   handleToolRequest,
   handleToolInvoke,
@@ -58,6 +59,7 @@ export function buildRpcHandlers(): Partial<{ [M in RpcMethod]: Handler<M> }> {
     "tool.invoke": handleToolInvoke,
     "tool.result": handleToolResult,
     "node.probe.result": handleNodeProbeResult,
+    "node.exec.event": handleNodeExecEvent,
     "tools.list": handleToolsList,
     "logs.get": handleLogsGet,
     "logs.result": handleLogsResult,

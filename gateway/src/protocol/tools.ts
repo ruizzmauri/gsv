@@ -80,3 +80,22 @@ export type NodeProbeResultParams = {
   bins?: Record<string, boolean>;
   error?: string;
 };
+
+export const NODE_EXEC_EVENT_TYPES = [
+  "started",
+  "finished",
+  "failed",
+  "timed_out",
+] as const;
+export type NodeExecEventType = (typeof NODE_EXEC_EVENT_TYPES)[number];
+
+export type NodeExecEventParams = {
+  sessionId: string;
+  event: NodeExecEventType;
+  callId?: string;
+  exitCode?: number | null;
+  signal?: string;
+  outputTail?: string;
+  startedAt?: number;
+  endedAt?: number;
+};

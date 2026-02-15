@@ -7,7 +7,7 @@ use gsv::protocol::{
     Frame, LogsGetPayload, LogsResultParams, NodeProbePayload, NodeProbeResultParams,
     NodeRuntimeInfo, ToolDefinition, ToolInvokePayload, ToolResultParams,
 };
-use gsv::tools::{all_tools_with_workspace, Tool};
+use gsv::tools::{all_tools_with_workspace, subscribe_exec_events, Tool};
 use serde_json::json;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -4229,6 +4229,7 @@ fn capabilities_for_tool(tool_name: &str) -> Result<Vec<&'static str>, String> {
         "Glob" => Ok(vec!["filesystem.list"]),
         "Grep" => Ok(vec!["text.search", "filesystem.read"]),
         "Bash" => Ok(vec!["shell.exec"]),
+        "Process" => Ok(vec!["shell.exec"]),
         _ => Err(format!("No capability mapping for tool '{}'", tool_name)),
     }
 }
@@ -4656,6 +4657,54 @@ async fn run_node(
         })
         .await;
 
+        let mut exec_events = subscribe_exec_events();
+        let conn_for_exec_events = conn.clone();
+        let logger_for_exec_events = logger.clone();
+        let exec_event_forwarder = tokio::spawn(async move {
+            loop {
+                match exec_events.recv().await {
+                    Ok(event) => {
+                        let params = match serde_json::to_value(&event) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                logger_for_exec_events.warn(
+                                    "node.exec.event.serialize_failed",
+                                    json!({
+                                        "error": error.to_string(),
+                                    }),
+                                );
+                                continue;
+                            }
+                        };
+                        if let Err(error) = conn_for_exec_events
+                            .request("node.exec.event", Some(params))
+                            .await
+                        {
+                            logger_for_exec_events.warn(
+                                "node.exec.event.send_failed",
+                                json!({
+                                    "sessionId": event.session_id,
+                                    "event": event.event,
+                                    "error": error.to_string(),
+                                }),
+                            );
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        logger_for_exec_events.warn(
+                            "node.exec.event.lagged",
+                            json!({
+                                "skipped": skipped,
+                            }),
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        });
+
         logger.info(
             "connect.ok",
             json!({
@@ -4670,6 +4719,7 @@ async fn run_node(
         loop {
             tokio::select! {
                 signal = &mut shutdown => {
+                    exec_event_forwarder.abort();
                     logger.info("shutdown", json!({ "signal": signal }));
                     return Ok(());
                 }
@@ -4738,6 +4788,7 @@ async fn run_node(
                 }
             }
         }
+        exec_event_forwarder.abort();
     }
 }
 

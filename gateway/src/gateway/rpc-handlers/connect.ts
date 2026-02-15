@@ -153,6 +153,7 @@ export const handleConnect: Handler<"connect"> = async (ctx) => {
         "tool.request",
         "tool.result",
         "node.probe.result",
+        "node.exec.event",
         "logs.result",
         "channel.inbound",
         "channel.start",

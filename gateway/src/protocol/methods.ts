@@ -25,6 +25,7 @@ import type { SkillsStatusResult, SkillsUpdateResult } from "./skills";
 import type {
   ToolDefinition,
   NodeRuntimeInfo,
+  NodeExecEventParams,
   NodeProbeResultParams,
   ToolRequestParams,
   ToolResultParams,
@@ -94,6 +95,11 @@ export type RpcMethods = {
 
   "node.probe.result": {
     params: NodeProbeResultParams;
+    result: { ok: true; dropped?: true };
+  };
+
+  "node.exec.event": {
+    params: NodeExecEventParams;
     result: { ok: true; dropped?: true };
   };
 
