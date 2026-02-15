@@ -48,7 +48,7 @@ import {
 } from "../agents/prompt";
 import {
   buildAgentSessionKey,
-  canonicalizeMainSessionAlias,
+  canonicalizeSessionKey as canonicalizeKey,
   normalizeAgentId,
   normalizeMainKey,
   resolveAgentIdFromSessionKey,
@@ -3037,31 +3037,15 @@ export class Gateway extends DurableObject<Env> {
   >(this.ctx.storage.kv, { prefix: "pendingChannelResponses:" });
 
   canonicalizeSessionKey(sessionKey: string, agentIdHint?: string): string {
-    const raw = sessionKey.trim();
-    if (!raw) {
-      return raw;
-    }
-
     const config = this.getFullConfig();
     const defaultAgentId = agentIdHint?.trim()
       ? normalizeAgentId(agentIdHint)
       : normalizeAgentId(getDefaultAgentId(config));
 
-    if (!raw.startsWith("agent:")) {
-      if (raw === "main" || raw === normalizeMainKey(config.session.mainKey)) {
-        return resolveAgentMainSessionKey({
-          agentId: defaultAgentId,
-          mainKey: config.session.mainKey,
-        });
-      }
-      return raw;
-    }
-
-    const agentId = resolveAgentIdFromSessionKey(raw, defaultAgentId);
-    return canonicalizeMainSessionAlias({
-      agentId,
-      sessionKey: raw,
+    return canonicalizeKey(sessionKey, {
       mainKey: config.session.mainKey,
+      dmScope: config.session.dmScope,
+      defaultAgentId,
     });
   }
 

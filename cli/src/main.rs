@@ -10,7 +10,7 @@ use gsv::protocol::{
 use gsv::tools::{all_tools_with_workspace, subscribe_exec_events, Tool};
 use serde_json::json;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -4361,17 +4361,46 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-fn is_bin_available(bin: &str) -> bool {
+fn resolve_login_shell() -> String {
+    if let Ok(raw) = std::env::var("SHELL") {
+        let candidate = raw.trim();
+        if !candidate.is_empty() {
+            let path = Path::new(candidate);
+            if path.is_absolute() && is_executable_file(path) {
+                return candidate.to_string();
+            }
+        }
+    }
+    "/bin/sh".to_string()
+}
+
+fn probe_path_from_login_shell() -> Option<OsString> {
+    let shell = resolve_login_shell();
+    let output = std::process::Command::new(shell)
+        .arg("-lc")
+        .arg("env")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        if let Some(path_bytes) = line.strip_prefix(b"PATH=") {
+            let path = String::from_utf8_lossy(path_bytes).to_string();
+            return Some(OsString::from(path));
+        }
+    }
+    None
+}
+
+fn is_bin_available_with_path(bin: &str, path_var: &OsStr) -> bool {
     if bin.contains('/') || bin.contains('\\') {
         return is_executable_file(Path::new(bin));
     }
 
-    let path_var = std::env::var_os("PATH");
-    let Some(path_var) = path_var else {
-        return false;
-    };
-
-    for dir in std::env::split_paths(&path_var) {
+    for dir in std::env::split_paths(path_var) {
         if dir.as_os_str().is_empty() {
             continue;
         }
@@ -4383,14 +4412,27 @@ fn is_bin_available(bin: &str) -> bool {
     false
 }
 
+fn is_bin_available(bin: &str) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    is_bin_available_with_path(bin, &path_var)
+}
+
 fn probe_node_bins(bins: &[String]) -> HashMap<String, bool> {
+    let login_shell_path = probe_path_from_login_shell();
     let mut statuses = HashMap::new();
     for raw_bin in bins {
         let bin = raw_bin.trim();
         if !is_valid_probe_bin(bin) {
             continue;
         }
-        statuses.insert(bin.to_string(), is_bin_available(bin));
+        let available = if let Some(path) = login_shell_path.as_deref() {
+            is_bin_available_with_path(bin, path)
+        } else {
+            is_bin_available(bin)
+        };
+        statuses.insert(bin.to_string(), available);
     }
     statuses
 }
