@@ -14,6 +14,7 @@
 # Installs CLI
 curl -sSL https://raw.githubusercontent.com/deathbyknowledge/gsv/main/install.sh | bash
 
+# https://dash.cloudflare.com/profile/api-tokens Use "Edit Cloudflare Workers" template
 # First-time guided deploy
 gsv deploy up --wizard
 ```
