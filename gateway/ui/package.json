@@ -10,9 +10,13 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
+    "@cloudflare/kumo": "^1.5.1",
+    "@phosphor-icons/react": "^2.1.10",
+    "dompurify": "^3.2.0",
     "lit": "^3.2.0",
     "marked": "^15.0.0",
-    "dompurify": "^3.2.0"
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
   },
   "devDependencies": {
     "@types/dompurify": "^3.0.5",

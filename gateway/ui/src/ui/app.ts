@@ -57,6 +57,8 @@ export class GsvApp extends LitElement {
 
   // ---- Navigation ----
   @state() tab: Tab = getCurrentTab();
+  @state() navDrawerOpen = false;
+  @state() isMobileLayout = false;
 
   // ---- Chat State ----
   @state() chatMessages: Message[] = [];
@@ -114,12 +116,16 @@ export class GsvApp extends LitElement {
   private chatAutoScrollRaf: number | null = null;
   private chatStreamRunId: string | null = null;
   private channelsRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  private mobileMediaQuery: MediaQueryList | null = null;
 
   // ---- Lifecycle ----
 
   connectedCallback() {
     super.connectedCallback();
     applyTheme(this.settings.theme);
+    this.mobileMediaQuery = window.matchMedia("(max-width: 960px)");
+    this.isMobileLayout = this.mobileMediaQuery.matches;
+    this.mobileMediaQuery.addEventListener("change", this.handleMobileMedia);
     
     // Only auto-connect if we have previously connected successfully
     // (token is set or user explicitly clicked connect)
@@ -158,11 +164,35 @@ export class GsvApp extends LitElement {
     this.stopChannelsAutoRefresh();
     this.client?.stop();
     window.removeEventListener("popstate", this.handlePopState);
+    this.mobileMediaQuery?.removeEventListener("change", this.handleMobileMedia);
+    this.mobileMediaQuery = null;
   }
 
   private handlePopState = () => {
     this.tab = getCurrentTab();
+    this.closeNavDrawer();
   };
+
+  private handleMobileMedia = (event: MediaQueryListEvent) => {
+    this.isMobileLayout = event.matches;
+    if (!event.matches) {
+      this.navDrawerOpen = false;
+    }
+  };
+
+  private toggleNavDrawer() {
+    if (!this.isMobileLayout) {
+      return;
+    }
+    this.navDrawerOpen = !this.navDrawerOpen;
+  }
+
+  private closeNavDrawer() {
+    if (!this.navDrawerOpen) {
+      return;
+    }
+    this.navDrawerOpen = false;
+  }
 
   private scheduleChatAutoScroll() {
     if (this.chatAutoScrollRaf !== null) {
@@ -277,6 +307,7 @@ export class GsvApp extends LitElement {
       navigateTo(tab);
       this.loadTabData(tab);
     }
+    this.closeNavDrawer();
   }
 
   private async loadTabData(tab: Tab) {
@@ -984,7 +1015,13 @@ export class GsvApp extends LitElement {
     }
 
     return html`
-      <div class="app-shell">
+      <div class="app-shell ${this.isMobileLayout ? "mobile" : ""} ${this.navDrawerOpen ? "nav-open" : ""}">
+        <button
+          type="button"
+          class="nav-backdrop ${this.navDrawerOpen ? "open" : ""}"
+          @click=${() => this.closeNavDrawer()}
+          aria-label="Close navigation menu"
+        ></button>
         ${this.renderNav()}
         <div class="main-content">
           ${this.renderTopbar()}
@@ -1084,7 +1121,7 @@ export class GsvApp extends LitElement {
 
   private renderNav() {
     return html`
-      <nav class="nav-sidebar">
+      <nav class="nav-sidebar ${this.navDrawerOpen ? "open" : ""}">
         <div class="nav-header">
           <span class="nav-logo">🚀</span>
           <span class="nav-title">GSV</span>
@@ -1122,7 +1159,17 @@ export class GsvApp extends LitElement {
   private renderTopbar() {
     return html`
       <header class="topbar">
-        <h1 class="topbar-title">${TAB_LABELS[this.tab]}</h1>
+        <div class="topbar-title-wrap">
+          <button
+            class="btn btn-ghost btn-icon topbar-menu-btn"
+            @click=${() => this.toggleNavDrawer()}
+            title="Toggle navigation"
+            aria-label="Toggle navigation menu"
+          >
+            ☰
+          </button>
+          <h1 class="topbar-title">${TAB_LABELS[this.tab]}</h1>
+        </div>
         <div class="topbar-actions">
           <button 
             class="btn btn-ghost btn-icon"

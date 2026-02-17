@@ -53,19 +53,19 @@ export function renderWorkspace(app: GsvApp) {
         </button>
       </div>
       
-      <div style="display: grid; grid-template-columns: 300px 1fr; gap: var(--space-4); height: calc(100vh - 200px)">
+      <div class="workspace-layout">
         <!-- File Browser -->
-        <div class="card" style="overflow: hidden; display: flex; flex-direction: column">
+        <div class="card workspace-panel">
           <div class="card-header">
             <h3 class="card-title">Files</h3>
           </div>
-          <div class="card-body" style="flex: 1; overflow-y: auto">
+          <div class="card-body workspace-panel-body">
             ${renderFileBrowser(app)}
           </div>
         </div>
         
         <!-- File Editor -->
-        <div class="card" style="overflow: hidden; display: flex; flex-direction: column">
+        <div class="card workspace-panel">
           <div class="card-header">
             <h3 class="card-title">
               ${app.workspaceFileContent ? app.workspaceFileContent.path : "No file selected"}
@@ -84,22 +84,11 @@ export function renderWorkspace(app: GsvApp) {
               </button>
             ` : nothing}
           </div>
-          <div class="card-body" style="flex: 1; overflow: hidden; padding: 0">
+          <div class="card-body workspace-panel-body" style="padding: 0">
             ${app.workspaceFileContent ? html`
               <textarea
                 id="workspace-editor"
-                style="
-                  width: 100%;
-                  height: 100%;
-                  padding: var(--space-4);
-                  font-family: var(--font-mono);
-                  font-size: var(--font-size-sm);
-                  background: var(--bg-primary);
-                  color: var(--text-primary);
-                  border: none;
-                  resize: none;
-                  outline: none;
-                "
+                class="workspace-editor"
                 .value=${app.workspaceFileContent.content}
               ></textarea>
             ` : html`
