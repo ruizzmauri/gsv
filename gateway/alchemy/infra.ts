@@ -10,7 +10,6 @@ import {
   DurableObjectNamespace,
   R2Bucket,
   R2Object,
-  Queue,
   Assets,
   Ai,
 } from "alchemy/cloudflare";
@@ -100,17 +99,6 @@ export async function createGsvInfra(opts: GsvInfraOptions) {
     console.log("   UI assets ready");
   }
 
-  // Channel inbound queue - all channels send inbound messages here
-  // Gateway consumes from this queue to process messages
-  // Settings optimized for minimal latency
-  const channelInboundQueue = await Queue(`${name}-channel-inbound`, {
-    name: `${name}-channel-inbound`,
-    adopt: true,
-    settings: {
-      deliveryDelay: 0, // No delay before delivery
-    },
-  });
-
   // =========================================================================
   // Deploy channels FIRST (Gateway references them via service bindings)
   // =========================================================================
@@ -124,8 +112,11 @@ export async function createGsvInfra(opts: GsvInfraOptions) {
       entrypoint: path.join(CHANNELS_DIR, "test/src/index.ts"),
       adopt: true,
       bindings: {
-        // Queue for sending inbound messages to Gateway (producer binding)
-        GATEWAY_QUEUE: channelInboundQueue,
+        GATEWAY: {
+          type: "service" as const,
+          service: name,
+          __entrypoint__: "GatewayEntrypoint",
+        },
         // Durable Object for maintaining test state across requests
         TEST_CHANNEL_STATE: DurableObjectNamespace("test-channel-state", {
           className: "TestChannelState",
@@ -182,8 +173,11 @@ export async function createGsvInfra(opts: GsvInfraOptions) {
           className: "DiscordGateway",
           sqlite: true,
         }),
-        // Queue for sending inbound messages to Gateway (producer binding)
-        GATEWAY_QUEUE: channelInboundQueue,
+        GATEWAY: {
+          type: "service" as const,
+          service: name,
+          __entrypoint__: "GatewayEntrypoint",
+        },
         ...(secrets.discordBotToken
           ? { DISCORD_BOT_TOKEN: secrets.discordBotToken }
           : {}),
@@ -201,7 +195,7 @@ export async function createGsvInfra(opts: GsvInfraOptions) {
   // Workers AI for audio transcription (free)
   const ai = Ai();
 
-  // Main gateway worker - consumes from channel inbound queue
+  // Main gateway worker
   const gateway = await Worker(`${name}-worker`, {
     name,
     entrypoint,
@@ -252,17 +246,6 @@ export async function createGsvInfra(opts: GsvInfraOptions) {
           }
         : {}),
     },
-    // Queue consumer: process inbound messages from channels
-    eventSources: [
-      {
-        queue: channelInboundQueue,
-        settings: {
-          batchSize: 1, // Process one message at a time for minimal latency
-          maxRetries: 3,
-          maxWaitTimeMs: 0, // Don't wait to batch, process immediately
-        },
-      },
-    ],
     url,
     compatibilityDate: "2025-09-01",
     compatibilityFlags: ["nodejs_compat"],
