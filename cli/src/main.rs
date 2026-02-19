@@ -2465,6 +2465,32 @@ fn systemd_user_unit_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 #[cfg(target_os = "linux")]
+fn linger_is_enabled() -> bool {
+    // Linger is enabled if /var/lib/systemd/linger/$USER exists
+    let username = whoami::username();
+    std::path::Path::new("/var/lib/systemd/linger")
+        .join(username)
+        .exists()
+}
+
+#[cfg(target_os = "linux")]
+fn try_enable_linger() -> Result<(), Box<dyn std::error::Error>> {
+    let username = whoami::username();
+    let output = std::process::Command::new("sudo")
+        .arg("loginctl")
+        .arg("enable-linger")
+        .arg(&username)
+        .output()?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("sudo loginctl enable-linger failed: {}", stderr.trim()).into())
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn install_systemd_user_service(exe_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let unit_path = systemd_user_unit_path()?;
     if let Some(parent) = unit_path.parent() {
@@ -2494,6 +2520,28 @@ fn install_systemd_user_service(exe_path: &PathBuf) -> Result<(), Box<dyn std::e
     )?;
 
     println!("Installed systemd unit: {}", unit_path.display());
+
+    // Ensure linger is enabled so the service persists after logout
+    if linger_is_enabled() {
+        println!("User linger is enabled - service will persist after logout.");
+    } else {
+        println!();
+        println!("User linger is not enabled. Attempting to enable...");
+        match try_enable_linger() {
+            Ok(()) => {
+                println!("✓ Enabled user linger - service will start at boot and persist after logout.");
+            }
+            Err(e) => {
+                println!();
+                println!("⚠️  Could not enable linger: {}", e);
+                println!();
+                println!("Without linger, the node daemon will stop when you log out.");
+                println!("Run this once with sudo:");
+                println!("  sudo loginctl enable-linger {}", whoami::username());
+            }
+        }
+    }
+
     Ok(())
 }
 
