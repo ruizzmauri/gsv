@@ -2530,9 +2530,7 @@ fn install_systemd_user_service(exe_path: &PathBuf) -> Result<(), Box<dyn std::e
         println!("Enabling linger (requires sudo - you may be prompted for password)...");
         match try_enable_linger() {
             Ok(()) => {
-                println!(
-                    "✓ Enabled user linger - service will start at boot and persist after logout."
-                );
+                println!("✓ Enabled user linger - service will start at boot and persist after logout.");
             }
             Err(e) => {
                 println!();
