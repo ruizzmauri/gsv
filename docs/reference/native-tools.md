@@ -260,3 +260,44 @@ Send a message into another session.
 **Side effects:** Injects a user message into the target session and triggers an agent turn.
 
 **Behavior:** Requires Gateway context.
+
+---
+
+## Transfer Tools
+
+### gsv__Transfer
+
+Transfer a file between connected nodes and/or the R2 workspace. The tool stays pending until the transfer completes end-to-end.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source` | `string` | Yes | Source endpoint. Format: `{nodeId}:/path/to/file` for a node filesystem path, or `gsv:workspace/path` for an R2 workspace path. |
+| `destination` | `string` | Yes | Destination endpoint. Same format as `source`. |
+
+**Output:** `{ source, destination, bytesTransferred, mime? }`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source` | `string` | Echoed source endpoint. |
+| `destination` | `string` | Echoed destination endpoint. |
+| `bytesTransferred` | `number` | Total bytes transferred. |
+| `mime` | `string` | Detected MIME type of the transferred file (when available). |
+
+**Side effects:** Reads the file from the source endpoint and writes it to the destination endpoint. Creates parent directories on node destinations if needed.
+
+**Behavior:** The Gateway orchestrates the transfer using one of three modes depending on the endpoint types:
+
+| Mode | Source | Destination | Description |
+|------|--------|-------------|-------------|
+| Node-to-Node | `{nodeId}:/path` | `{nodeId}:/path` | Binary relay through the Gateway. Data flows as binary WebSocket frames from source node to Gateway to destination node. |
+| Node-to-R2 | `{nodeId}:/path` | `gsv:workspace/path` | Streaming upload. Source node sends binary frames; Gateway streams into `R2Bucket.put()` via a `TransformStream`. |
+| R2-to-Node | `gsv:workspace/path` | `{nodeId}:/path` | Streaming download. Gateway reads from R2 and sends binary frames to the destination node. |
+
+Data transfer uses binary WebSocket frames (not JSON text frames). See the [WebSocket Protocol Reference](./websocket-protocol.md#binary-frames) for the binary frame format.
+
+**Error conditions:**
+- Source or destination endpoint is malformed.
+- Referenced node is not connected.
+- Source file does not exist or is not readable.
+- Destination write fails (permissions, disk full).
+- Transfer timeout.

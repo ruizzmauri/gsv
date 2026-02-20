@@ -72,6 +72,23 @@ import { formatEnvelope, formatTimeFull, resolveTimezone } from "../shared/time"
 import { processInboundMedia } from "../storage/media";
 import { listWorkspaceSkills } from "../skills";
 import { getNativeToolDefinitions } from "../agents/tools";
+import type {
+  TransferEndpoint,
+  TransferRequestParams,
+  TransferMetaParams,
+  TransferAcceptParams,
+  TransferCompleteParams,
+  TransferDoneParams,
+  TransferToolResult,
+  TransferSendPayload,
+  TransferReceivePayload,
+  TransferStartPayload,
+  TransferEndPayload,
+} from "../protocol/transfer";
+import {
+  parseTransferBinaryFrame,
+  buildTransferBinaryFrame,
+} from "../protocol/transfer";
 import { listHostsByRole, pickExecutionHostId } from "./capabilities";
 import {
   CronService,
@@ -279,10 +296,29 @@ function describeCronSchedule(job: CronJob, timezone: string): string {
   return `cron "${job.schedule.expr}" (${tz})`;
 }
 
+type ActiveTransfer = {
+  transferId: number;
+  callId: string;
+  sessionKey: string;
+  source: TransferEndpoint;
+  destination: TransferEndpoint;
+  state: "init" | "meta-wait" | "accept-wait" | "streaming" | "completing";
+  size?: number;
+  mime?: string;
+  sourceWs?: WebSocket;
+  destWs?: WebSocket;
+  r2Writer?: WritableStreamDefaultWriter<Uint8Array>;
+  r2UploadPromise?: Promise<R2Object>;
+  bytesTransferred: number;
+};
+
 export class Gateway extends DurableObject<Env> {
   clients: Map<string, WebSocket> = new Map();
   nodes: Map<string, WebSocket> = new Map();
   channels: Map<string, WebSocket> = new Map();
+
+  private activeTransfers = new Map<number, ActiveTransfer>();
+  private nextTransferId = 1;
 
   readonly toolRegistry = PersistedObject<Record<string, ToolDefinition[]>>(
     this.ctx.storage.kv,
@@ -449,7 +485,10 @@ export class Gateway extends DurableObject<Env> {
   }
 
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string) {
-    if (typeof message !== "string") return;
+    if (typeof message !== "string") {
+      this.handleTransferBinaryFrame(ws, message as ArrayBuffer);
+      return;
+    }
     try {
       const frame: Frame = JSON.parse(message);
       console.log(
@@ -693,6 +732,7 @@ export class Gateway extends DurableObject<Env> {
         nodeId,
         `Node disconnected during node probe: ${nodeId}`,
       );
+      this.failTransfersForNode(nodeId);
       delete this.nodeRuntimeRegistry[nodeId];
       console.log(`[Gateway] Node ${nodeId} removed from registry`);
     } else if (mode === "channel" && channelKey) {
@@ -1846,6 +1886,315 @@ export class Gateway extends DurableObject<Env> {
     await this.scheduleGatewayAlarm();
 
     return { ok: true };
+  }
+
+  async transferRequest(
+    params: TransferRequestParams,
+  ): Promise<{ ok: boolean; error?: string }> {
+    const transferId = this.nextTransferId++;
+    const sourceIsGsv = params.source.node === "gsv";
+    const destIsGsv = params.destination.node === "gsv";
+
+    const transfer: ActiveTransfer = {
+      transferId,
+      callId: params.callId,
+      sessionKey: params.sessionKey,
+      source: params.source,
+      destination: params.destination,
+      state: "init",
+      bytesTransferred: 0,
+    };
+
+    if (!sourceIsGsv) {
+      const sourceWs = this.nodes.get(params.source.node);
+      if (!sourceWs || sourceWs.readyState !== WebSocket.OPEN) {
+        return { ok: false, error: `Source node not connected: ${params.source.node}` };
+      }
+      transfer.sourceWs = sourceWs;
+    }
+
+    if (!destIsGsv) {
+      const destWs = this.nodes.get(params.destination.node);
+      if (!destWs || destWs.readyState !== WebSocket.OPEN) {
+        return { ok: false, error: `Destination node not connected: ${params.destination.node}` };
+      }
+      transfer.destWs = destWs;
+    }
+
+    this.activeTransfers.set(transferId, transfer);
+
+    if (sourceIsGsv) {
+      const r2Object = await this.env.STORAGE.head(params.source.path);
+      if (!r2Object) {
+        this.activeTransfers.delete(transferId);
+        return { ok: false, error: `R2 object not found: ${params.source.path}` };
+      }
+      transfer.size = r2Object.size;
+      transfer.mime = r2Object.httpMetadata?.contentType;
+
+      if (destIsGsv) {
+        this.activeTransfers.delete(transferId);
+        return { ok: false, error: "Cannot transfer from gsv to gsv" };
+      }
+
+      const receiveEvt: EventFrame<TransferReceivePayload> = {
+        type: "evt",
+        event: "transfer.receive",
+        payload: {
+          transferId,
+          path: params.destination.path,
+          size: transfer.size,
+          mime: transfer.mime,
+        },
+      };
+      transfer.destWs!.send(JSON.stringify(receiveEvt));
+      transfer.state = "accept-wait";
+    } else {
+      const sendEvt: EventFrame<TransferSendPayload> = {
+        type: "evt",
+        event: "transfer.send",
+        payload: {
+          transferId,
+          path: params.source.path,
+        },
+      };
+      transfer.sourceWs!.send(JSON.stringify(sendEvt));
+      transfer.state = "meta-wait";
+    }
+
+    return { ok: true };
+  }
+
+  handleTransferMeta(params: TransferMetaParams): void {
+    const transfer = this.activeTransfers.get(params.transferId);
+    if (!transfer) return;
+
+    if (params.error) {
+      this.failTransfer(transfer, params.error);
+      return;
+    }
+
+    transfer.size = params.size;
+    transfer.mime = params.mime;
+
+    const destIsGsv = transfer.destination.node === "gsv";
+
+    if (destIsGsv) {
+      const { readable, writable } = new TransformStream<Uint8Array>();
+      const writer = writable.getWriter();
+      transfer.r2Writer = writer;
+      transfer.r2UploadPromise = this.env.STORAGE.put(
+        transfer.destination.path,
+        readable,
+        {
+          httpMetadata: transfer.mime
+            ? { contentType: transfer.mime }
+            : undefined,
+        },
+      );
+
+      const startEvt: EventFrame<TransferStartPayload> = {
+        type: "evt",
+        event: "transfer.start",
+        payload: { transferId: params.transferId },
+      };
+      transfer.sourceWs!.send(JSON.stringify(startEvt));
+      transfer.state = "streaming";
+    } else {
+      const receiveEvt: EventFrame<TransferReceivePayload> = {
+        type: "evt",
+        event: "transfer.receive",
+        payload: {
+          transferId: params.transferId,
+          path: transfer.destination.path,
+          size: params.size,
+          mime: params.mime,
+        },
+      };
+      transfer.destWs!.send(JSON.stringify(receiveEvt));
+      transfer.state = "accept-wait";
+    }
+  }
+
+  handleTransferAccept(params: TransferAcceptParams): void {
+    const transfer = this.activeTransfers.get(params.transferId);
+    if (!transfer) return;
+
+    if (params.error) {
+      this.failTransfer(transfer, params.error);
+      return;
+    }
+
+    const sourceIsGsv = transfer.source.node === "gsv";
+
+    if (sourceIsGsv) {
+      transfer.state = "streaming";
+      this.ctx.waitUntil(this.streamR2ToDest(transfer));
+    } else {
+      const startEvt: EventFrame<TransferStartPayload> = {
+        type: "evt",
+        event: "transfer.start",
+        payload: { transferId: params.transferId },
+      };
+      transfer.sourceWs!.send(JSON.stringify(startEvt));
+      transfer.state = "streaming";
+    }
+  }
+
+  handleTransferComplete(params: TransferCompleteParams): void {
+    const transfer = this.activeTransfers.get(params.transferId);
+    if (!transfer) return;
+
+    const destIsGsv = transfer.destination.node === "gsv";
+
+    if (destIsGsv) {
+      this.ctx.waitUntil(this.finalizeR2Upload(transfer));
+    } else {
+      const endEvt: EventFrame<TransferEndPayload> = {
+        type: "evt",
+        event: "transfer.end",
+        payload: { transferId: params.transferId },
+      };
+      transfer.destWs!.send(JSON.stringify(endEvt));
+      transfer.state = "completing";
+    }
+  }
+
+  handleTransferDone(params: TransferDoneParams): void {
+    const transfer = this.activeTransfers.get(params.transferId);
+    if (!transfer) return;
+
+    if (params.error) {
+      this.failTransfer(transfer, params.error);
+      return;
+    }
+
+    this.completeTransfer(transfer, params.bytesWritten);
+  }
+
+  private handleTransferBinaryFrame(ws: WebSocket, data: ArrayBuffer): void {
+    const { transferId, chunk } = parseTransferBinaryFrame(data);
+    const transfer = this.activeTransfers.get(transferId);
+    if (!transfer) return;
+
+    transfer.bytesTransferred += chunk.byteLength;
+
+    const destIsGsv = transfer.destination.node === "gsv";
+
+    if (destIsGsv) {
+      if (transfer.r2Writer) {
+        transfer.r2Writer.write(chunk).catch((err) => {
+          this.failTransfer(transfer, `R2 write error: ${err}`);
+        });
+      }
+    } else {
+      transfer.destWs!.send(buildTransferBinaryFrame(transferId, chunk));
+    }
+  }
+
+  private async streamR2ToDest(transfer: ActiveTransfer): Promise<void> {
+    try {
+      const r2Object = await this.env.STORAGE.get(transfer.source.path);
+      if (!r2Object) {
+        this.failTransfer(transfer, `R2 object not found: ${transfer.source.path}`);
+        return;
+      }
+
+      const reader = r2Object.body.getReader();
+      let done = false;
+
+      while (!done) {
+        const result = await reader.read();
+        done = result.done;
+        if (result.value) {
+          transfer.bytesTransferred += result.value.byteLength;
+          transfer.destWs!.send(
+            buildTransferBinaryFrame(transfer.transferId, result.value),
+          );
+        }
+      }
+
+      const endEvt: EventFrame<TransferEndPayload> = {
+        type: "evt",
+        event: "transfer.end",
+        payload: { transferId: transfer.transferId },
+      };
+      transfer.destWs!.send(JSON.stringify(endEvt));
+      transfer.state = "completing";
+    } catch (err) {
+      this.failTransfer(
+        transfer,
+        `R2 stream error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  private async finalizeR2Upload(transfer: ActiveTransfer): Promise<void> {
+    try {
+      if (transfer.r2Writer) {
+        await transfer.r2Writer.close();
+      }
+      if (transfer.r2UploadPromise) {
+        await transfer.r2UploadPromise;
+      }
+      this.completeTransfer(transfer, transfer.bytesTransferred);
+    } catch (err) {
+      this.failTransfer(
+        transfer,
+        `R2 upload finalize error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  private completeTransfer(
+    transfer: ActiveTransfer,
+    bytesTransferred: number,
+  ): void {
+    const toolResult: TransferToolResult = {
+      source: `${transfer.source.node}:${transfer.source.path}`,
+      destination: `${transfer.destination.node}:${transfer.destination.path}`,
+      bytesTransferred,
+      mime: transfer.mime,
+    };
+
+    const sessionStub = this.env.SESSION.getByName(transfer.sessionKey);
+    this.ctx.waitUntil(
+      sessionStub.toolResult({
+        callId: transfer.callId,
+        result: toolResult,
+      }),
+    );
+
+    this.activeTransfers.delete(transfer.transferId);
+  }
+
+  private failTransfer(transfer: ActiveTransfer, error: string): void {
+    const sessionStub = this.env.SESSION.getByName(transfer.sessionKey);
+    this.ctx.waitUntil(
+      sessionStub.toolResult({
+        callId: transfer.callId,
+        error,
+      }),
+    );
+
+    if (transfer.r2Writer) {
+      try {
+        transfer.r2Writer.close().catch(() => {});
+      } catch {}
+    }
+
+    this.activeTransfers.delete(transfer.transferId);
+  }
+
+  private failTransfersForNode(nodeId: string): void {
+    for (const [, transfer] of this.activeTransfers) {
+      if (
+        transfer.source.node === nodeId ||
+        transfer.destination.node === nodeId
+      ) {
+        this.failTransfer(transfer, `Node disconnected: ${nodeId}`);
+      }
+    }
   }
 
   /**

@@ -37,7 +37,12 @@ import {
 import { loadAgentWorkspace } from "../agents/loader";
 import { isMainSessionKey } from "./routing";
 import { buildSystemPromptFromWorkspace } from "../agents/prompt";
-import { executeNativeTool, isNativeTool } from "../agents/tools";
+import {
+  executeNativeTool,
+  isNativeTool,
+  parseTransferEndpoint,
+  TRANSFER_TOOL_NAME,
+} from "../agents/tools";
 import {
   shouldAutoResetByPolicy,
   type ResetPolicy as SessionResetPolicy,
@@ -1893,6 +1898,33 @@ export class Session extends DurableObject<Env> {
     }
 
     this.pendingToolCalls[toolCall.id] = toolCall;
+
+    if (toolCall.name === TRANSFER_TOOL_NAME) {
+      try {
+        const source = parseTransferEndpoint(toolCall.args.source as string);
+        const destination = parseTransferEndpoint(
+          toolCall.args.destination as string,
+        );
+
+        const gateway = this.env.GATEWAY.getByName("singleton");
+        const result = await gateway.transferRequest({
+          callId: toolCall.id,
+          sessionKey: this.meta.sessionKey,
+          source,
+          destination,
+        });
+
+        if (!result.ok) {
+          toolCall.error = result.error || "Transfer request failed";
+          this.pendingToolCalls[toolCall.id] = toolCall;
+        }
+      } catch (err) {
+        toolCall.error =
+          err instanceof Error ? err.message : String(err);
+        this.pendingToolCalls[toolCall.id] = toolCall;
+      }
+      return;
+    }
 
     // Native tools (gsv__*) are handled locally in Session.
     if (isNativeTool(toolCall.name)) {

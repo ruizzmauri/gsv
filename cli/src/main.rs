@@ -6,8 +6,10 @@ use gsv::deploy;
 use gsv::protocol::{
     Frame, LogsGetPayload, LogsResultParams, NodeExecEventParams, NodeProbePayload,
     NodeProbeResultParams, NodeRuntimeInfo, ToolDefinition, ToolInvokePayload, ToolResultParams,
+    TransferEndPayload, TransferReceivePayload, TransferSendPayload, TransferStartPayload,
 };
 use gsv::tools::{all_tools_with_workspace, subscribe_exec_events, Tool};
+use gsv::transfer::TransferCoordinator;
 use serde_json::json;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -2530,7 +2532,9 @@ fn install_systemd_user_service(exe_path: &PathBuf) -> Result<(), Box<dyn std::e
         println!("Enabling linger (requires sudo - you may be prompted for password)...");
         match try_enable_linger() {
             Ok(()) => {
-                println!("✓ Enabled user linger - service will start at boot and persist after logout.");
+                println!(
+                    "✓ Enabled user linger - service will start at boot and persist after logout."
+                );
             }
             Err(e) => {
                 println!();
@@ -3161,6 +3165,8 @@ async fn run_node(
         }
     });
 
+    let transfer_coordinator = Arc::new(TransferCoordinator::new());
+
     loop {
         logger.info("connect.attempt", json!({ "url": url }));
 
@@ -3206,14 +3212,24 @@ async fn run_node(
         };
         let conn = Arc::new(conn);
 
+        let coordinator_for_binary = transfer_coordinator.clone();
+        conn.set_binary_handler(move |data| {
+            coordinator_for_binary.route_binary_frame(&data);
+        })
+        .await;
+
         let conn_clone = conn.clone();
         let tools_clone = tools_for_handler.clone();
         let logger_clone = logger.clone();
+        let coordinator_for_events = transfer_coordinator.clone();
+        let workspace_for_transfers = workspace.clone();
 
         conn.set_event_handler(move |frame| {
             let conn = conn_clone.clone();
             let tools = tools_clone.clone();
             let logger = logger_clone.clone();
+            let coordinator = coordinator_for_events.clone();
+            let transfer_workspace = workspace_for_transfers.clone();
 
             tokio::spawn(async move {
                 if let Frame::Evt(evt) = frame {
@@ -3440,6 +3456,60 @@ async fn run_node(
                                         "error": e.to_string(),
                                     }),
                                 );
+                            }
+                        }
+                    } else if evt.event == "transfer.send" {
+                        if let Some(payload) = evt.payload {
+                            if let Ok(send_payload) =
+                                serde_json::from_value::<TransferSendPayload>(payload)
+                            {
+                                let conn = conn.clone();
+                                let ws = transfer_workspace.clone();
+                                let coord = coordinator.clone();
+                                tokio::spawn(async move {
+                                    gsv::transfer::handle_transfer_send(
+                                        conn,
+                                        send_payload,
+                                        ws,
+                                        coord,
+                                    )
+                                    .await;
+                                });
+                            }
+                        }
+                    } else if evt.event == "transfer.receive" {
+                        if let Some(payload) = evt.payload {
+                            if let Ok(receive_payload) =
+                                serde_json::from_value::<TransferReceivePayload>(payload)
+                            {
+                                let conn = conn.clone();
+                                let ws = transfer_workspace.clone();
+                                let coord = coordinator.clone();
+                                tokio::spawn(async move {
+                                    gsv::transfer::handle_transfer_receive(
+                                        conn,
+                                        receive_payload,
+                                        ws,
+                                        coord,
+                                    )
+                                    .await;
+                                });
+                            }
+                        }
+                    } else if evt.event == "transfer.start" {
+                        if let Some(payload) = evt.payload {
+                            if let Ok(start_payload) =
+                                serde_json::from_value::<TransferStartPayload>(payload)
+                            {
+                                coordinator.fire_start_signal(start_payload.transfer_id);
+                            }
+                        }
+                    } else if evt.event == "transfer.end" {
+                        if let Some(payload) = evt.payload {
+                            if let Ok(end_payload) =
+                                serde_json::from_value::<TransferEndPayload>(payload)
+                            {
+                                coordinator.close_chunk_sender(end_payload.transfer_id);
                             }
                         }
                     }
