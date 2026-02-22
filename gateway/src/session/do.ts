@@ -1032,6 +1032,7 @@ export class Session extends DurableObject<Env> {
 
     // Process pending tool results
     const pendingCallIds = Object.keys(this.pendingToolCalls);
+    const hadPendingToolCalls = pendingCallIds.length > 0;
     if (pendingCallIds.length > 0) {
       for (const callId of pendingCallIds) {
         const call = this.pendingToolCalls[callId];
@@ -1104,10 +1105,60 @@ export class Session extends DurableObject<Env> {
       }
     }
 
+    // If this turn resumed from tool calls, inject queued user messages now so they
+    // are included before the next LLM continuation, without waiting for run end.
+    let continuationOverrides: {
+      thinkLevel?: string;
+      model?: { provider: string; id: string };
+    } | undefined;
+    if (hadPendingToolCalls && this.messageQueue.length > 0) {
+      const queuedMessages = [...this.messageQueue];
+      this.messageQueue = [];
+
+      for (const queuedMessage of queuedMessages) {
+        const userMessage = this.buildUserMessage(
+          queuedMessage.text,
+          queuedMessage.media,
+        );
+        this.addMessage(userMessage);
+
+        if (queuedMessage.messageOverrides?.thinkLevel) {
+          continuationOverrides = {
+            ...continuationOverrides,
+            thinkLevel: queuedMessage.messageOverrides.thinkLevel,
+          };
+        }
+
+        if (queuedMessage.messageOverrides?.model) {
+          continuationOverrides = {
+            ...continuationOverrides,
+            model: queuedMessage.messageOverrides.model,
+          };
+        }
+      }
+
+      this.meta.updatedAt = Date.now();
+
+      console.log(
+        `[Session] Injected ${queuedMessages.length} queued message(s) into active run ${this.currentRun?.runId}`,
+      );
+    }
+
     let response: AssistantMessage;
+
+    const runForLlm = this.currentRun;
+    const originalMessageOverrides = runForLlm?.messageOverrides;
+    if (continuationOverrides && runForLlm) {
+      runForLlm.messageOverrides = continuationOverrides;
+    }
+
     try {
       response = await this.callLlm();
     } catch (e) {
+      if (runForLlm) {
+        runForLlm.messageOverrides = originalMessageOverrides;
+      }
+
       console.error(`[Session] LLM call failed:`, e);
       await this.broadcastToClients({
         runId: this.currentRun?.runId ?? null,
@@ -1125,6 +1176,10 @@ export class Session extends DurableObject<Env> {
         `[Session] Run ${this.currentRun.runId} was aborted during LLM call`,
       );
       return;
+    }
+
+    if (runForLlm) {
+      runForLlm.messageOverrides = originalMessageOverrides;
     }
 
     if (!response.content || response.content.length === 0) {
